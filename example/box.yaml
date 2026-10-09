@@ -1,0 +1,34 @@
+family:
+  name: box
+  dimension: d
+  internals: [ l1 ]
+  externals: [ p1, p2, p3 ]
+  invariants:
+    - [ s, 2 ]
+    - [ t, 2 ]
+    - [ m, 1 ]
+  sps_rules:
+    - [ p1, p1, m^2 ]
+    - [ p2, p2, m^2 ]
+    - [ p3, p3, m^2 ]
+    - [ p1, p2, t-m^2 ]
+    - [ p1, p3, s-m^2 ]
+    - [ p2, p3, -t-s-m^2 ]
+  propagators:
+    - [ l1, m ]
+    - [ l1+p1, 0 ]
+    - [ l1+p1+p2, m ]
+    - [ l1+p1+p2+p3, 0 ]
+  # cut: [0, 0, 0, 0]
+
+settings:
+  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
+  subsector_depth_offset: 1   # depth offset n for the subsector filter: depth < _depth - n
+  cache_dir: cache_box        # directory for the global system and Kira scratch files
+
+targets:
+  - [ 2, 2, 1, 1 ]
+  - [ 1, 2, 1, 1 ]
+  - [ 1, 1, 2, 1 ]
+  - [ 1, 1, -1, 2 ]

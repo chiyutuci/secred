@@ -1,0 +1,21 @@
+# build tree
+build/
+
+# local-only notes and benchmark records (not part of the released package)
+ARCHITECTURE.md
+bench/
+CLAUDE.md
+
+# run output
+cache*/
+sector_timing.csv
+results/
+tmp/
+sectormappings/
+kira.log
+kira_*.log
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store
