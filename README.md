@@ -187,7 +187,7 @@ two-pass seeding of the sector stage) and a `Reduction Statistics` block.
 | `example/dbox.yaml` | massless double box, 9 propagators | symbolic `d`, `s`, `t` | `kira` | seconds |
 | `example/sunrise.yaml` | two-loop massive sunrise, 5 propagators | symbolic `d` | `kira` | seconds |
 | `example/topoA.yaml` | two-loop three-point with masses, 9 propagators | symbolic `d`, `s`, `t`, `u`, `m` | `kira` | minutes |
-| `example/F234_N.yaml` | two-loop three-point non-planar, 9 propagators | numeric | `finiteflow` | minutes |
+| `example/F234_N.yaml` | two-loop five-point non-planar, 9 propagators | numeric | `finiteflow` | minutes |
 | `example/F234_S.yaml` | the same family | numeric `d`, symbolic `s`, `t` | `kira` | hours |
 | `example/F1.yaml` | four-loop, 14 propagators | numeric | `finiteflow` | days |
 
