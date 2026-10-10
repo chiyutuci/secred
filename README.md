@@ -159,7 +159,7 @@ Powers of an invariant are written with `^` in the expressions
 | `kira_cmd` | `kira` | Command used to invoke Kira (path or name on `PATH`). |
 | `kira_jobs_file` | `jobs.yaml` | Name of the Kira job file. |
 | `kira_bunch_size` | `64` | Kira's `--bunch_size` (integrals reduced per bunch). |
-| `kira_parallel` | `64` | Kira's `-p` (parallel workers). |
+| `kira_parallel` | `64` | Kira's `-p` (parallel workers; Kira also starts this many Fermat instances in its final result-writing step — see Examples). |
 | `global_otf` | `false` | Kira's on-the-fly loading of the global system. |
 | `global_tool` | `kira` | `kira` or `finiteflow` — see the table above. |
 | `global_finiteflow_threads` | `64` | Threads used by the in-process FiniteFlow reconstruction. |
@@ -193,6 +193,13 @@ two-pass seeding of the sector stage) and a `Reduction Statistics` block.
 
 `box.yaml` is the reference input: it is the file used to validate changes to the
 input format.
+
+The three small examples set `kira_parallel: 8`. At the end of every Kira run its
+`kira2file: Reconstruct results` step starts one Fermat/Blackbox instance per
+`-p` slot — serially, ~0.15 s each — even when, as here, every target is already
+reduced and the instances are never used. With the default 64 that fixed start-up
+costs ~9 s (Kira 2.3 and 3.0 alike); with 8 it is ~2 s, and the reductions are
+byte-identical (verified on all three examples).
 
 ## Tests
 

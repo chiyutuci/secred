@@ -790,3 +790,161 @@ TEST(timing_accumulates_across_sectors) {
   REQUIRE(ctx.probeNanos.load() == 2'500'000'000ULL);
   REQUIRE(ctx.fullNanos.load() == 35'000'000'000ULL);
 }
+
+// ---------------------------------------------------------------------------
+// Per-sector target list — complete snapshot on disk as soon as it is written
+// ---------------------------------------------------------------------------
+
+TEST(write_target_list_complete_on_disk) {
+  const std::string path = "/tmp/secred_test_targets.txt";
+  std::set<RawIntegral> targets;
+  // Enough entries to overflow the 8 KiB stdio filebuf: a stream left open for
+  // the sector's lifetime would show only its first buffer here.  Indices stay
+  // within RawIntegral's int8_t range, and (i % 100, i / 100) is injective.
+  for (int i = 1; i <= 1000; ++i)
+    targets.insert(RI({1, 1, i % 100, i / 100}));
+  REQUIRE(targets.size() == 1000u);
+
+  writeTargetList(path, targets);
+
+  REQUIRE(std::filesystem::file_size(path) > 8192);
+  std::ifstream in(path);
+  std::set<RawIntegral> back;
+  std::string line;
+  while (std::getline(in, line))
+    back.insert(RawIntegral::from_text(line));
+  REQUIRE(back.size() == targets.size());
+  REQUIRE(back == targets);
+
+  // Newline-terminated: no entry may be cut mid-number.
+  in.clear();
+  in.seekg(-1, std::ios::end);
+  char last = 0;
+  in.get(last);
+  REQUIRE(last == '\n');
+  std::filesystem::remove(path);
+}
+
+TEST(write_target_list_empty_is_empty_file) {
+  const std::string path = "/tmp/secred_test_targets_empty.txt";
+  std::set<RawIntegral> targets;
+  writeTargetList(path, targets);
+  REQUIRE(std::filesystem::file_size(path) == 0);
+  std::filesystem::remove(path);
+}
+
+// ---------------------------------------------------------------------------
+// initial_seed_bounds — smallest box covering a sector's requests
+// ---------------------------------------------------------------------------
+
+TEST(initial_seed_bounds_no_requests_is_base_layer) {
+  // Sector 0b101 (two lines) asked for nothing beyond its base layer: with no
+  // minimum-1 restriction the box is the base layer itself, i.e. zero excess
+  // depth, not the one-layer-too-big box the old floor forced.
+  auto [depth, rank] = initial_seed_bounds(0b101, {}, {});
+  REQUIRE(depth == 2u);   // popcount(0b101), not 3
+  REQUIRE(rank == 1u);    // the rank floor is unchanged
+}
+
+TEST(initial_seed_bounds_uptarget_at_base_depth_keeps_floor_off) {
+  // An uptarget is reduced in place, so it needs its own depth only: a base
+  // integral (all its lines at power 1) does not raise the box at all.  This is
+  // the case the removed floor used to inflate to popcount + 1.
+  std::set<RawIntegral> uptargets{RI({1, 0, 1})};
+  auto [depth, rank] = initial_seed_bounds(0b101, {}, uptargets);
+  REQUIRE(depth == 2u);
+  REQUIRE(rank == 1u);
+}
+
+TEST(initial_seed_bounds_uptarget_depth_lifts_box) {
+  // A deeper uptarget lifts the box to its own depth, without the extra +1 a
+  // direct target gets.
+  std::set<RawIntegral> uptargets{RI({3, 0, 1})};  // depth 4, rank 0
+  auto [depth, rank] = initial_seed_bounds(0b101, {}, uptargets);
+  REQUIRE(depth == 4u);
+  REQUIRE(rank == 1u);
+}
+
+TEST(initial_seed_bounds_target_gets_one_layer_more) {
+  // A direct target needs the layer above it, so its depth contributes +1.
+  std::set<RawIntegral> targets{RI({2, 0, 0})};  // depth 2, rank 0
+  auto [depth, rank] = initial_seed_bounds(0b101, targets, {});
+  REQUIRE(depth == 3u);
+  REQUIRE(rank == 1u);
+}
+
+TEST(initial_seed_bounds_rank_from_negative_indices) {
+  // Rank is read off the negative (numerator) powers: the deepest request wins,
+  // and every one of them contributes +1.
+  std::set<RawIntegral> targets{RI({1, 0, 1}), RI({-2, 0, 1})};
+  std::set<RawIntegral> uptargets{RI({1, 0, -3})};
+  auto [depth, rank] = initial_seed_bounds(0b101, targets, uptargets);
+  REQUIRE(depth == 3u);  // max(base 2, target [1,0,1]: 2 + 1)
+  REQUIRE(rank == 4u);   // max(1, target [-2,0,1]: 2 + 1, uptarget [1,0,-3]: 3 + 1)
+}
+
+TEST(initial_seed_bounds_never_below_base_layer) {
+  // Every request belongs to this sector, so it has at least popcount(id)
+  // positive units: the box can never fall below the base layer, which is what
+  // keeps the unsigned excess-depth arithmetic in _generate_seeds sound.
+  const unsigned id = 0b1011;
+  std::set<RawIntegral> uptargets{RI({1, 1, 1, 1})};
+  auto [depth, rank] = initial_seed_bounds(id, {}, uptargets);
+  REQUIRE(depth >= std::popcount(id));
+  REQUIRE(depth == 4u);
+  REQUIRE(rank == 1u);
+}
+
+TEST(initial_seed_bounds_matches_observed_sector_box) {
+  // Reproduce a sector log line: sector 0b111 with target [1,1,1] (depth 3)
+  // gets depth 4, i.e. "dot: 1" in the log (dot = depth - popcount(id)).
+  std::set<RawIntegral> targets{RI({1, 1, 1})};
+  auto [depth, rank] = initial_seed_bounds(0b111, targets, {});
+  REQUIRE(depth == 4u);
+  REQUIRE(depth - std::popcount(0b111u) == 1u);
+  REQUIRE(rank == 1u);
+}
+
+TEST(initial_seed_bounds_matches_observed_deep_sector_box) {
+  // A deeper target reproduces a "dot: 2" sector: sector 0b111 asked for
+  // [1, 1, 2] (depth 4) gets depth 5.
+  std::set<RawIntegral> targets{RI({1, 1, 2})};
+  auto [depth, rank] = initial_seed_bounds(0b111, targets, {});
+  REQUIRE(depth == 5u);
+  REQUIRE(depth - std::popcount(0b111u) == 2u);
+}
+
+TEST(initial_seed_bounds_dot_is_zero_only_for_base_layer_box) {
+  // "dot" as logged is exactly this difference, so it is 0 iff the box is the
+  // base layer.  The old floor (`_depth = popcount(id) + 1`) made that
+  // unreachable: it forced the excess — and therefore dot — to be at least 1.
+  const unsigned id = 0b10110;               // five propagators, lines 1, 2, 4
+  std::set<RawIntegral> uptargets{RI({0, 1, 1, 0, 1})};  // the base integral
+  auto [depth, rank] = initial_seed_bounds(id, {}, uptargets);
+  REQUIRE(depth - std::popcount(id) == 0u);  // "dot: 0"
+  REQUIRE(rank == 1u);
+}
+
+// ---------------------------------------------------------------------------
+// format_seed_box_line — the seed box a sector was reduced with, and the box
+// the probe pass started from
+// ---------------------------------------------------------------------------
+
+TEST(seed_box_line_reports_probe_start_when_raised) {
+  // id 0b111 (three lines): reduced with depth 5 (dot 2), the probe started at
+  // depth 4 (dot 1) and raised the bound once.
+  REQUIRE(format_seed_box_line(0b111, 5, 4, 4, 4) ==
+          " dot: 2 rank: 3  probe start: dot: 1 rank: 3");
+}
+
+TEST(seed_box_line_repeats_start_when_probe_did_not_raise) {
+  REQUIRE(format_seed_box_line(0b101, 3, 2, 3, 2) ==
+          " dot: 1 rank: 1  probe start: dot: 1 rank: 1");
+}
+
+TEST(seed_box_line_base_layer_box_is_dot_zero) {
+  // A base-layer box (no request beyond the sector's own lines) is dot 0 — the
+  // value the removed `_depth = popcount(id) + 1` floor made unreachable.
+  REQUIRE(format_seed_box_line(0b1011, 3, 2, 3, 2) ==
+          " dot: 0 rank: 1  probe start: dot: 0 rank: 1");
+}

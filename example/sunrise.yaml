@@ -32,6 +32,7 @@ settings:
   threads: 64                 # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
   subsector_depth_offset: 1   # depth offset n for the subsector filter: depth < _depth - n
+  kira_parallel: 8            # Kira -p; Kira also starts this many Fermat instances at the end of the run
   cache_dir: cache_sunrise    # directory for the global system and Kira scratch files
 
 targets:

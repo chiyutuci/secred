@@ -13,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <sstream>
+#include <tuple>
 
 #include "numeric_solver_mod.h"
 
@@ -108,6 +109,46 @@ void createJobFile(const std::string &filename, bool otf) {
   file << "       - [targets]" << std::endl;
 
   file.close();
+}
+
+void writeTargetList(const std::string &path,
+                     const std::set<RawIntegral> &targets) {
+  std::ofstream file(path);
+  for (const auto &integral : targets)
+    file << integral << '\n';
+  // The stream dies here: the buffered tail is flushed and the file is a
+  // complete snapshot on disk even though the sector keeps running.
+}
+
+std::pair<unsigned, unsigned>
+initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
+                    const std::set<RawIntegral> &uptargets) {
+  unsigned rank = 1;
+  unsigned depth = std::popcount(id);
+  for (const auto &integral : targets) {
+    rank = std::max(rank, integral.rank() + 1);
+    depth = std::max(depth, integral.depth() + 1);
+  }
+  for (const auto &integral : uptargets) {
+    rank = std::max(rank, integral.rank() + 1);
+    depth = std::max(depth, integral.depth());
+  }
+  return {depth, rank};
+}
+
+std::string format_seed_box_line(unsigned id, unsigned depth, unsigned rank,
+                                 unsigned initialDepth, unsigned initialRank) {
+  // dot = excess depth of the box above the sector's own base layer, i.e.
+  // depth - popcount(id): 0 means the box is exactly that base layer (the
+  // smallest box initial_seed_bounds can return, where no seed generates
+  // equations and the probe raises the bound).  "probe start" repeats the same
+  // two figures for the box the probe pass ran with, before any raise; it equals
+  // the leading pair when the probe did not raise.
+  std::ostringstream oss;
+  oss << " dot: " << (int)depth - (int)std::popcount(id) << " rank: " << rank - 1
+      << "  probe start: dot: " << (int)initialDepth - (int)std::popcount(id)
+      << " rank: " << initialRank - 1;
+  return oss.str();
 }
 
 void Sector::_generate_combinations(int number, int sum) {
@@ -228,16 +269,13 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
     return;
   }
 
-  _rank = 1;
-  _depth = std::popcount(_id) + 1;
-  for (const auto &integral : ctx.targets[_id]) {
-    _rank = std::max(_rank, integral.rank() + 1);
-    _depth = std::max(_depth, integral.depth() + 1);
-  }
-  for (const auto &integral : ctx.uptargets[_id]) {
-    _rank = std::max(_rank, integral.rank() + 1);
-    _depth = std::max(_depth, integral.depth());
-  }
+  // Smallest box covering the sector's targets; see initial_seed_bounds.  Keep
+  // it: the probe below may raise the bounds once, and a sector's log reports
+  // both so the probe's starting point stays visible.
+  std::tie(_depth, _rank) = initial_seed_bounds(_id, ctx.targets[_id],
+                                                ctx.uptargets[_id]);
+  _initialDepth = _depth;
+  _initialRank = _rank;
 
   namespace fs = std::filesystem;
   std::string sectorpath =
@@ -318,7 +356,6 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
       cfg.cache_dir + "/sectors/sector" + std::to_string(_id);
   fs::create_directories(sectorpath);
   std::ofstream file(sectorpath + "/log");
-  std::ofstream targetfile(sectorpath + "/targets");
   file << "sector " << _id << ":" << '\n';
 
   // Wait for system memory headroom BEFORE generating seeds.  A blocked sector
@@ -457,11 +494,14 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   // set target integrals
   for (const auto &integral : ctx.uptargets[_id])
     ctx.targets[_id].insert(integral);
-  for (const auto &integral : ctx.targets[_id])
-    targetfile << integral << '\n';
+  // Diagnostic snapshot of the list this sector reduces.  writeTargetList
+  // closes its stream, so the file is complete on disk from here on, not only
+  // once the sector finishes.
+  writeTargetList(sectorpath + "/targets", ctx.targets[_id]);
   unsigned neededvars = ctx.targets[_id].size();
-  file << "\n dot: " << _depth - std::popcount(_id) - 1
-       << " rank: " << _rank - 1 << '\n';
+  file << '\n' << format_seed_box_line(_id, _depth, _rank, _initialDepth,
+                                       _initialRank)
+       << '\n';
   file << "\n integrals: " << nvars << " sub integrals: " << nsubint
        << '\n';
   file << " seeds: " << nseeds << "  outer: " << nouter << '\n';

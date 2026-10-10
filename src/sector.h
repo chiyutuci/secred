@@ -403,6 +403,36 @@ struct ReductionContext {
 // at the cost of slower random access.
 void createJobFile(const std::string &filename, bool otf = false);
 
+// Initial seed-box bounds (max depth, max rank) for a sector: the smallest box
+// that covers everything the sector is asked for.  A target needs one layer
+// above itself (the equations then reduce it away), an uptarget is reduced in
+// place, so it only needs its own depth.  There is no extra floor: a sector
+// whose requests reach no further than its own base layer starts at zero excess
+// depth.  Both sets only ever hold integrals of this very sector (their lines
+// are the sector's lines), so the result always satisfies
+// depth >= popcount(id) — the excess-depth arithmetic in _generate_seeds stays
+// non-negative and the probe pass raises the bound once if the small box turns
+// out to be insufficient.
+std::pair<unsigned, unsigned>
+initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
+                    const std::set<RawIntegral> &uptargets);
+
+// One sector log's seed-box line: the box the sector was actually reduced with
+// and, after "probe start:", the box the probe pass ran with before its single
+// raise.  Both pairs are "dot rank", dot being the box's excess depth above the
+// sector's base layer (depth - popcount(id), so 0 = exactly the base layer) and
+// rank being rank - 1.  The two pairs are equal when the probe did not raise.
+std::string format_seed_box_line(unsigned id, unsigned depth, unsigned rank,
+                                 unsigned initialDepth, unsigned initialRank);
+
+// Dump a sector's target list (one operator<< form per line) to `path`.  The
+// stream is closed before returning, so the file on disk is a complete,
+// newline-terminated snapshot from the moment this returns.  Holding the
+// stream open for the sector's lifetime left it at the 8 KiB filebuf boundary,
+// cut mid-number, until the sector finished.
+void writeTargetList(const std::string &path,
+                     const std::set<RawIntegral> &targets);
+
 class Sector {
 public:
   friend class SectorTestHelper;
@@ -447,6 +477,10 @@ private:
   unsigned _depth = 0;
   // maximum rank
   unsigned _rank = 0;
+  // the bounds above as derived for the probe pass, before its single raise;
+  // kept so the log can report where the probe started (see format_seed_box_line)
+  unsigned _initialDepth = 0;
+  unsigned _initialRank = 0;
   // lines
   std::vector<bool> _lines;
 
