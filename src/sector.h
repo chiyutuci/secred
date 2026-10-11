@@ -285,12 +285,19 @@ unsigned
 select_dum_eq_from_file(const std::string &path,
                         const std::unordered_map<RawIntegral, unsigned> &id_map);
 
-// Wall-clock cost of one sector's adaptive two-pass seeding (ATPS).
-// probeNanos is the sector's single probe pass, fullNanos the full pass that
-// follows.  The memory gate (SectorRunGuard) is constructed inside each pass,
-// so a headroom wait is counted in the pass that waited.  `expanded` records
-// that the probe found the initial depth/rank too small, so they were raised
-// once before the full pass.
+// Wall-clock cost of one sector's adaptive seeding (ATPS).  Which pass is which
+// depends on the engine.  Under `fflow` the sector runs a probe pass and then the
+// full pass that follows: probeNanos is the probe, fullNanos that full pass.  Under
+// `pyred` every round is a full pass (`skip_subsectors = false`): probeNanos
+// accumulates the reporting rounds that were discarded — each charged the
+// cache-directory removal that preceded it — and fullNanos is the one settling
+// round that spilled, 0 for a sector dropped at the round cap.  The two engines'
+// figures are therefore not comparable with each other, nor with this project's
+// pre-stage-S runs.  The memory gate (SectorRunGuard) is constructed inside each
+// pass, so a headroom wait is counted in the pass that waited.  `expanded` records
+// that the initial depth/rank were found too small and the box was widened before
+// the settling pass (`fflow`: at most once, before the single full pass; `pyred`:
+// once per reporting round).
 struct SectorTiming {
   unsigned id = 0;
   bool expanded = false;
@@ -336,19 +343,25 @@ struct ReductionContext {
 
   // Per-sector seed-range narrowing statistics (updated atomically by worker threads).
   // narrowingSuccess: sectors where the initial depth/rank bounds (derived from targets)
-  //   were sufficient — the probe pass returned 0.
-  // narrowingFail: sectors where the probe pass reported the bounds too small and
-  //   they were raised once before the full pass.
+  //   were sufficient — the first pass settled without reporting (`fflow`: the probe
+  //   pass returned 0; `pyred`: the settling round reported nothing).
+  // narrowingFail: sectors that had to widen the bounds at least once before settling.
   std::atomic<unsigned> narrowingSuccess{0};
   std::atomic<unsigned> narrowingFail{0};
 
-  // Total raw equations generated across all sectors in the full (second) pass.
+  // Total raw equations generated across all sectors in the passes that count: the
+  // full (second) pass under `fflow`, every round — the discarded ones included —
+  // under `pyred`.
   std::atomic<unsigned> rawEquationsTotal{0};
 
-  // Sector-reduction (ATPS) wall-clock totals in nanoseconds.  probeNanos
-  // accumulates every sector's probe pass, fullNanos the full passes; their
-  // ratio is the probe pass's share of the reduction work.  The memory gate
-  // lives inside each pass, so headroom waits are included in these figures.
+  // Sector-reduction (ATPS) wall-clock totals in nanoseconds: the sum of the
+  // per-sector `SectorTiming` figures above.  probeNanos accumulates every sector's
+  // probe pass (under `pyred`: the discarded reporting rounds), fullNanos the
+  // settling passes; their ratio is the discarded rounds' share of the reduction
+  // work — under `pyred` that is the share of the work the round loop throws away,
+  // not what `fflow`'s cheaper seed-only probe costs, so the figure is not
+  // comparable across engines.  The memory gate lives inside each pass, so headroom
+  // waits are included in these figures.
   std::atomic<std::uint64_t> probeNanos{0};
   std::atomic<std::uint64_t> fullNanos{0};
   // Serializes appends to sector_timing.csv.
