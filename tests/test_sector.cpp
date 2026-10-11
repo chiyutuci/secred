@@ -1734,3 +1734,30 @@ TEST(widen_for_applied_twice_matches_two_widenings) {
   REQUIRE(b.limit == 13u);  // max(12, 8 + 5)
   REQUIRE(b.seed_top() == 11);
 }
+
+// ---------------------------------------------------------------------------
+// Stage S: what the driver does after a round (round_action).  Round indices are
+// 0-based, and the rule mirrors the probe loop it replaces: the cap is checked
+// before a widening, so the last round reports and is dropped without widening.
+// ---------------------------------------------------------------------------
+
+TEST(round_action_settles_on_a_clean_pass_at_every_round) {
+  for (unsigned round = 0; round < kMaxRounds; ++round)
+    REQUIRE(round_action(round, 0) == RoundAction::Settle);
+}
+
+TEST(round_action_widens_while_rounds_remain_and_gives_up_at_the_cap) {
+  const unsigned reports[] = {1u, 2u, 3u, 5u};
+  for (unsigned round = 0; round + 1 < kMaxRounds; ++round)
+    for (unsigned bits : reports)
+      REQUIRE(round_action(round, bits) == RoundAction::Widen);
+  for (unsigned bits : reports)
+    REQUIRE(round_action(kMaxRounds - 1, bits) == RoundAction::GiveUp);
+}
+
+TEST(round_action_treats_a_lone_repair_hint_as_a_report) {
+  // Bit 4 alone cannot arrive, but it is not a clean pass either: the round must
+  // not be taken for one that settled.
+  REQUIRE(round_action(0, 4) == RoundAction::Widen);
+  REQUIRE(round_action(kMaxRounds - 1, 4) == RoundAction::GiveUp);
+}

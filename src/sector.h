@@ -699,6 +699,32 @@ struct SeedBound {
   }
 };
 
+// How many passes a sector may spend settling its seed box before the driver gives
+// up on it with a warning; one cap for both engines (the fflow probe loop and the
+// pyred round loop).
+inline constexpr unsigned kMaxRounds = 8;
+
+// What the driver does after one pass of a sector: Settle means the pass reported
+// nothing, so it propagated its masters and uptargets and spilled its equations;
+// Widen means it reported a seed outside the box, so its work is thrown away and
+// the caller widens by the reported bits (SeedBound::widen_for) and runs again;
+// GiveUp means the cap is reached with the pass still reporting, so the sector is
+// dropped -- it contributes no masters, no uptargets and no equations, exactly as a
+// dropped reporting pass does today.  Named here, next to the box rule, so the
+// termination policy is testable without running a reduction.
+enum class RoundAction { Settle, Widen, GiveUp };
+
+// Round indices are 0-based, so `round + 1` is the number of passes run: the cap
+// fires on the kMaxRounds-th reporting pass, matching the probe loop that widens
+// only while rounds remain.
+constexpr RoundAction round_action(unsigned round, unsigned refusalBits) {
+  if (refusalBits == 0)
+    return RoundAction::Settle;
+  if (round + 1 == kMaxRounds)
+    return RoundAction::GiveUp;
+  return RoundAction::Widen;
+}
+
 // Initial seed-box bounds (max depth, max rank) for a sector: the smallest box
 // that covers everything the sector is asked for.  A target needs one layer
 // above itself (the equations then reduce it away), an uptarget is reduced in

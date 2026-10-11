@@ -357,7 +357,6 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   // made alone deepens the box and leaves the cap where it is.  The passes are cheap
   // next to the full one -- they carry no subsector integrals -- and the box they
   // settle on is what the full pass below reduces with.
-  constexpr unsigned kMaxProbeRounds = 8;
   unsigned result = 0;
   unsigned probeRounds = 0;
   auto probeBegin = std::chrono::steady_clock::now();
@@ -368,7 +367,7 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
     if (result == 0)
       break;
     ++probeRounds;
-    if (probeRounds == kMaxProbeRounds) {
+    if (probeRounds == kMaxRounds) {
       // Every widening so far has brought in a seed the reduction still could not
       // close on.  The bound is a heuristic input, not a guarantee, so stop here
       // and let the full pass -- and its own report -- speak for the sector.
