@@ -328,15 +328,17 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
                              const std::vector<IBPProtoFFmod> &ibps_mod,
                              const std::vector<IBPProtoM> *ibps_sym,
                              const SectorConfig &cfg, ReductionContext &ctx) {
+  // Sectors no request reaches never start: they get neither a round nor a cache
+  // directory.  Keep this above everything else.
   if (ctx.targets[_id].empty() && ctx.uptargets[_id].empty()) {
     _print_progress(ctx);
     return;
   }
 
   // Smallest box covering the sector's targets; see initial_seed_bounds, and
-  // SeedBound for the boundary rule built on top of it.  Keep it: the probe
-  // below may relax the boundary once, and a sector's log reports both so the
-  // probe's starting point stays visible.
+  // SeedBound for the boundary rule built on top of it.  Keep it: a widening below
+  // may relax the boundary once or more, and a sector's log reports both so the
+  // starting point stays visible.
   unsigned boxDepth, boxRank;
   std::tie(boxDepth, boxRank) = initial_seed_bounds(_id, ctx.targets[_id],
                                                     ctx.uptargets[_id]);
@@ -347,84 +349,148 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   std::string sectorpath =
       cfg.cache_dir + "/sectors/sector" + std::to_string(_id);
 
-  // First run(s): skip all subsector integrals to check that the box covers every
-  // integral the sector still needs.  A pass that reports an inadmissible seed
-  // (SeedBound::exceeded -- past the top of the box, or through its depth cap under
-  // that top) reports, per offending seed, which figure of the box refuses it
-  // (SeedBound::refusal); widening that figure by one layer admits it, so the loop
-  // repeats until a pass reports nothing.  A depth widening carries the Total cap
-  // along only when the box top is what was reported (bit 4); a report the depth cap
-  // made alone deepens the box and leaves the cap where it is.  The passes are cheap
-  // next to the full one -- they carry no subsector integrals -- and the box they
-  // settle on is what the full pass below reduces with.
-  unsigned result = 0;
-  unsigned probeRounds = 0;
-  auto probeBegin = std::chrono::steady_clock::now();
-  while (true) {
-    _probeRounds = probeRounds + 1;
+  // One round = one pass over the current box, with the per-round tables released
+  // first (the flow-2 session and matrix were destroyed inside the previous pass).
+  auto run_round = [&](bool skip_subsectors) {
     clear();
-    result = sector_reduction_ff_n(ibps, ibps_mod, ibps_sym, cfg, ctx, true);
-    if (result == 0)
-      break;
-    ++probeRounds;
-    if (probeRounds == kMaxRounds) {
-      // Every widening so far has brought in a seed the reduction still could not
-      // close on.  The bound is a heuristic input, not a guarantee, so stop here
-      // and let the full pass -- and its own report -- speak for the sector.
-      std::cerr << "warning: sector " << _id << ": probe still finds seeds"
-                << " outside the box after " << probeRounds << " widenings"
-                << " (depth " << _bound.depth << ", rank " << _bound.rank
+    return sector_reduction_ff_n(ibps, ibps_mod, ibps_sym, cfg, ctx,
+                                 skip_subsectors);
+  };
+
+  // Whether the box was widened at all, i.e. whether the sector settled on a box
+  // past the one initial_seed_bounds returned.
+  bool expanded = false;
+  std::uint64_t probeNanos = 0;  // time in rounds whose work was thrown away
+  std::uint64_t fullNanos = 0;   // time in the round that settled and spilled
+
+  if (cfg.sector_elimination == SectorElimination::Pyred) {
+    // Every round is a full pass, so the criterion that decides the box sees the
+    // subsector columns too -- it reports no more often than the seed-only probe did,
+    // and it can settle a sector on a narrower box than the probe would have chosen.
+    // A pass that reports an inadmissible seed (SeedBound::exceeded -- past the top
+    // of the seed box, or through its depth cap under that top) spills nothing: it
+    // returns at the criterion, before the masters/uptargets propagation and before
+    // the equations are appended, so the next round starts from a clean directory and
+    // an unchanged ctx and only the box differs.  Widening the reported figure by one
+    // layer admits that seed (_bound.widen_for; a depth widening carries the Total
+    // cap along only when the box top was what was reported, bit 4), and the loop
+    // repeats until a round reports nothing -- that round is the one that settles and
+    // spills.  So the "one expansion suffices" assumption the two-pass scheme made is
+    // no longer load-bearing: a report widens instead of dropping the sector.
+    for (unsigned round = 0;; ++round) {
+      // A re-run can find a directory an earlier run left behind, and a reporting
+      // round leaves its own partial files (targets, the seed-box line; see below).
+      // The deletion is charged to the round that follows it, as it is for the fflow
+      // full pass.
+      const auto roundBegin = std::chrono::steady_clock::now();
+      fs::remove_all(sectorpath);
+      _probeRounds = round + 1;
+      const unsigned result = run_round(/*skip_subsectors=*/false);
+      const std::uint64_t nanos =
+          (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - roundBegin)
+              .count();
+      const RoundAction action = round_action(round, result);
+      if (action == RoundAction::Settle) {
+        fullNanos = nanos;
+        break;
+      }
+      probeNanos += nanos;
+      if (action == RoundAction::GiveUp) {
+        // Every widening so far has brought in a seed the reduction still could not
+        // close on.  The bound is a heuristic input, not a guarantee, so stop here:
+        // this round reported, so it settles nothing and the sector contributes no
+        // masters, no uptargets and no equations -- which is what the fflow path
+        // reaches through its own cap warning plus a reporting full pass.
+        std::cerr << "warning: sector " << _id << ": still finds seeds outside the"
+                  << " box after " << kMaxRounds << " passes (depth " << _bound.depth
+                  << ", rank " << _bound.rank
+                  << (_bound.mode == BoundaryMode::Total
+                          ? ", total " + std::to_string(_bound.limit)
+                          : std::string())
+                  << ")\n";
+        break;
+      }
+      expanded = true;
+      _bound.widen_for(result);
+    }
+  } else {
+    // fflow: skip all subsector integrals first, to check that the box covers every
+    // integral the sector still needs.  A pass that reports an inadmissible seed
+    // reports, per offending seed, which figure of the box refuses it
+    // (SeedBound::refusal); widening that figure by one layer admits it, so the loop
+    // repeats until a pass reports nothing.  The passes are cheap next to the full
+    // one -- they carry no subsector integrals -- and the box they settle on is what
+    // the full pass below reduces with.
+    unsigned probeRounds = 0;
+    const auto probeBegin = std::chrono::steady_clock::now();
+    while (true) {
+      _probeRounds = probeRounds + 1;
+      const unsigned result = run_round(/*skip_subsectors=*/true);
+      if (result == 0)
+        break;
+      ++probeRounds;
+      if (probeRounds == kMaxRounds) {
+        // Every widening so far has brought in a seed the reduction still could not
+        // close on.  The bound is a heuristic input, not a guarantee, so stop here
+        // and let the full pass -- and its own report -- speak for the sector.
+        std::cerr << "warning: sector " << _id << ": probe still finds seeds"
+                  << " outside the box after " << probeRounds << " widenings"
+                  << " (depth " << _bound.depth << ", rank " << _bound.rank
+                  << (_bound.mode == BoundaryMode::Total
+                          ? ", total " + std::to_string(_bound.limit)
+                          : std::string())
+                  << ")\n";
+        break;
+      }
+      _bound.widen_for(result);
+    }
+    expanded = probeRounds > 0;
+    const auto probeEnd = std::chrono::steady_clock::now();
+    probeNanos =
+        (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            probeEnd - probeBegin)
+            .count();
+
+    // Full computation with filtered subsector integrals.  The memory gate +
+    // running-sector accounting happen inside sector_reduction_ff_n.  It also
+    // discards the failed probe's cache, so the probe above leaves it in place.
+    const auto fullBegin = std::chrono::steady_clock::now();
+    fs::remove_all(sectorpath);
+    const unsigned fullResult = run_round(/*skip_subsectors=*/false);
+    const auto fullEnd = std::chrono::steady_clock::now();
+    fullNanos =
+        (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            fullEnd - fullBegin)
+            .count();
+    if ((fullResult & 3) != 0) {
+      // That a single expansion always suffices is what the two-pass scheme
+      // assumes; if it ever fails to hold, the equations just collected are
+      // incomplete, so report it rather than reduce silently with too narrow a
+      // bound.  Bit 4 is the probe's repair hint, not a figure of the box, so it is
+      // masked out here (and it cannot arrive alone -- a seed that reports it also
+      // pins a hard cap).
+      std::cerr << "warning: sector " << _id << ": full pass still needs a wider"
+                << " bound (code " << (fullResult & 3) << ", depth " << _bound.depth
+                << ", rank " << _bound.rank
                 << (_bound.mode == BoundaryMode::Total
-                        ? ", total " + std::to_string(_bound.limit)
+                        ? ", total " + std::to_string(_bound.limit - 1)
                         : std::string())
                 << ")\n";
-      break;
     }
-    _bound.widen_for(result);
   }
-  bool probeExpanded = probeRounds > 0;
-  auto probeEnd = std::chrono::steady_clock::now();
-  if (probeExpanded)
+
+  if (expanded)
     ctx.narrowingFail.fetch_add(1, std::memory_order_relaxed);
   else
     ctx.narrowingSuccess.fetch_add(1, std::memory_order_relaxed);
 
-  // Second run: full computation with filtered subsector integrals.  The memory
-  // gate + running-sector accounting happen inside sector_reduction_ff_n.  It
-  // also discards the failed probe's cache, so the probe above leaves it in
-  // place.
-  auto fullBegin = std::chrono::steady_clock::now();
-  fs::remove_all(sectorpath);
-  clear();
-  unsigned fullResult =
-      sector_reduction_ff_n(ibps, ibps_mod, ibps_sym, cfg, ctx, false);
-  auto fullEnd = std::chrono::steady_clock::now();
-  if ((fullResult & 3) != 0) {
-    // That a single expansion always suffices is what the two-pass scheme
-    // assumes; if it ever fails to hold, the equations just collected are
-    // incomplete, so report it rather than reduce silently with too narrow a
-    // bound.  Bit 4 is the probe's repair hint, not a figure of the box, so it is
-    // masked out here (and it cannot arrive alone -- a seed that reports it also
-    // pins a hard cap).
-    std::cerr << "warning: sector " << _id << ": full pass still needs a wider"
-              << " bound (code " << (fullResult & 3) << ", depth " << _bound.depth
-              << ", rank " << _bound.rank
-              << (_bound.mode == BoundaryMode::Total
-                      ? ", total " + std::to_string(_bound.limit - 1)
-                      : std::string())
-              << ")\n";
-  }
-
   {
     SectorTiming t;
     t.id = _id;
-    t.expanded = probeExpanded;
-    t.probeNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                       probeEnd - probeBegin)
-                       .count();
-    t.fullNanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      fullEnd - fullBegin)
-                      .count();
+    t.expanded = expanded;
+    t.probeNanos = probeNanos;
+    t.fullNanos = fullNanos;
     ctx.recordTiming(t);
   }
 
@@ -589,11 +655,15 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   writeTargetList(sectorpath + "/targets", ctx.targets[_id]);
   unsigned neededvars = ctx.targets[_id].size();
   file << '\n' << format_seed_box_line(_id, _bound, _initialBound)
-       // How many probe passes it took to settle the bound: the driver widens the
-       // box and probes again while a pass still reports a seed outside it, so
-       // "probe rounds: 3" says the leading triple is two widenings past "probe
-       // start".  The full pass reports the count of the probe passes before it.
-       << "  probe rounds: " << _probeRounds << '\n';
+       // How many passes it took to settle the bound: the driver widens the box and
+       // runs another pass while one still reports a seed outside it, so "rounds: 3"
+       // says the leading triple is two widenings past "probe start".  Under pyred
+       // every pass is a full one and the pass that settles is the one that spilled,
+       // so the field is spelled without "probe"; under fflow these are the seed-only
+       // probe passes, and the full pass reports the count of them.
+       << (cfg.sector_elimination == SectorElimination::Pyred ? "  rounds: "
+                                                             : "  probe rounds: ")
+       << _probeRounds << '\n';
   file << "\n integrals: " << nvars << " sub integrals: " << nsubint
        << '\n';
   file << " seeds: " << nseeds << "  outer: " << nouter << '\n';
