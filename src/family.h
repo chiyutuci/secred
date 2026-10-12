@@ -7,7 +7,9 @@
 #include "ginac/ginac.h"
 #include "yaml-cpp/yaml.h"
 
+#include "globalreduce.h"
 #include "sector.h"
+#include "symmetry.h"
 #include "utils.h"
 
 class Family {
@@ -26,6 +28,18 @@ public:
   // run the reduction
   void run_reduce(Reduce &);
 
+  // number of propagators
+  unsigned nprops() const { return _nprops; }
+
+  // Non-trivial sectors of the family inside `top` (index = sector id, true =
+  // non-trivial), by the Euler-form triviality test.  This is the "#0.4
+  // Searching trivial sectors" stage of init_reduce, on its own so that the
+  // symmetry detector can be driven without the rest of the reduction.
+  std::vector<bool> nontrivial_sectors(unsigned top) const;
+
+  // The symmetry detector's view of this family (spec 4.3).  The references
+  // point into *this, so the result is used immediately and never stored.
+  SymmetryTable::Inputs symmetry_inputs() const;
 
 private:
   // compute expressions of scalar products over propagators
@@ -45,8 +59,12 @@ private:
   // parallel reduction strategies
   void _run_reduce_layer(Reduce &) const;
   void _run_reduce_fine(Reduce &) const;
-  // post-reduction global kira solve (ff_n path only)
-  void _run_global_kira(Reduce &) const;
+  // Post-reduction global solve: it orders the spilled equations into a global
+  // system and then either hands it to the Kira subprocess or runs the
+  // in-process FiniteFlow reduction.  The returned result carries the
+  // FiniteFlow phase split (both zero on the Kira path) into the run's
+  // Timing Statistics block.
+  GlobalReductionResult _run_global_kira(Reduce &) const;
 
 public:
   static GiNaC::symtab symtab;
@@ -72,6 +90,10 @@ private:
   std::vector<GiNaC::possymbol> _symbols;
   // propagators
   std::vector<GiNaC::ex> _propagators;
+  // the signed momentum flow q_k of each propagator, D_k = q_k^2 - m_k^2, in the
+  // family's own symbols.  The symmetry detector reads its linear data off this
+  // by differentiation; nothing else uses it.
+  std::vector<GiNaC::ex> _propMomenta;
   // scalar products rules
   GiNaC::lst _spsRules;
   // scalar products over propagators
@@ -90,7 +112,9 @@ private:
   std::string _kira_jobs_file = "jobs.yaml";
   unsigned _kira_bunch_size   = 64;
   unsigned _kira_parallel     = 64;
-  unsigned _subsector_depth_offset = 1;
+  // Offset n of the subsector filter (see SectorConfig).
+  unsigned _subsector_filter_n = 1;
+  // Integral order of the per-sector stage; see OrderingMode.
   OrderingMode _ordering_mode      = OrderingMode::Balance;
   // System-memory headroom kept free during parallel sector execution (default 60 GB).
   std::uint64_t _memory_reserve = 60ULL * 1024 * 1024 * 1024;
@@ -102,13 +126,10 @@ private:
   std::vector<unsigned> _cut;
   unsigned _ncut = 0;
 
-  // on-the-fly loading in the global Kira reduction (parsed from settings:
-  // global_otf: true/false); when false the whole system is materialised.
-  bool _global_otf = false;
   // which tool performs the global reduction: "kira" (external Kira subprocess,
-  // default) or "finiteflow" (in-process FiniteFlow; pyred + CRT for pure-numeric
-  // systems, pyred + FiniteFlow rational-function reconstruction for symbolic
-  // systems). Parsed from settings: global_tool.
+  // default) or "finiteflow" (in-process FiniteFlow; the in-process solver + CRT
+  // for pure-numeric systems, + FiniteFlow rational-function reconstruction for
+  // symbolic systems). Parsed from settings: global_tool.
   std::string _global_tool = "kira";
   // number of threads for the FiniteFlow global reconstruction
   // (parsed from settings: global_finiteflow_threads; default 64). The Gaussian

@@ -1,6 +1,8 @@
 #include "family.h"
 #include "BS_thread_pool.hpp"
+#include "global_order.h"
 #include "globalreduce.h"
+#include "masters_file.h"
 #include "ginac/factor.h"
 #include <algorithm>
 #include <atomic>
@@ -75,10 +77,13 @@ void Family::run_reduce(Reduce &reduce) {
   else
     _run_reduce_layer(reduce);
   const auto sector_t1 = std::chrono::steady_clock::now();
-  std::cout << "[timing] sector reduction: "
-            << format_duration(
-                   std::chrono::duration<double>(sector_t1 - sector_t0).count())
-            << "\n";
+  const double sectorSeconds =
+      std::chrono::duration<double>(sector_t1 - sector_t0).count();
+  // Echoed here as well as in the end-of-run Timing Statistics block: the global
+  // phase that follows can run for hours, and this is the number that says how
+  // much of the run the sector phase took.
+  std::cout << "\n  [timing] sector reduction: "
+            << secred::format_duration(sectorSeconds) << "\n";
 
   // Release the remaining IBP prototypes and the intra-sector propagation
   // state.  They are only consumed while generating sector equations; without
@@ -132,12 +137,12 @@ void Family::run_reduce(Reduce &reduce) {
 
     char atpsLine[128];
     std::snprintf(atpsLine, sizeof(atpsLine),
-                  "\n ATPS: probe %.1f s / full %.1f s / probe share %.1f %%",
+                  "\n  ATPS: probe %.1f s / full %.1f s / probe share %.1f %%",
                   probeSeconds, fullSeconds, probeShare);
     std::cout << atpsLine << std::endl;  // flush: precedes the global phase
 
-    // 纯数值 + FiniteFlow 全局约化时,探测趟收窄统计并入 learn 之后的统一
-    // Reduction Statistics 汇总,这里不再单独打印。
+    // With the pure-numeric FiniteFlow global reduction the probe narrowing is
+    // folded into the Reduction Statistics summary printed after learn.
     if (!finiteflow_global)
       std::cout << "\n Probe narrowing: succeeded " << ok << " / failed " << fail
                 << " / total " << total << " ("
@@ -147,25 +152,35 @@ void Family::run_reduce(Reduce &reduce) {
 
   // Send the spilled equations to kira for the global reduction (numeric and
   // signed paths alike).
+  const auto global_t0 = std::chrono::steady_clock::now();
+  GlobalReductionResult globalResult;
   if (reduce._ctx.globalEquationsCount.load() > 0)
-    _run_global_kira(reduce);
+    globalResult = _run_global_kira(reduce);
   else {
     reduce._ctx.rawEqOut.reset();
     std::filesystem::remove(reduce._ctx.rawEquationsPath);
   }
+  const double globalSeconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - global_t0)
+          .count();
 
-  // Write the sector-local masters (pre-Kira) to cache/masters.
-  std::ofstream masters(_cache_dir + "/masters");
-  for (const auto &sector : reduce._ctx.allMasters)
-    for (const auto &integral : sector)
-      masters << integral << std::endl;
+  // Write the sector-local masters — the union of the per-sector masters, the
+  // candidates the global step then selects from — to cache/masters_sector; the
+  // basis the global reduction settles on is cache/masters_final.
+  {
+    std::vector<RawIntegral> sector_masters;
+    for (const auto &sector : reduce._ctx.allMasters)
+      sector_masters.insert(sector_masters.end(), sector.begin(), sector.end());
+    secred::write_masters_file(_cache_dir + "/" + secred::kMastersSectorFile,
+                               sector_masters);
+  }
 
   // Count final master integrals.
   //
-  // 数值路径(ff_n):Kira 的全局约化(扁平文件)在 INIT 阶段写
-  // global/results/Tuserweight/masters,FF_RECON 阶段写 masters.final。
-  // 优先取 'masters'(select 完整依赖分析,正确排除仅作主元列出现的
-  // 可约化积分),回退到 'masters.final',再回退到 sector 局部列表。
+  // Numeric path: the global reduction writes "masters" during INIT and
+  // "masters.final" during FF_RECON.  Prefer "masters" (full dependency analysis,
+  // which excludes integrals appearing only as pivots), then "masters.final",
+  // then the sector-local list.
   unsigned masterCount = 0;
   const std::string mastersInitPath =
       _cache_dir + "/global/results/Tuserweight/masters";
@@ -190,19 +205,59 @@ void Family::run_reduce(Reduce &reduce) {
   // reduce_global_finiteflow instead.)
   if (!finiteflow_global) {
     const auto &ctx = reduce._ctx;
-    std::cout << "\n----------------- Reduction Statistics ------------------\n"
-              << "  Master integrals:                      " << masterCount << "\n"
-              << "  Raw equations generated (full pass):   "
-              << ctx.rawEquationsTotal.load() << "\n"
-              << "  Equations in global system:            "
-              << ctx.globalEquationsCount.load() << "\n"
-              << "---------------------------------------------------------\n";
+    std::vector<std::string> labels{"Master integrals",
+                                    "Raw equations generated (full pass)",
+                                    "Equations in global system"};
+    // The equations kira selected for FireFly, when its log could be read: the
+    // system the reconstruction ran on, which is smaller than the one SecRed
+    // assembled.  A run whose log is unreadable says nothing rather than zero.
+    if (globalResult.firefly_equations)
+      labels.push_back("Equations to FireFly");
+    const std::size_t w = secred::block_label_width(labels);
+
+    std::vector<std::string> rows{
+        secred::block_row("Master integrals", std::to_string(masterCount), w),
+        secred::block_row("Raw equations generated (full pass)",
+                          std::to_string(ctx.rawEquationsTotal.load()), w),
+        secred::block_row("Equations in global system",
+                          std::to_string(ctx.globalEquationsCount.load()), w)};
+    if (globalResult.firefly_equations)
+      rows.push_back(secred::block_row(
+          "Equations to FireFly",
+          std::to_string(*globalResult.firefly_equations), w));
+
+    std::cout << "\n"
+              << secred::block_header("Reduction Statistics")
+              << secred::block_rows(rows) << "\n"
+              << secred::block_rule();
+  }
+
+  // Closing summary of where the run's wall-clock time went.  The finiteflow
+  // paths also report their own learn/reconstruction split; the Kira path has
+  // only the one global phase.
+  {
+    std::vector<secred::PhaseTiming> phases{
+        {"Sector reduction", sectorSeconds},
+        {"Global reduction", globalSeconds}};
+    if (globalResult.phase_split) {
+      phases.push_back({"Global learn", globalResult.learn_seconds});
+      phases.push_back({"Reconstruction", globalResult.reconstruction_seconds});
+    }
+    // The global kira run lives in a child the kernel measures on its own, so the
+    // block also reports the peak of the run including it — otherwise a run whose
+    // memory went into kira would report only what SecRed itself held.  The
+    // in-process finiteflow paths have no child and keep their single row.
+    std::cout << "\n"
+              << secred::format_timing_statistics(
+                     phases, secred::run_elapsed_seconds(),
+                     process_peak_memory(), globalResult.child_peak_bytes,
+                     "Kira");
   }
 }
 
 void Family::_run_reduce_layer(Reduce &reduce) const {
   BS::thread_pool pool(_threads);
-  SectorConfig scfg{_cache_dir, _subsector_depth_offset, _ordering_mode};
+  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode};
 
   // Hierarchical parallel execution: sectors are pre-sorted by descending
   // popcount(id), so iterating in order visits layers from highest to lowest.
@@ -264,7 +319,7 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
   for (unsigned i = 0; i < nsec; ++i)
     pending[i].store(parent_count[i], std::memory_order_relaxed);
 
-  SectorConfig scfg{_cache_dir, _subsector_depth_offset, _ordering_mode};
+  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode};
 
   std::atomic<unsigned> done_count{0};
   std::mutex done_mutex;
@@ -305,7 +360,7 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
   pool.wait_for_tasks();
 }
 
-void Family::_run_global_kira(Reduce &reduce) const {
+GlobalReductionResult Family::_run_global_kira(Reduce &reduce) const {
   auto &ctx = reduce._ctx;
 
   // Close the spill stream: all sectors have appended their equations.
@@ -320,16 +375,11 @@ void Family::_run_global_kira(Reduce &reduce) const {
                                          ctx.distinctIntegrals.end());
   ctx.distinctIntegrals.clear();  // free the set (contents now in the vector)
 
-  std::sort(all_integrals.begin(), all_integrals.end(),
-            [](const RawIntegral &a, const RawIntegral &b) {
-              unsigned pa = std::popcount(a.sector());
-              unsigned pb = std::popcount(b.sector());
-              if (pa != pb) return pa < pb;
-              if (a.depth() != b.depth()) return a.depth() < b.depth();
-              if (a.rank() != b.rank()) return a.rank() < b.rank();
-              if (a.sector() != b.sector()) return a.sector() < b.sector();
-              return a < b;
-            });
+  // The order is fixed by src/global_order.h: sector popcount first, then either
+  // the (depth, rank) key (Normal) or the balance key, with the sector mask and
+  // the lexicographic order as the deterministic tie-breaks that make it a total
+  // order.
+  secred::order_global_integrals(all_integrals, _ordering_mode);
 
   std::unordered_map<RawIntegral, unsigned> integral_id;
   integral_id.reserve(all_integrals.size());
@@ -340,23 +390,25 @@ void Family::_run_global_kira(Reduce &reduce) const {
   std::string global_path = _cache_dir + "/global";
   fs::create_directories(global_path + "/system");
 
-  // FiniteFlow option: reduce in-process with FiniteFlow (pyred elimination +
-  // CRT for pure-numeric, rational-function reconstruction for symbolic),
-  // skipping the Kira subprocess (and the "dum" symbol workaround) entirely.
+  // FiniteFlow option: reduce in-process (modular elimination + CRT for
+  // pure-numeric, rational-function reconstruction for symbolic), skipping the
+  // Kira subprocess (and the "dum" symbol workaround) entirely.
   if (_global_tool == "finiteflow") {
     GlobalReductionResult result;
+    const std::string mastersFinalPath =
+        _cache_dir + "/" + secred::kMastersFinalFile;
     if (_symbols.empty())
       result = reduce_global_finiteflow(
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
           ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
-          _global_finiteflow_threads);
+          mastersFinalPath, _global_finiteflow_threads);
     else
       result = reduce_global_finiteflow_symbolic(
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
           _symbols, ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
-          _global_finiteflow_threads);
+          mastersFinalPath, _global_finiteflow_threads);
     std::filesystem::remove(ctx.rawEquationsPath);
 
     fs::create_directories(global_path + "/results/Tuserweight");
@@ -382,7 +434,7 @@ void Family::_run_global_kira(Reduce &reduce) const {
     }
     if (!result.ok)
       std::cerr << "finiteflow global reduction did not complete cleanly\n";
-    return;
+    return result;
   }
 
   // Integral index table: one line per integral "<id> <RawIntegral>".
@@ -448,7 +500,7 @@ void Family::_run_global_kira(Reduce &reduce) const {
     }
   }
 
-  createJobFile(global_path + "/" + _kira_jobs_file, _global_otf);
+  createJobFile(global_path + "/" + _kira_jobs_file);
 
   std::string jobpath = _job_dir.empty() ? fs::current_path().string() : _job_dir;
   std::string kira_dir = (!global_path.empty() && global_path[0] == '/')
@@ -488,6 +540,21 @@ void Family::_run_global_kira(Reduce &reduce) const {
       }
     }
   }
+
+  // The Kira path has no learn/reconstruction split to report; Kira's own
+  // outputs are the masters and reductions it wrote above.
+  GlobalReductionResult kira_result;
+  kira_result.ok = true;
+  // Kira is the only child this process ever runs, so the kernel's account of the
+  // reaped children is its account of kira — the global stage's memory, which
+  // SecRed's own high-water mark does not cover.  Read after the call above
+  // returned, when the child's usage had been folded into the parent.
+  kira_result.child_peak_bytes = child_peak_memory();
+  // What kira handed to FireFly is not what SecRed handed to kira: kira selects,
+  // and the selection is the system the reconstruction actually runs on.
+  kira_result.firefly_equations =
+      selected_equations_from_log(global_path + "/kira.log");
+  return kira_result;
 }
 
 Family::Family(const YAML::Node &config) {
@@ -586,13 +653,17 @@ Family::Family(const YAML::Node &config) {
         "number of propagators does not match the topology");
   for (const auto &prop :
        familyConfig["propagators"]
-           .as<std::vector<std::pair<std::string, std::string>>>())
+           .as<std::vector<std::pair<std::string, std::string>>>()) {
+    // Keep the flow as well: the reduction needs only D_k, but the symmetry
+    // detector needs q_k, and q_k is not recoverable from D_k.
+    _propMomenta.emplace_back(reader(prop.first));
     _propagators.emplace_back(
         (pow(reader(prop.first), 2) - pow(reader(prop.second), 2))
             .expand()
             .subs(_spsRules, GiNaC::subs_options::algebraic)
             .subs(_one)
             .expand());
+  }
 
   // cuts
   if (familyConfig["cut"])
@@ -615,11 +686,22 @@ Family::Family(const YAML::Node &config) {
         throw std::runtime_error(
             "parallel_mode must be 'layer' or 'fine', got '" + _parallel_mode + "'");
     }
-    if (s["subsector_depth_offset"])   _subsector_depth_offset   = s["subsector_depth_offset"].as<unsigned>();
+    // subsector_filter_n: offset n of the subsector filter -- a subsector
+    // integral is kept when its total power lies within n layers of the seed
+    // box's top (SeedBound::seed_top); n = 0 therefore drops every subsector
+    // integral.
+    if (s["subsector_filter_n"])
+      _subsector_filter_n = s["subsector_filter_n"].as<unsigned>();
+    // ordering_mode: integral order.  "balance" (default) orders the per-sector
+    // seeds and subsector columns, and the global IDs (the global numbering, see
+    // order_global_integrals below); "normal" keeps the generation order.
     if (s["ordering_mode"]) {
       std::string om = s["ordering_mode"].as<std::string>();
       if      (om == "normal")  _ordering_mode = OrderingMode::Normal;
       else if (om == "balance") _ordering_mode = OrderingMode::Balance;
+      else
+        throw std::runtime_error(
+            "ordering_mode must be 'normal' or 'balance', got '" + om + "'");
     }
     // max_memory is specified in GB and stored internally in bytes. It is the
     // allowed total: sectors are admitted only while the process stays under
@@ -629,8 +711,6 @@ Family::Family(const YAML::Node &config) {
     // memory_reserve: system memory (in GB) kept free during parallel sectors.
     if (s["memory_reserve"])
       _memory_reserve = (std::uint64_t)(s["memory_reserve"].as<double>() * 1024 * 1024 * 1024);
-    // global_otf: on-the-fly loading in the global Kira reduction.
-    if (s["global_otf"]) _global_otf = s["global_otf"].as<bool>();
     // global_tool: which tool performs the global reduction ("kira" or
     // "finiteflow", default "kira").
     if (s["global_tool"]) _global_tool = s["global_tool"].as<std::string>();
@@ -960,7 +1040,7 @@ void Family::_generate_ibp_ff_m() {
   }
 }
 
-void Family::_search_trivial_sectors(Reduce &reduce) const {
+std::vector<bool> Family::nontrivial_sectors(unsigned top) const {
   GiNaC::ex gPoly = _uPoly + _fPoly;
   GiNaC::ex gDiff;
 
@@ -973,11 +1053,11 @@ void Family::_search_trivial_sectors(Reduce &reduce) const {
     gDiff += kvec[i] * _symIndices[i] * gPoly.diff(_symIndices[i]);
   gDiff = (gDiff - gPoly).expand();
 
-  reduce._sectors = std::vector<bool>(reduce._top + 1, false);
+  std::vector<bool> nontrivial(top + 1, false);
   std::vector<unsigned> trivials;
-  for (unsigned sector = reduce._top; sector >= (1 << _nints) - 1; --sector) {
+  for (unsigned sector = top; sector >= (1 << _nints) - 1; --sector) {
     // check if this sector belongs to top sector
-    if ((sector & reduce._top) == sector) {
+    if ((sector & top) == sector) {
       // check if this sector belongs to a trivial sector
       if (std::find_if(trivials.begin(), trivials.end(),
                        [sector](unsigned trivial) {
@@ -1017,11 +1097,30 @@ void Family::_search_trivial_sectors(Reduce &reduce) const {
       }
       // solve the k equations
       if (nops(GiNaC::lsolve(eqs, klst)) == 0)
-        reduce._sectors[sector] = true;
+        nontrivial[sector] = true;
       else
         trivials.push_back(sector);
     }
   }
+  return nontrivial;
+}
+
+void Family::_search_trivial_sectors(Reduce &reduce) const {
+  reduce._sectors = nontrivial_sectors(reduce._top);
+}
+
+SymmetryTable::Inputs Family::symmetry_inputs() const {
+  return SymmetryTable::Inputs{_uPoly + _fPoly,  // by value: the sum has no owner
+                               _propagators,
+                               _propMomenta,
+                               _internals,
+                               _externals,
+                               _spsRules,
+                               _spsFromProps,
+                               _symIndices,
+                               _symProps,
+                               _nprops,
+                               _symbols.empty()};
 }
 
 void Family::_compute_sps() {

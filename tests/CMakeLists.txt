@@ -7,22 +7,33 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Collect all test translation units (everything except test_main.cpp)
 set(TEST_SOURCES
     test_main.cpp
+    test_symmetry.cpp
     test_rawintegral.cpp
     test_arithmetic.cpp
     test_equation.cpp
     test_sector.cpp
     test_family.cpp
-    test_pyred.cpp
+    test_ffred.cpp
+    test_sector_engine.cpp
+    test_forward_selector.cpp
+    test_global_order.cpp
+    test_sym_coeff.cpp
+    test_progress_bar.cpp
+    test_masters_file.cpp
+    test_run_report.cpp
+    test_utils.cpp
 )
 
 # Core secred source files needed by the tests (exclude main.cpp and secred.cpp).
 set(SECRED_CORE_SOURCES
     ${CMAKE_SOURCE_DIR}/src/equation.cpp
     ${CMAKE_SOURCE_DIR}/src/family.cpp
+    ${CMAKE_SOURCE_DIR}/src/forward_selector.cpp
     ${CMAKE_SOURCE_DIR}/src/globalreduce.cpp
     ${CMAKE_SOURCE_DIR}/src/numeric_solver_mod.cpp
-    ${CMAKE_SOURCE_DIR}/src/pyred_solver.cpp
+    ${CMAKE_SOURCE_DIR}/src/ffred_solver.cpp
     ${CMAKE_SOURCE_DIR}/src/sector.cpp
+    ${CMAKE_SOURCE_DIR}/src/symmetry.cpp
     ${CMAKE_SOURCE_DIR}/src/utils.cpp
 )
 
