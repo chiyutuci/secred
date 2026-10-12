@@ -785,6 +785,24 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
   std::cout << "\n #0.4   Searching trivial sectors "
                "finished.\n";
 
+  // Sector symmetries (spec 4.2): the only slot where both the non-trivial flags
+  // are known and no thread has started.  With the feature off the table stays
+  // empty and every consumer sees nothing to do.
+  if (_symmetry) {
+    std::cout << "\n #0.4   Searching sector symmetries...\n";
+    reduce._symmetries =
+        SymmetryTable::find(symmetry_inputs(), reduce._sectors, reduce._top);
+    if (_parallel_mode == "layer") {
+      // A layer is submitted whole, so a same-layer edge cannot be honoured
+      // (spec 5.5).
+      reduce._symmetries.dropCross();
+      std::cout << " #0.4   parallel_mode layer: cross-sector symmetry relations "
+                   "are dropped, self relations are kept.\n";
+    }
+    reduce._symmetries.dump(_cache_dir + "/symmetries.txt");
+    std::cout << "\n #0.4   Searching sector symmetries finished.\n";
+  }
+
   reduce.prepare_sectors();
 }
 
@@ -1306,5 +1324,18 @@ void Reduce::prepare_sectors() {
       if (sectors[i] & (1 << j))
         slines[j] = true;
     _reduceSectors.push_back(Sector::make(i, sectors[i], _nprops, slines, trivialsectors));
+  }
+
+  // Spec 4.7: the table was built over non-trivial sectors, but this function's
+  // own filters (the cut mask and the top filter) may have dropped an endpoint.
+  // An edge to a sector that is never scheduled is a deadlock, so prune the
+  // table to exactly the sectors that will run.  A source left without
+  // prescriptions reports itself.
+  {
+    std::set<unsigned> reduced;
+    for (const Sector &s : _reduceSectors)
+      reduced.insert(s.id());
+    _symmetries.restrictTo(reduced);
+    _ctx.symmetries = &_symmetries;
   }
 }

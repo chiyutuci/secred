@@ -114,6 +114,9 @@ private:
   unsigned _kira_parallel     = 64;
   // Offset n of the subsector filter (see SectorConfig).
   unsigned _subsector_filter_n = 1;
+  // settings.symmetry: build and use the sector symmetry relations (default
+  // true; spec 5.6).
+  bool _symmetry = true;
   // Integral order of the per-sector stage; see OrderingMode.
   OrderingMode _ordering_mode      = OrderingMode::Balance;
   // System-memory headroom kept free during parallel sector execution (default 60 GB).
@@ -173,6 +176,10 @@ public:
     return ids;
   }
 
+  // The detected symmetry table (spec 4.3).  Empty until init_reduce has built
+  // it, and empty for the whole run when settings.symmetry is false.
+  const SymmetryTable &symmetries() const { return _symmetries; }
+
   friend class Family;
 
 private:
@@ -199,5 +206,9 @@ private:
   std::vector<bool> _sectors;
   // the reduction jobs
   std::vector<Sector> _reduceSectors;
+  // Detected sector symmetries: one entry per emitting sector (spec 4.2).  Built
+  // before any thread starts, pruned at the end of prepare_sectors, read-only
+  // after.
+  SymmetryTable _symmetries;
   ReductionContext _ctx;
 };
