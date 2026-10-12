@@ -2,9 +2,29 @@
 
 #include "family.h"
 #include "symmetry.h"
+#include "symmetry_golden.h"
 
 #include <string>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// The archived goldens (bench/symmetry/native, spec 4.8), generated into
+// tests/symmetry_golden.h by tests/make_symmetry_golden.py.
+// ---------------------------------------------------------------------------
+
+// The archived goldens must be present and non-empty for every family: the later
+// tasks compare against them, and a truncated header must fail loudly here rather
+// than silently skipping a comparison.
+TEST(symmetry_golden_header_is_complete) {
+  const char *fams[] = {"box", "sunrise", "dbox"};
+  for (const char *fam : fams) {
+    REQUIRE(std::string(golden_canonica(fam)).size() > 100);
+    REQUIRE(std::string(golden_entries(fam, false)).size() > 100);
+    REQUIRE(std::string(golden_entries(fam, true)).size() > 100);
+  }
+  // spot check: the box relations golden's first block is the verified 4 -> 1 entry
+  REQUIRE(std::string(golden_entries("box", false)).rfind("0\n0 4\n0 1\n", 0) == 0);
+}
 
 // ---------------------------------------------------------------------------
 // Families for the symmetry tests.  They reproduce, in SecRed's own YAML, the
