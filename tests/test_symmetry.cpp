@@ -435,3 +435,284 @@ TEST(symmetry_canonica_permutations_are_reported_not_asserted) {
               << "): " << differing << " of " << compared << "\n";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Correspondences (spec 4.9.2): every one of Kira's 432 entries, driven with
+// Kira's *own* correspondence -- recovered from the golden's canonica
+// permutations as ing[p0[g]] = p1[g] (spec 3.1, trivial_sym.cpp:1331-1333) --
+// and compared coefficient by coefficient as expressions.  Driving the
+// comparison with the golden's pairing rather than ours is what keeps it
+// independent of the row-order tie-break that makes our permutations differ
+// from Kira's on some sectors (spec 3.1).
+// ---------------------------------------------------------------------------
+
+// One golden row: nprops coefficient cells then the constant.  An alias, not a
+// struct, because that is exactly the shape rows_ok() compares against (the
+// brief's struct does not convert to its own rows_ok parameter).
+using EntryRow = std::vector<std::string>;
+
+struct GoldenEntry {
+  int dots = 0;
+  unsigned from = 0, to = 0;
+  std::vector<EntryRow> rows;
+};
+
+static std::vector<GoldenEntry> parse_entries(const std::string &text, unsigned nprops) {
+  std::vector<GoldenEntry> out;
+  for (const std::string &b : golden_blocks(text)) {
+    std::stringstream ss(b);
+    GoldenEntry e;
+    unsigned itc = 0, topo = 0;
+    ss >> e.dots >> itc >> e.from >> topo >> e.to;
+    EntryRow r;
+    std::string cell;
+    while (ss >> cell) {
+      r.push_back(cell);
+      if (r.size() == nprops + 1) {
+        e.rows.push_back(r);
+        r.clear();
+      }
+    }
+    if (!r.empty())
+      e.rows.push_back(r);
+    out.push_back(e);
+  }
+  return out;
+}
+
+// The comparison driver.  For a cross entry the source's first canonical
+// permutation is paired with the target's g-th for every g; for a self entry
+// with g >= 1 (Kira's symmetry_finder is called with permIt from 1 for it == itt,
+// trivial_sym.cpp:1755-1764).  The first g that reproduces Kira's rows is
+// accepted: the golden file's own entry order is a sorted one, so it does not
+// carry permIt.  An entry no g reproduces is reported, not silently skipped.
+static unsigned compare_family(const Family &f, const char *fam, unsigned nprops,
+                               std::vector<std::string> &problems) {
+  const SymmetryTable::Inputs in = f.symmetry_inputs();
+  const std::vector<CanonicaBlock> canon = parse_canonica(golden_canonica(fam));
+  std::map<unsigned, const CanonicaBlock *> by_sector;
+  for (const CanonicaBlock &b : canon)
+    by_sector[b.sector] = &b;
+
+  const std::size_t before = problems.size();
+  unsigned checked = 0, dots = 0, dots_we_verified = 0, dots_with_a_map = 0;
+  unsigned first_g = 0;
+  std::map<unsigned, unsigned> g_hist;
+  std::vector<std::string> stronger;
+  for (int selfs = 0; selfs <= 1; ++selfs) {
+    for (const GoldenEntry &e : parse_entries(golden_entries(fam, selfs != 0), nprops)) {
+      const CanonicaBlock *src = by_sector.at(e.from);
+      const CanonicaBlock *dst = by_sector.at(e.to);
+      // Every candidate pairing Kira itself considered: the target's g-th
+      // canonical permutation against the source's first (g >= 1 for a self
+      // entry, since permIt starts at 1 when it == itt).
+      bool matched = false, map_where_matched = false, any_map = false;
+      unsigned used = 0;
+      for (unsigned g = selfs ? 1 : 0; g < dst->perms.size(); ++g) {
+        std::vector<int> ing(nprops, -1);
+        for (unsigned h = 0; h < src->perms.front().size(); ++h)
+          ing[src->perms.front()[h]] = dst->perms[g][h];
+        auto p = SymmetryTable::verify(e.from, e.to, ing, in);
+        if (p)
+          any_map = true;
+        const PropPrescription cand =
+            p ? *p : SymmetryTable::dot_only_entry(e.from, e.to, ing, in);
+        if (cand.rows_ok(e.rows, nprops, Family::symtab) && !matched) {
+          matched = true;
+          map_where_matched = !cand.dot_only;
+          used = g;
+        }
+      }
+      if (!matched)
+        problems.push_back(std::string(fam) + " " + std::to_string(e.from) + " -> " +
+                           std::to_string(e.to));
+      else {
+        ++g_hist[used];
+        if (used == (selfs ? 1u : 0u))
+          ++first_g;
+      }
+      if (e.dots == 1) {
+        ++dots;
+        // Spec 4.9.2: Kira wrote the relation off as dots-only and our search is
+        // strictly stronger -- either we find a map at all for a correspondence
+        // Kira dotted, or (the stronger case) our map's rows are themselves what
+        // Kira printed.
+        if (any_map) {
+          ++dots_with_a_map;
+          if (stronger.size() < 10)
+            stronger.push_back(std::to_string(e.from) + "->" + std::to_string(e.to));
+        }
+        if (map_where_matched)
+          ++dots_we_verified;
+      }
+      ++checked;
+    }
+  }
+  const unsigned unmatched = unsigned(problems.size() - before);
+  std::cout << "  " << fam << ": " << checked << " entries compared, " << unmatched
+            << " unmatched, " << first_g << " at the first candidate pairing, "
+            << dots << " symDOTS=1 of which " << dots_with_a_map
+            << " admit a map for us (first few:";
+  for (const std::string &s : stronger)
+    std::cout << ' ' << s;
+  std::cout << ") and " << dots_we_verified << " whose Kira rows our own map reproduces"
+            << "; pairings used:";
+  for (const auto &[g, n] : g_hist)
+    std::cout << " g" << g << "x" << n;
+  std::cout << "\n";
+  return checked;
+}
+
+TEST(symmetry_correspondences_match_every_golden_entry) {
+  std::vector<std::string> problems;
+  unsigned total = 0;
+  {
+    Family f = make_box("tc_sym_corr_box");
+    total += compare_family(f, "box", 4, problems);
+  }
+  {
+    Family f = make_sunrise("tc_sym_corr_sunrise");
+    total += compare_family(f, "sunrise", 5, problems);
+  }
+  {
+    Family f = make_dbox("tc_sym_corr_dbox");
+    total += compare_family(f, "dbox", 9, problems);
+  }
+  std::cout << "  golden entries checked: " << total << "\n";
+  for (const std::string &p : problems)
+    std::cerr << "  unmatched golden entry: " << p << "\n";
+  REQUIRE_EQ(total, 432u);  // 148 cross + 284 self (spec 4.1.2)
+  REQUIRE(problems.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Emission (spec 4.5, 4.9.3): the shipped table's entry set, against Kira's own
+// counts.  The counts are Kira's, read off the goldens (relations = cross,
+// symmetries = self), and they follow from the emission rule alone -- a
+// non-representative emits exactly one cross entry, a representative with
+// nrows > 1 emits nrows - 1 self entries, nothing else emits.
+// ---------------------------------------------------------------------------
+
+TEST(symmetry_emission_rule_matches_the_golden) {
+  struct Case {
+    const char *fam;
+    unsigned cross, selfs;
+    std::vector<unsigned> cross_sources, self_sources;
+  };
+  const Case cases[] = {
+      {"box", 3, 4, {4, 6, 12}, {5, 7, 10, 14}},
+      {"sunrise", 17, 23, {}, {}},
+      {"dbox", 128, 257, {}, {}},
+  };
+  Family box = make_box("tc_sym_emit_box");
+  Family sunrise = make_sunrise("tc_sym_emit_sunrise");
+  Family dbox = make_dbox("tc_sym_emit_dbox");
+  for (const Case &c : cases) {
+    const Family &f = std::string(c.fam) == "box"      ? box
+                      : std::string(c.fam) == "sunrise" ? sunrise
+                                                        : dbox;
+    const unsigned top = (1u << f.nprops()) - 1;
+    const SymmetryTable t =
+        SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+    unsigned cross = 0, selfs = 0;
+    for (unsigned s = 0; s < (1u << f.nprops()); ++s) {
+      for (const PropPrescription &p : t.bySource(s)) {
+        REQUIRE_EQ(p.from, s);
+        if (p.from == p.to) {
+          ++selfs;
+          // A self source reports itself: no out-edge.
+          REQUIRE_EQ(t.representative(s), s);
+        } else {
+          ++cross;
+          // Exactly one cross entry per source, pointing at the representative.
+          REQUIRE_EQ(t.representative(s), p.to);
+          REQUIRE_EQ(t.bySource(s).size(), 1u);
+        }
+      }
+      // A self-only sector reports itself; a sector with no entries reports itself.
+      if (t.bySource(s).empty())
+        REQUIRE_EQ(t.representative(s), s);
+    }
+    REQUIRE_EQ(cross, c.cross);
+    REQUIRE_EQ(selfs, c.selfs);
+    if (std::string(c.fam) == "box") {
+      std::vector<unsigned> srcs, self_srcs;
+      for (unsigned s = 0; s < 16; ++s)
+        for (const PropPrescription &p : t.bySource(s))
+          (p.from == p.to ? self_srcs : srcs).push_back(s);
+      std::sort(srcs.begin(), srcs.end());
+      std::sort(self_srcs.begin(), self_srcs.end());
+      REQUIRE(srcs == c.cross_sources);
+      REQUIRE(self_srcs == c.self_sources);
+    }
+  }
+}
+
+// The dot-only split of spec 8.1, through Kira's correspondences: 4 -> 1 is
+// verified against 6 -> 3 and 12 -> 3 are not, 5 -> 5 and 10 -> 10 are verified
+// against 7 -> 7 and 14 -> 14 are not.  All six of the box's emitted entries
+// therefore appear, four of them as Kira's faked rows.
+TEST(symmetry_box_dot_only_split_matches_the_golden) {
+  Family f = make_box("tc_sym_split_box");
+  const SymmetryTable::Inputs in = f.symmetry_inputs();
+  REQUIRE(SymmetryTable::verify(4, 1, {-1, -1, 0, -1}, in).has_value());
+  REQUIRE(!SymmetryTable::verify(6, 3, {-1, 1, 0, -1}, in).has_value());
+  REQUIRE(!SymmetryTable::verify(12, 3, {-1, -1, 0, 1}, in).has_value());
+  REQUIRE(SymmetryTable::verify(5, 5, {2, -1, 0, -1}, in).has_value());
+  REQUIRE(SymmetryTable::verify(10, 10, {-1, 3, -1, 1}, in).has_value());
+  REQUIRE(!SymmetryTable::verify(7, 7, {2, 1, 0, -1}, in).has_value());
+  REQUIRE(!SymmetryTable::verify(14, 14, {-1, 3, 2, 1}, in).has_value());
+
+  const unsigned top = (1u << f.nprops()) - 1;
+  const SymmetryTable t =
+      SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+  unsigned dots = 0, maps = 0;
+  for (unsigned s = 0; s < 16; ++s)
+    for (const PropPrescription &p : t.bySource(s))
+      (p.dot_only ? dots : maps)++;
+  REQUIRE_EQ(dots, 4u);
+  REQUIRE_EQ(maps, 3u);
+}
+
+// Review Focus 1 and 2 (spec 4.7): a filter -- the cut mask or the top filter --
+// can drop the representative of a class, and a prescription left pointing at a
+// sector that is not reduced is a scheduler deadlock in stage B.  After
+// restrictTo no surviving prescription may have an endpoint outside the reduced
+// set, and a source left with none must report itself.
+TEST(symmetry_restrict_to_prunes_and_self_reports) {
+  Family f = make_box("tc_sym_restrict_box");
+  const unsigned top = (1u << f.nprops()) - 1;
+  SymmetryTable t =
+      SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+  std::set<unsigned> reduced;
+  for (unsigned s = 0; s < 16; ++s)
+    if (t.nrows(s) > 0 && s != 1)  // sector 1 is the representative of {1, 4}
+      reduced.insert(s);
+  t.restrictTo(reduced);
+  REQUIRE(t.bySource(4).empty());       // its only entry pointed at the dropped 1
+  REQUIRE_EQ(t.representative(4), 4u);  // ... so it reports itself
+  unsigned surviving = 0;
+  for (unsigned s = 0; s < 16; ++s)
+    for (const PropPrescription &p : t.bySource(s)) {
+      ++surviving;
+      REQUIRE(reduced.count(p.from) == 1);
+      REQUIRE(reduced.count(p.to) == 1);
+    }
+  REQUIRE(surviving > 0);  // the invariant above is not vacuously true
+  // 5 -> 5 is untouched: both endpoints are in the reduced set (and survive
+  // because 5's own self entry has no partner to lose).
+  REQUIRE_EQ(t.bySource(5).size(), 1u);
+  REQUIRE_EQ(t.representative(5), 5u);
+
+  // dropCross (spec 5.5, `layer`) keeps the self entries and nothing else.
+  SymmetryTable u =
+      SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+  u.dropCross();
+  for (unsigned s = 0; s < 16; ++s)
+    for (const PropPrescription &p : u.bySource(s)) {
+      REQUIRE_EQ(p.from, p.to);
+      REQUIRE_EQ(u.representative(s), s);
+    }
+  REQUIRE_EQ(u.bySource(6).size(), 0u);  // 6 was a cross source
+  REQUIRE_EQ(u.bySource(5).size(), 1u);  // 5 was a self source
+}
