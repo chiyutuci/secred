@@ -4,6 +4,10 @@
 #include "symmetry.h"
 #include "symmetry_golden.h"
 
+#include <algorithm>
+#include <map>
+#include <set>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -73,6 +77,92 @@ family:
 static Family make_box(const std::string &tag) {
   Family::symtab.clear();
   Family f(symmetry_box_config("/tmp/secred_tests/" + tag));
+  f.init();
+  return f;
+}
+
+// sunrise and dbox: the propagator lists are transcribed verbatim from the
+// archived goldens' own Kira configs (bench/symmetry/native/<fam>_sym/config/),
+// which are in turn example/sunrise.yaml and example/dbox.yaml with m2 = m^2 and
+// the loop momenta renamed.  A reordered or reformulated list changes the
+// canonical partition, so these are not free to be "cleaned up".
+static YAML::Node symmetry_sunrise_config(const std::string &cache_dir) {
+  std::string yaml = R"(
+settings:
+  cache_dir: )" + cache_dir + R"(
+  threads: 1
+
+family:
+  name: sunrise
+  dimension: d
+  internals: [l1, l2]
+  externals: [p1]
+  invariants:
+    - [s, 2]
+    - [m, 1]
+  sps_rules:
+    - [p1, p1, s]
+  propagators:
+    - [l1, m]
+    - [l2, m]
+    - [p1-l1-l2, m]
+    - [p1-l2, m]
+    - [p1-l1, m]
+
+targets:
+  - [1, 1, 1, 1, 1]
+)";
+  return YAML::Load(yaml);
+}
+
+static Family make_sunrise(const std::string &cache_dir) {
+  Family::symtab.clear();
+  Family f(symmetry_sunrise_config(cache_dir));
+  f.init();
+  return f;
+}
+
+static YAML::Node symmetry_dbox_config(const std::string &cache_dir) {
+  std::string yaml = R"(
+settings:
+  cache_dir: )" + cache_dir + R"(
+  threads: 1
+
+family:
+  name: dbox
+  dimension: d
+  internals: [l1, l2]
+  externals: [p1, p2, p3]
+  invariants:
+    - [s, 2]
+    - [t, 2]
+  sps_rules:
+    - [p1, p1, 0]
+    - [p2, p2, 0]
+    - [p3, p3, 0]
+    - [p1, p2, t]
+    - [p2, p3, s]
+    - [p1, p3, -t-s]
+  propagators:
+    - [l1-p1, 0]
+    - [l1-p1-p2, 0]
+    - [l1, 0]
+    - [l1+l2, 0]
+    - [l2+p1+p2, 0]
+    - [l2, 0]
+    - [l2+p1+p2+p3, 0]
+    - [l1+p3, 0]
+    - [l2+p1, 0]
+
+targets:
+  - [1, 1, 1, 1, 1, 1, 1, 0, 0]
+)";
+  return YAML::Load(yaml);
+}
+
+static Family make_dbox(const std::string &cache_dir) {
+  Family::symtab.clear();
+  Family f(symmetry_dbox_config(cache_dir));
   f.init();
   return f;
 }
@@ -208,4 +298,140 @@ TEST(symmetry_numeric_conversion_round_trips) {
   auto p = SymmetryTable::verify(4, 1, {-1, -1, 0, -1}, in);
   REQUIRE(p.has_value());
   REQUIRE(p->f_num.empty());  // not a numeric family: nothing to convert
+}
+
+// ---------------------------------------------------------------------------
+// Golden parsers.  Both formats are blank-line separated blocks; see spec 4.8.
+// ---------------------------------------------------------------------------
+
+struct CanonicaBlock {
+  unsigned sector = 0;
+  std::string hash;
+  unsigned nrows = 0, ncols = 0;
+  std::vector<std::vector<int>> perms;
+};
+
+static std::vector<std::string> golden_blocks(const std::string &text) {
+  std::vector<std::string> out;
+  std::stringstream ss(text);
+  std::string line, cur;
+  while (std::getline(ss, line)) {
+    if (line.find_first_not_of(" \t\r") == std::string::npos) {
+      if (!cur.empty())
+        out.push_back(cur);
+      cur.clear();
+    } else {
+      cur += line + "\n";
+    }
+  }
+  if (!cur.empty())
+    out.push_back(cur);
+  return out;
+}
+
+static std::vector<CanonicaBlock> parse_canonica(const std::string &text) {
+  std::vector<CanonicaBlock> out;
+  for (const std::string &b : golden_blocks(text)) {
+    std::stringstream ss(b);
+    CanonicaBlock cb;
+    ss >> cb.sector >> cb.hash >> cb.nrows >> cb.ncols;
+    for (unsigned r = 0; r < cb.nrows; ++r) {
+      std::vector<int> perm(cb.ncols);
+      for (unsigned c = 0; c < cb.ncols; ++c)
+        ss >> perm[c];
+      cb.perms.push_back(perm);
+    }
+    out.push_back(cb);
+  }
+  return out;
+}
+
+// A sector's canonical class is the set of sectors sharing its hash -- within one
+// golden file that is exactly Kira's partition (the hash is a function of the key).
+static std::map<unsigned, std::set<unsigned>> golden_classes(const std::string &text) {
+  std::map<std::string, std::set<unsigned>> by_hash;
+  for (const CanonicaBlock &b : parse_canonica(text))
+    by_hash[b.hash].insert(b.sector);
+  std::map<unsigned, std::set<unsigned>> cls;
+  for (const auto &[h, members] : by_hash)
+    for (unsigned s : members)
+      cls[s] = members;
+  return cls;
+}
+
+// The partition test's three families are driven with `top` = the golden's own
+// top_level_sectors (box 15, sunrise 31, dbox 511), which is the full line mask
+// because every target the goldens use is positive on every line.
+TEST(symmetry_canonica_matches_golden_partition) {
+  const char *fams[] = {"box", "sunrise", "dbox"};
+  const char *dirs[] = {"tc_sym_canon_box", "tc_sym_canon_sunrise", "tc_sym_canon_dbox"};
+  for (unsigned i = 0; i < 3; ++i) {
+    Family f = i == 0 ? make_box(dirs[i])
+                      : i == 1 ? make_sunrise(dirs[i]) : make_dbox(dirs[i]);
+    const unsigned top = (1u << f.nprops()) - 1;
+    const SymmetryTable t =
+        SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+    const std::vector<CanonicaBlock> golden = parse_canonica(golden_canonica(fams[i]));
+    std::map<unsigned, std::set<unsigned>> want = golden_classes(golden_canonica(fams[i]));
+    std::map<unsigned, std::set<unsigned>> got;
+    for (const CanonicaBlock &b : golden)
+      got[b.sector] = {};
+    for (const CanonicaBlock &b : golden) {
+      got[t.representative(b.sector)].insert(b.sector);
+    }
+    // The same sectors are considered at all.
+    for (const CanonicaBlock &b : golden)
+      REQUIRE(t.nrows(b.sector) > 0);
+    for (unsigned s = 0; s < 1024; ++s)
+      if (t.nrows(s) > 0)
+        REQUIRE(want.count(s) == 1);
+    // nrows per sector, and the same partition into classes.
+    for (const CanonicaBlock &b : golden)
+      REQUIRE_EQ(t.nrows(b.sector), b.nrows);
+    for (const auto &[s, members] : want) {
+      std::set<unsigned> ours;
+      for (unsigned m : members)
+        ours.insert(t.representative(m));
+      REQUIRE_EQ(ours.size(), 1u);
+      REQUIRE(*ours.begin() == *members.begin());  // min bitmask, both sides
+      REQUIRE_EQ(t.representative(s), *members.begin());
+    }
+    // Determinism: a second run of the same input gives the same table.
+    const SymmetryTable t2 =
+        SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+    REQUIRE(t.canonical() == t2.canonical());
+    for (const CanonicaBlock &b : golden)
+      REQUIRE(t.permutations(b.sector) == t2.permutations(b.sector));
+  }
+}
+
+TEST(symmetry_canonica_permutations_are_reported_not_asserted) {
+  // Diagnostic only (spec 4.9.1): our canonical permutations differ from Kira's on
+  // some sectors because our row order is deterministic where Kira's is not.  The
+  // task report lists the sectors; the test only pins that our permutations are
+  // permutations of the sector's lines.
+  const char *fams[] = {"box", "sunrise", "dbox"};
+  const char *dirs[] = {"tc_sym_perms_box", "tc_sym_perms_sunrise", "tc_sym_perms_dbox"};
+  for (unsigned i = 0; i < 3; ++i) {
+    Family f = i == 0 ? make_box(dirs[i])
+                      : i == 1 ? make_sunrise(dirs[i]) : make_dbox(dirs[i]);
+    const unsigned top = (1u << f.nprops()) - 1;
+    const SymmetryTable t =
+        SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+    unsigned differing = 0, compared = 0;
+    for (const CanonicaBlock &b : parse_canonica(golden_canonica(fams[i]))) {
+      ++compared;
+      if (!(t.permutations(b.sector) == b.perms))
+        ++differing;
+      std::vector<int> ours = t.permutations(b.sector).front();
+      std::sort(ours.begin(), ours.end());
+      std::vector<int> lines;
+      for (unsigned k = 0; k < f.nprops(); ++k)
+        if (b.sector & (1u << k))
+          lines.push_back(int(k));
+      REQUIRE(ours == lines);
+    }
+    std::cout << "  canonica permutations differing from the golden (" << fams[i]
+              << "): " << differing << " of " << compared << "\n";
+  }
 }
