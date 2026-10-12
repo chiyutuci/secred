@@ -315,6 +315,26 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
     }
   }
 
+  // One edge per cross prescription (spec 5.3): the image sector S' = rep(S) is
+  // reduced *after* the sector S that emits the relation, because S requests the
+  // image integrals from S' when it spills, and that request must be in place
+  // before S' derives its box.  A representative has no cross prescription --
+  // representative(s) == s is exactly "s has no out-edge" -- and restrictTo has
+  // already removed every prescription with an endpoint outside the scheduled
+  // set, so the lookup below always succeeds.  The edges are stars of depth one
+  // (S -> rep(S), rep(rep(S)) == rep(S)), so they add no cycle to the DAG.
+  for (unsigned j = 0; j < nsec; ++j) {
+    unsigned sid = reduce._reduceSectors[j].id();
+    unsigned rep = reduce._symmetries.representative(sid);
+    if (rep == sid)
+      continue;
+    auto it = id_to_idx.find(rep);
+    if (it == id_to_idx.end())
+      continue;
+    children[j].push_back(it->second);
+    ++parent_count[it->second];
+  }
+
   std::vector<std::atomic<unsigned>> pending(nsec);
   for (unsigned i = 0; i < nsec; ++i)
     pending[i].store(parent_count[i], std::memory_order_relaxed);
@@ -717,6 +737,10 @@ Family::Family(const YAML::Node &config) {
     // global_finiteflow_threads: threads for the FiniteFlow reconstruction.
     if (s["global_finiteflow_threads"])
       _global_finiteflow_threads = s["global_finiteflow_threads"].as<unsigned>();
+    // symmetry: detect the sector symmetry relations and use them in the
+    // per-sector reduction (default true; spec 5.6/5.10).  With false no table
+    // is built, nothing is dumped and the reduction is the symmetry-free one.
+    if (s["symmetry"]) _symmetry = s["symmetry"].as<bool>();
   }
 
   std::cout << "\n #0.0   Parsing config file finished." << std::endl;

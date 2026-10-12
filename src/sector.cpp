@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <iostream>
 #include <malloc.h>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -18,6 +19,7 @@
 #include "global_select.h"
 #include "numeric_solver_mod.h"
 #include "sector_engine.h"
+#include "symmetry.h"
 
 using namespace fflow;
 
@@ -91,43 +93,41 @@ bool Sector::_compare_subintegral(const RawIntegral &i1,
   return false;
 }
 
-// OrderingMode::Complexity — the five-key order itself is complexity_less()
-// (src/sector.h), shared with the global ID numbering.  Ascending = simplest
-// first, the same direction as Balance and the same direction the column
-// convention wants (a larger label is a smaller, more complex column).  The
-// five keys do not form a total order — integrals that tie on all of them are
-// ordered by whatever order the caller's input had, so both call sites must
-// sort stably (the global numbering adds its own tie-break keys instead).
-bool Sector::_compare_complexity(const RawIntegral &i1,
-                                 const RawIntegral &i2) {
-  return complexity_less(i1, i2);
+// The balance order is balance_less() (src/sector.h), shared with the global ID
+// numbering.  Ascending = simplest first, the direction the column convention
+// wants (a larger label is a smaller, more complex column).  The five keys do
+// not form a total order — integrals that tie on all of them are ordered by
+// whatever order the caller's input had, so both call sites must sort stably
+// (the global numbering adds its own tie-break keys instead).
+bool Sector::_compare_balance(const RawIntegral &i1, const RawIntegral &i2) {
+  return balance_less(i1, i2);
 }
 
 // Order the discovered subsector integrals into column order: the most complex
 // integral first, so it takes the smallest subsector column (nvars).  The mode
-// picks the key: Complexity uses the same five-key order as the seeds, the other
-// modes the canonical per-index _compare_subintegral.  Which subsector integral
-// sits in the smallest column decides the elimination pivots exactly as it does
-// for the seeds.  The Complexity key is not a total order, so that path sorts
-// stably: ties keep the order the vector arrives in (the discovery builds it
-// from a std::map, i.e. RawIntegral::operator<), which the final reverse then
-// mirrors — tied integrals come back in the reverse of the arrival order.
+// picks the key: Balance uses the same five-key order as the seeds, Normal the
+// canonical per-index _compare_subintegral.  Which subsector integral sits in
+// the smallest column decides the elimination pivots exactly as it does for the
+// seeds.  The balance key is not a total order, so that path sorts stably: ties
+// keep the order the vector arrives in (the discovery builds it from a
+// std::map, i.e. RawIntegral::operator<), which the final reverse then mirrors —
+// tied integrals come back in the reverse of the arrival order.
 void Sector::_order_subintegrals(std::vector<RawIntegral> &subInts,
                                  OrderingMode mode) {
-  if (mode == OrderingMode::Complexity)
-    std::stable_sort(subInts.begin(), subInts.end(), _compare_complexity);
+  if (mode == OrderingMode::Balance)
+    std::stable_sort(subInts.begin(), subInts.end(), _compare_balance);
   else
     std::sort(subInts.begin(), subInts.end(), _compare_subintegral);
   std::reverse(subInts.begin(), subInts.end());
 }
 
-void createJobFile(const std::string &filename, bool otf) {
+void createJobFile(const std::string &filename) {
   std::ofstream file(filename);
 
   file << "jobs:" << std::endl;
   file << "  - reduce_user_defined_system:" << std::endl;
-  file << "      input_system: {files: [\"system\"], config: false, otf: "
-       << (otf ? "true" : "false") << "}" << std::endl;
+  file << "      input_system: {files: [\"system\"], config: false, otf: false}"
+       << std::endl;
   file << "      select_integrals:" << std::endl;
   file << "        select_mandatory_list:" << std::endl;
   file << "          - [targets]" << std::endl;
@@ -170,37 +170,23 @@ initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
 
 std::string format_seed_box_line(unsigned id, const SeedBound &bound,
                                  const SeedBound &initial) {
-  // The three figures describe the seeds the boundary admits, not the boundary:
-  // the seeds are what generates the sector's equations (SeedBound::admits), and
-  // they sit strictly inside it in depth and in rank, so every figure here is one
-  // step below the corresponding bound.  Reported are the extents of the admitted
-  // set along each axis -- its largest depth (the sum of the positive indices, as
-  // depth() counts it), its largest rank, and -- in Total mode, where the
-  // total-power cap cuts the (depth, rank) box along a diagonal -- its largest
-  // total power.  Each extent accounts for all three admission rules: a seed of
-  // this sector has depth >= popcount(id), so the rank extent reads
-  // min(rank, limit - popcount(id)) - 1 whenever the cap bites, and with the cap at
-  // its initial value (the top of the seed box's total-power range, depth + rank)
-  // the total-power figure is the box corner depth + rank - 2.  "probe start"
-  // repeats the same three figures for the boundary the probe pass ran with,
-  // before its single relaxation: the two are equal wherever the relaxation admits
-  // no further seed (which is always so from the initial cap, one diagonal above
-  // the box) and differ wherever it does, i.e. from a cap that was biting.
+  // The three figures are the extents of the admitted seeds, not of the boundary:
+  // a seed sits strictly inside both hard bounds, and a seed of this sector has
+  // depth >= popcount(id), so the rank extent reads min(rank, limit - popcount(id))
+  // - 1 whenever the cap bites and the total-power figure is the box corner
+  // depth + rank - 2 at the initial cap.  "start:" repeats them for the box
+  // initial_seed_bounds derived.
   auto append = [id](std::ostringstream &oss, const SeedBound &b) {
     const int depth = (int)b.depth;
     const int rank = (int)b.rank;
-    if (b.mode == BoundaryMode::Total) {
-      const int limit = (int)b.limit;
-      oss << " depth: " << std::min(depth, limit) - 1
-          << " rank: " << std::min(rank, limit - (int)std::popcount(id)) - 1
-          << " total: " << std::min(depth + rank - 2, limit - 1);
-    } else {
-      oss << " depth: " << depth - 1 << " rank: " << rank - 1;
-    }
+    const int limit = (int)b.limit;
+    oss << " depth: " << std::min(depth, limit) - 1
+        << " rank: " << std::min(rank, limit - (int)std::popcount(id)) - 1
+        << " total: " << std::min(depth + rank - 2, limit - 1);
   };
   std::ostringstream oss;
   append(oss, bound);
-  oss << "  probe start:";
+  oss << "  start:";
   append(oss, initial);
   return oss.str();
 }
@@ -267,36 +253,11 @@ void Sector::_generate_seeds(OrderingMode mode) {
     }
   }
 
-  int base_depth = (int)std::popcount(_id);
-
   if (mode == OrderingMode::Balance) {
-    // Balance ordering: (excess_depth ASC, rank ASC, max_active_power ASC).
-    // Seeds with the smallest excess depth and lowest rank are placed first,
-    // making them preferred pivots in the Gaussian elimination and increasing
-    // the chance that higher-depth, higher-rank seeds are found redundant.
-    std::stable_sort(
-        _seeds.begin(), _seeds.end(),
-        [this, base_depth](const RawIntegral &a, const RawIntegral &b) {
-          int ea = (int)a.depth() - base_depth;
-          int eb = (int)b.depth() - base_depth;
-          if (ea != eb)
-            return ea < eb;
-          if (a.rank() != b.rank())
-            return a.rank() < b.rank();
-          int max_a = 1, max_b = 1;
-          for (unsigned i = 0; i < _nprops; i++) {
-            if (_lines[i]) {
-              max_a = std::max(max_a, a[i]);
-              max_b = std::max(max_b, b[i]);
-            }
-          }
-          return max_a < max_b;
-        });
-  } else if (mode == OrderingMode::Complexity) {
-    // Complexity ordering: (depth+rank ASC, depth ASC, rank ASC, max
-    // denominator power ASC, max numerator power ASC).  Stable, so seeds tying
-    // on all five keys keep the generation order (depth-major, rank-minor).
-    std::stable_sort(_seeds.begin(), _seeds.end(), _compare_complexity);
+    // Balance ordering: (depth+rank ASC, depth ASC, rank ASC, max denominator
+    // power ASC, max numerator power ASC).  Stable, so seeds tying on all five
+    // keys keep the generation order (depth-major, rank-minor).
+    std::stable_sort(_seeds.begin(), _seeds.end(), _compare_balance);
   }
   // OrderingMode::Normal: keep generation order, no sort.
 
@@ -342,7 +303,7 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   unsigned boxDepth, boxRank;
   std::tie(boxDepth, boxRank) = initial_seed_bounds(_id, ctx.targets[_id],
                                                     ctx.uptargets[_id]);
-  _bound = SeedBound::initial(cfg.boundary_mode, boxDepth, boxRank);
+  _bound = SeedBound::initial(boxDepth, boxRank);
   _initialBound = _bound;
 
   namespace fs = std::filesystem;
@@ -350,11 +311,10 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
       cfg.cache_dir + "/sectors/sector" + std::to_string(_id);
 
   // One round = one pass over the current box, with the per-round tables released
-  // first (the flow-2 session and matrix were destroyed inside the previous pass).
-  auto run_round = [&](bool skip_subsectors) {
+  // first (the matrix and solver data were destroyed inside the previous pass).
+  auto run_round = [&] {
     clear();
-    return sector_reduction_ff_n(ibps, ibps_mod, ibps_sym, cfg, ctx,
-                                 skip_subsectors);
+    return sector_reduction_ff_n(ibps, ibps_mod, ibps_sym, cfg, ctx);
   };
 
   // Whether the box was widened at all, i.e. whether the sector settled on a box
@@ -363,121 +323,46 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   std::uint64_t probeNanos = 0;  // time in rounds whose work was thrown away
   std::uint64_t fullNanos = 0;   // time in the round that settled and spilled
 
-  if (cfg.sector_elimination == SectorElimination::Pyred) {
-    // Every round is a full pass, so the criterion that decides the box sees the
-    // subsector columns too -- it reports no more often than the seed-only probe did,
-    // and it can settle a sector on a narrower box than the probe would have chosen.
-    // A pass that reports an inadmissible seed (SeedBound::exceeded -- past the top
-    // of the seed box, or through its depth cap under that top) spills nothing: it
-    // returns at the criterion, before the masters/uptargets propagation and before
-    // the equations are appended, so the next round starts from a clean directory and
-    // an unchanged ctx and only the box differs.  Widening the reported figure by one
-    // layer admits that seed (_bound.widen_for; a depth widening carries the Total
-    // cap along only when the box top was what was reported, bit 4), and the loop
-    // repeats until a round reports nothing -- that round is the one that settles and
-    // spills.  So the "one expansion suffices" assumption the two-pass scheme made is
-    // no longer load-bearing: a report widens instead of dropping the sector.
-    for (unsigned round = 0;; ++round) {
-      // A re-run can find a directory an earlier run left behind, and a reporting
-      // round leaves its own partial files (targets, the seed-box line; see below).
-      // The deletion is charged to the round that follows it, as it is for the fflow
-      // full pass.
-      const auto roundBegin = std::chrono::steady_clock::now();
-      fs::remove_all(sectorpath);
-      _probeRounds = round + 1;
-      const unsigned result = run_round(/*skip_subsectors=*/false);
-      const std::uint64_t nanos =
-          (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-              std::chrono::steady_clock::now() - roundBegin)
-              .count();
-      const RoundAction action = round_action(round, result);
-      if (action == RoundAction::Settle) {
-        fullNanos = nanos;
-        break;
-      }
-      probeNanos += nanos;
-      if (action == RoundAction::GiveUp) {
-        // Every widening so far has brought in a seed the reduction still could not
-        // close on.  The bound is a heuristic input, not a guarantee, so stop here:
-        // this round reported, so it settles nothing and the sector contributes no
-        // masters, no uptargets and no equations -- which is what the fflow path
-        // reaches through its own cap warning plus a reporting full pass.
-        std::cerr << "warning: sector " << _id << ": still finds seeds outside the"
-                  << " box after " << kMaxRounds << " passes (depth " << _bound.depth
-                  << ", rank " << _bound.rank
-                  << (_bound.mode == BoundaryMode::Total
-                          ? ", total " + std::to_string(_bound.limit)
-                          : std::string())
-                  << ")\n";
-        break;
-      }
-      expanded = true;
-      _bound.widen_for(result);
-    }
-  } else {
-    // fflow: skip all subsector integrals first, to check that the box covers every
-    // integral the sector still needs.  A pass that reports an inadmissible seed
-    // reports, per offending seed, which figure of the box refuses it
-    // (SeedBound::refusal); widening that figure by one layer admits it, so the loop
-    // repeats until a pass reports nothing.  The passes are cheap next to the full
-    // one -- they carry no subsector integrals -- and the box they settle on is what
-    // the full pass below reduces with.
-    unsigned probeRounds = 0;
-    const auto probeBegin = std::chrono::steady_clock::now();
-    while (true) {
-      _probeRounds = probeRounds + 1;
-      const unsigned result = run_round(/*skip_subsectors=*/true);
-      if (result == 0)
-        break;
-      ++probeRounds;
-      if (probeRounds == kMaxRounds) {
-        // Every widening so far has brought in a seed the reduction still could not
-        // close on.  The bound is a heuristic input, not a guarantee, so stop here
-        // and let the full pass -- and its own report -- speak for the sector.
-        std::cerr << "warning: sector " << _id << ": probe still finds seeds"
-                  << " outside the box after " << probeRounds << " widenings"
-                  << " (depth " << _bound.depth << ", rank " << _bound.rank
-                  << (_bound.mode == BoundaryMode::Total
-                          ? ", total " + std::to_string(_bound.limit)
-                          : std::string())
-                  << ")\n";
-        break;
-      }
-      _bound.widen_for(result);
-    }
-    expanded = probeRounds > 0;
-    const auto probeEnd = std::chrono::steady_clock::now();
-    probeNanos =
-        (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            probeEnd - probeBegin)
-            .count();
-
-    // Full computation with filtered subsector integrals.  The memory gate +
-    // running-sector accounting happen inside sector_reduction_ff_n.  It also
-    // discards the failed probe's cache, so the probe above leaves it in place.
-    const auto fullBegin = std::chrono::steady_clock::now();
+  // Every round is a full pass, so the criterion that decides the box sees the
+  // subsector columns too.  A pass that reports an inadmissible seed
+  // (SeedBound::exceeded -- past the top of the seed box, or through its depth cap
+  // under that top) spills nothing: it returns at the criterion, before the
+  // masters/uptargets propagation and before the equations are appended, so the
+  // next round starts from a clean directory and an unchanged ctx and only the box
+  // differs.  Widening the reported figure by one layer admits that seed
+  // (_bound.widen_for; a depth widening carries the cap along only when the box top
+  // was what was reported, bit 4), and the loop repeats until a round reports
+  // nothing -- that round is the one that settles and spills.
+  for (unsigned round = 0;; ++round) {
+    // A re-run can find a directory an earlier run left behind, and a reporting
+    // round leaves its own partial files (targets, the seed-box line; see below).
+    // The deletion is charged to the round that follows it.
+    const auto roundBegin = std::chrono::steady_clock::now();
     fs::remove_all(sectorpath);
-    const unsigned fullResult = run_round(/*skip_subsectors=*/false);
-    const auto fullEnd = std::chrono::steady_clock::now();
-    fullNanos =
+    _probeRounds = round + 1;
+    const unsigned result = run_round();
+    const std::uint64_t nanos =
         (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            fullEnd - fullBegin)
+            std::chrono::steady_clock::now() - roundBegin)
             .count();
-    if ((fullResult & 3) != 0) {
-      // That a single expansion always suffices is what the two-pass scheme
-      // assumes; if it ever fails to hold, the equations just collected are
-      // incomplete, so report it rather than reduce silently with too narrow a
-      // bound.  Bit 4 is the probe's repair hint, not a figure of the box, so it is
-      // masked out here (and it cannot arrive alone -- a seed that reports it also
-      // pins a hard cap).
-      std::cerr << "warning: sector " << _id << ": full pass still needs a wider"
-                << " bound (code " << (fullResult & 3) << ", depth " << _bound.depth
-                << ", rank " << _bound.rank
-                << (_bound.mode == BoundaryMode::Total
-                        ? ", total " + std::to_string(_bound.limit - 1)
-                        : std::string())
-                << ")\n";
+    const RoundAction action = round_action(round, result);
+    if (action == RoundAction::Settle) {
+      fullNanos = nanos;
+      break;
     }
+    probeNanos += nanos;
+    if (action == RoundAction::GiveUp) {
+      // Every widening so far has brought in a seed the reduction still could not
+      // close on.  The bound is a heuristic input, not a guarantee, so stop here:
+      // this round reported, so it settles nothing and the sector contributes no
+      // masters, no uptargets and no equations.
+      std::cerr << "warning: sector " << _id << ": still finds seeds outside the"
+                << " box after " << kMaxRounds << " passes (depth " << _bound.depth
+                << ", rank " << _bound.rank << ", total " << _bound.limit << ")\n";
+      break;
+    }
+    expanded = true;
+    _bound.widen_for(result);
   }
 
   if (expanded)
@@ -507,8 +392,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
                                        const std::vector<IBPProtoFFmod> &ibps_mod,
                                        const std::vector<IBPProtoM> *ibps_sym,
                                        const SectorConfig &cfg,
-                                       ReductionContext &ctx,
-                                       bool skip_subsectors) {
+                                       ReductionContext &ctx) {
   namespace fs = std::filesystem;
   std::string sectorpath =
       cfg.cache_dir + "/sectors/sector" + std::to_string(_id);
@@ -532,20 +416,9 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   std::map<RawIntegral, unsigned int> subsector_map;
   unsigned int sub_int_id = _seeds.size();
 
-  // create a new graph
-  Session session;
-  unsigned graphId = session.new_graph();
-  Graph *graph = session.graph(graphId);
-
-  // set input vars
-  graph->set_input_vars(0);
-  std::vector<unsigned> inputnodes;
-
-  // prepare sparse solver data
-  typedef NumericSparseSolverModData Data;
-  std::unique_ptr<NumericSparseSolverMod> algptr(new NumericSparseSolverMod());
-  std::unique_ptr<Data> data(new Data());
-  auto &alg = *algptr;
+  // the sector's matrix: rows are the generated equations, columns the seeds
+  // (ascending column number = simpler) followed by the subsector integrals
+  NumericSparseSolverMod alg;
 
   unsigned nvars = _seeds.size();
   unsigned nseeds = 0;
@@ -569,8 +442,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
           if (coeff.is_zero())
             continue;
           if (!_weights.contains(integral)) {
-            if (skip_subsectors ||
-                _bound.filter_drops(integral, cfg.subsector_filter_n) ||
+            if (_bound.filter_drops(integral, cfg.subsector_filter_n) ||
                 _trivialsectors.contains(integral.sector()))
               continue;
             if (subsector_map.find(integral) == subsector_map.end()) {
@@ -620,8 +492,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
 
           unsigned weight = 0;
           if (!_weights.contains(integral)) {
-            if (skip_subsectors ||
-                _bound.filter_drops(integral, cfg.subsector_filter_n) ||
+            if (_bound.filter_drops(integral, cfg.subsector_filter_n) ||
                 _trivialsectors.contains(integral.sector()))
               continue;
             weight = subsector_map[integral] + nvars;
@@ -642,9 +513,8 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   }
   time_stamp(file, " finish generating system: ");
 
-  // Count raw equations for the full (second) pass only.
-  if (!skip_subsectors)
-    ctx.rawEquationsTotal.fetch_add(system.size(), std::memory_order_relaxed);
+  // Count raw equations of this round.
+  ctx.rawEquationsTotal.fetch_add(system.size(), std::memory_order_relaxed);
 
   // set target integrals
   for (const auto &integral : ctx.uptargets[_id])
@@ -657,13 +527,8 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   file << '\n' << format_seed_box_line(_id, _bound, _initialBound)
        // How many passes it took to settle the bound: the driver widens the box and
        // runs another pass while one still reports a seed outside it, so "rounds: 3"
-       // says the leading triple is two widenings past "probe start".  Under pyred
-       // every pass is a full one and the pass that settles is the one that spilled,
-       // so the field is spelled without "probe"; under fflow these are the seed-only
-       // probe passes, and the full pass reports the count of them.
-       << (cfg.sector_elimination == SectorElimination::Pyred ? "  rounds: "
-                                                             : "  probe rounds: ")
-       << _probeRounds << '\n';
+       // says the leading triple is two widenings past "start".
+       << "  rounds: " << _probeRounds << '\n';
   file << "\n integrals: " << nvars << " sub integrals: " << nsubint
        << '\n';
   file << " seeds: " << nseeds << "  outer: " << nouter << '\n';
@@ -702,16 +567,9 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   system.shrink_to_fit();
 
   // -------------------------------------------------------------------------
-  // 方程选取。给下游的是两样东西：必需主积分（needed_indep，列号）与选中的方程下标
-  // （selected_eqs，指向 alg.rinfo/alg.c）。
-  //
-  // 两种引擎（settings.sector_elimination）：
-  //   fflow（默认，旧行为）：FiniteFlow SparseLinearSolver 的 learn +
-  //     mark_and_sweep_eqs（前向+反向整链闭包）。
-  //   pyred：与全局阶段同一套 —— forward_eliminate/backward_eliminate 做 learn，
-  //     前向闭包 + 数值充分性修复做选取（src/global_select.h），主积分用与全局阶段
-  //     相同的公式（约化式右端的并集）。
-  // needed_indep 一律是「按列升序」的列号（列越小越复杂），两种引擎同序。
+  // Equation selection.  Two things go downstream: the needed masters
+  // (needed_indep, as column numbers, ascending = most complex first) and the
+  // selected equations (selected_eqs, indices into alg.rinfo/alg.c).
   // -------------------------------------------------------------------------
   std::vector<std::size_t> needed_indep;
   std::vector<unsigned> selected_eqs;
@@ -719,105 +577,63 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   const unsigned ncols = nvars + nsubint;
   const uint64_t learn_prime = BIG_UINT_PRIMES[0];
 
-  // pyred 分支的状态（fflow 分支不用）。sys_idx[j] = res_eqs 第 j 行来自
-  // alg.rinfo/alg.c（= eqrecord）的哪一行 —— 选取结果要按它映射回去。
+  // sys_idx[j] = the row of alg.rinfo/alg.c (= eqrecord) that row j of res_eqs
+  // came from; the selection result is mapped back through it.
   std::vector<secred::ResEq> res_eqs;
   std::vector<uint32_t> sys_idx;
-  secred::SubSolve pyred_learn;
-  GlobalSelection pyred_sel;
-  std::vector<unsigned> pyred_dep_targets;
+  secred::SubSolve ffred_learn;
+  GlobalSelection ffred_sel;
+  std::vector<unsigned> ffred_dep_targets;
 
-  SparseLinearSolver *sls = nullptr;
-  unsigned solverId = 0;
-
-  if (cfg.sector_elimination == SectorElimination::Pyred) {
-    // ---- pyred：与全局阶段同一套 learn（globalreduce.cpp 的 learn 三连）----
-    time_stamp(file, "\n beging learning: ");
-    // res_eqs 第 j 行 ← alg.rinfo/eqrecord 的第 sys_idx[j] 行。今天 res_eq_from_row
-    // 丢不掉任何行（方程构造已滤掉空行，且 id = ncols-1-col 是单射，同 id 不会相消），
-    // 所以 sys_idx 恒为 [0, 1, ...]；仍然显式映射，免得下游悄悄依赖这个不变量。
-    std::vector<uint32_t> all_idx;
-    res_eqs.reserve(alg.rinfo.size());
-    sys_idx.reserve(alg.rinfo.size());
-    for (unsigned i = 0; i < alg.rinfo.size(); ++i) {
-      secred::ResEq re = secred::res_eq_from_row(
-          alg.rinfo[i].cols.get(), alg.c[i].get(), alg.rinfo[i].size, ncols,
-          learn_prime);
-      if (!re.empty()) {
-        res_eqs.push_back(std::move(re));
-        sys_idx.push_back(i);
-      }
+  // Learn the system (globalreduce.cpp's learn): row j of res_eqs comes from row
+  // sys_idx[j] of alg.rinfo/eqrecord, which the selection result is mapped back
+  // through.  res_eq_from_row drops no row today -- the equation builder already
+  // filters empty rows and id = ncols - 1 - col is injective -- so sys_idx is
+  // always [0, 1, ...], but it is kept explicit so no downstream code comes to
+  // depend on that.
+  time_stamp(file, "\n beging learning: ");
+  std::vector<uint32_t> all_idx;
+  res_eqs.reserve(alg.rinfo.size());
+  sys_idx.reserve(alg.rinfo.size());
+  for (unsigned i = 0; i < alg.rinfo.size(); ++i) {
+    secred::ResEq re = secred::res_eq_from_row(
+        alg.rinfo[i].cols.get(), alg.c[i].get(), alg.rinfo[i].size, ncols,
+        learn_prime);
+    if (!re.empty()) {
+      res_eqs.push_back(std::move(re));
+      sys_idx.push_back(i);
     }
-    all_idx.resize(res_eqs.size());
-    for (uint32_t j = 0; j < all_idx.size(); ++j)
-      all_idx[j] = j;
-    secred::solve_res_subset(res_eqs, all_idx, learn_prime, pyred_learn,
-                             /*want_fwd=*/true, /*want_bwd=*/true);
-    time_stamp(file, " finish learning: ");
-
-    // 主积分：与全局阶段同一公式（约化式右端 ∪ 本阶段约化不了的 target），
-    // id 降序 → 翻成列号即升序，与 legacy 的 needed_indepvars() 同序。
-    std::vector<unsigned> target_ids;
-    target_ids.reserve(neededvars);
-    for (unsigned i = 0; i < neededvars; ++i)
-      target_ids.push_back(ncols - 1 - neededVars[i]);
-    for (unsigned id : secred::sector_masters(pyred_learn, target_ids))
-      needed_indep.push_back(ncols - 1 - id);
-    for (unsigned id : target_ids)
-      if (pyred_learn.solmap.find(id) != pyred_learn.solmap.end())
-        pyred_dep_targets.push_back(id);
-  } else {
-    // ---- fflow（默认，旧行为，逐行未动）----
-    alg.init(alg.c.size(), nvars + nsubint, neededVars.get(), neededvars, *data);
-
-    // attach solver node
-    solverId =
-        graph->new_node(std::move(algptr), std::move(data), inputnodes.data());
-
-    // set only homogeneous
-    Algorithm *presol = session.algorithm(graphId, solverId);
-    SparseLinearSolver &psls = *static_cast<SparseLinearSolver *>(presol);
-    psls.only_homogeneous();
-    session.invalidate_subctxt_alg_data(graphId, solverId);
-
-    // set output node
-    session.set_output_node(graphId, solverId);
-
-    // solver learn
-    time_stamp(file, "\n beging learning: ");
-    Ret lret = session.learn(graphId);
-    if (lret != SUCCESS) {
-      std::cerr << "learn failed!" << std::endl;
-      exit(1);
-    }
-    time_stamp(file, " finish learning: ");
-
-    sls = static_cast<SparseLinearSolver *>(session.algorithm(graphId, solverId));
-    needed_indep.assign(sls->needed_indepvars(),
-                        sls->needed_indepvars() + sls->n_needed_indepvars());
   }
+  all_idx.resize(res_eqs.size());
+  for (uint32_t j = 0; j < all_idx.size(); ++j)
+    all_idx[j] = j;
+  secred::solve_res_subset(res_eqs, all_idx, learn_prime, ffred_learn,
+                           /*want_fwd=*/true, /*want_bwd=*/true);
+  time_stamp(file, " finish learning: ");
+
+  // Masters, by the global stage's formula: the RHS of every reduction union the
+  // targets this stage cannot reduce.  id descending -> column ascending.
+  std::vector<unsigned> target_ids;
+  target_ids.reserve(neededvars);
+  for (unsigned i = 0; i < neededvars; ++i)
+    target_ids.push_back(ncols - 1 - neededVars[i]);
+  for (unsigned id : secred::sector_masters(ffred_learn, target_ids))
+    needed_indep.push_back(ncols - 1 - id);
+  for (unsigned id : target_ids)
+    if (ffred_learn.solmap.find(id) != ffred_learn.solmap.end())
+      ffred_dep_targets.push_back(id);
 
   // mark and sweep
   //
-  // The narrowing-failure criterion: a needed independent variable that is a seed
-  // the boundary does not admit means the box was too small (that seed generates no
-  // equation, the reduction cannot close on it, and it stays a master).  Two things
-  // make a seed the box generates inadmissible -- its quantity (depth in Box mode,
-  // total power depth + rank in Total mode) landing past the top of the seed box,
-  // or, in Total mode only, its depth reaching the depth hard cap while a large rank
-  // figure keeps its total power under that top.  See SeedBound; the second one is
-  // the deep, low-rank seed F234's sector 246 kept as a master.
+  // A needed independent variable whose seed the boundary does not admit means the
+  // box was too small: that seed generates no equation, the reduction cannot close
+  // on it, and it stays a master (SeedBound names the two ways that happens).
   //
-  // The return value names the figure of the box that has to grow: bit 1 the depth
-  // (or, in Total mode, the cap that holds the box top down), bit 2 the rank, and
-  // bit 4 the *repair* a depth widening has to use -- set when some reported seed
-  // was past the box top, i.e. when the total power is what was wrong and the cap
-  // therefore has to ride along at the top of the widened box (SeedBound::
-  // widen_depth).  A depth report made by the depth cap alone leaves bit 4 clear
-  // and deepens the box without moving the cap.  Seeds the rank cap refuses while
-  // their total power is inside the box -- the wide, shallow "outer" integrals a
-  // sector hands on as masters -- are still not reported: widening the box would
-  // not admit them.
+  // The return value names the figure that has to grow: bit 1 the depth, bit 2 the
+  // rank, bit 4 the *repair* -- set when the total power was what was wrong, so the
+  // cap must ride along at the top of the widened box (SeedBound::widen_depth).  A
+  // depth report from the depth cap alone leaves bit 4 clear and deepens the box
+  // without moving the cap.
   unsigned refusalBits = 0;
   for (unsigned i = 0; i < needed_indep.size(); ++i) {
     if (needed_indep[i] >= nvars)
@@ -831,11 +647,6 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   }
   if (refusalBits != 0)
     return refusalBits;
-
-  // First run only checks depth/rank; skip master propagation and equation
-  // collection.
-  if (skip_subsectors)
-    return 0;
 
   file << "\n masters: ";
   file << needed_indep.size() << '\n';
@@ -860,55 +671,48 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   }
   file << '\n';
 
-  if (cfg.sector_elimination == SectorElimination::Pyred) {
-    // ---- pyred 选取：前向闭包 + 数值充分性修复（与全局阶段同一个选择器）----
-    std::unordered_map<unsigned, unsigned> master_index; // id -> 序号
-    for (std::size_t j = 0; j < needed_indep.size(); ++j)
-      master_index[ncols - 1 - needed_indep[j]] = j;
+  // Selection: forward closure + numeric sufficiency repair, the global stage's
+  // own selector (global_select.h).
+  std::unordered_map<unsigned, unsigned> master_index; // id -> position
+  for (std::size_t j = 0; j < needed_indep.size(); ++j)
+    master_index[ncols - 1 - needed_indep[j]] = j;
 
-    pyred_sel = select_global_forward(
-        pyred_learn.eq_index, pyred_learn.fwd_deps, pyred_learn.solmap,
-        pyred_dep_targets, master_index,
-        [&](const std::vector<uint32_t> &idx, secred::SubSolve &out) {
-          secred::solve_res_subset(res_eqs, idx, learn_prime, out,
-                                   /*want_fwd=*/true, /*want_bwd=*/false);
-        });
-    // 选取给出的是 res_eqs 下标，下游要的是 eqrecord/alg.rinfo 的行号。
-    std::vector<unsigned> sel_idx;
-    if (pyred_sel.fallback) {
-      // 兜底：今天 mark_and_sweep_eqs 的语义（前向 ∪ 反向整链闭包），永不缺方程。
-      std::cerr << "sector " << _id
-                << ": forward selection fell back to the legacy closure\n";
-      sel_idx = secred::legacy_closure(pyred_dep_targets, pyred_learn.fwd_deps,
-                                       pyred_learn.bwd_deps,
-                                       pyred_learn.eq_index);
-    } else {
-      sel_idx.assign(pyred_sel.needed_eq_idx.begin(),
-                     pyred_sel.needed_eq_idx.end());
-    }
-    selected_eqs.reserve(sel_idx.size());
-    for (unsigned j : sel_idx)
-      selected_eqs.push_back(sys_idx[j]);
+  ffred_sel = select_global_forward(
+      ffred_learn.eq_index, ffred_learn.fwd_deps, ffred_learn.solmap,
+      ffred_dep_targets, master_index,
+      [&](const std::vector<uint32_t> &idx, secred::SubSolve &out) {
+        secred::solve_res_subset(res_eqs, idx, learn_prime, out,
+                                 /*want_fwd=*/true, /*want_bwd=*/false);
+      });
+  // The selection names res_eqs rows; downstream wants eqrecord/alg.rinfo rows.
+  std::vector<unsigned> sel_idx;
+  if (ffred_sel.fallback) {
+    // Fallback: the forward union the full backward closure, which can never
+    // miss an equation.
+    std::cerr << "sector " << _id
+              << ": forward selection fell back to the legacy closure\n";
+    sel_idx = secred::legacy_closure(ffred_dep_targets, ffred_learn.fwd_deps,
+                                     ffred_learn.bwd_deps,
+                                     ffred_learn.eq_index);
   } else {
-    sls->mark_and_sweep_eqs(session.alg_data(graphId, solverId));
-    session.invalidate_subctxt_alg_data(graphId, solverId);
-    selected_eqs.assign(sls->indep_eqs(),
-                        sls->indep_eqs() + sls->n_indep_eqs());
+    sel_idx.assign(ffred_sel.needed_eq_idx.begin(),
+                   ffred_sel.needed_eq_idx.end());
   }
+  selected_eqs.reserve(sel_idx.size());
+  for (unsigned j : sel_idx)
+    selected_eqs.push_back(sys_idx[j]);
 
   file << "\n remained equations: " << selected_eqs.size() << '\n';
-  if (cfg.sector_elimination == SectorElimination::Pyred)
-    file << " selection: forward (repair rounds " << pyred_sel.n_repair_rounds
-         << ", +" << pyred_sel.n_repair_added << " added; fwd-only "
-         << pyred_sel.n_fwd_only << "; fallback "
-         << (pyred_sel.fallback ? "yes" : "no") << ")\n";
+  file << " selection: forward (repair rounds " << ffred_sel.n_repair_rounds
+       << ", +" << ffred_sel.n_repair_added << " added; fwd-only "
+       << ffred_sel.n_fwd_only << "; fallback "
+       << (ffred_sel.fallback ? "yes" : "no") << ")\n";
 
   // Regenerate each selected equation from its (seed, ibp) record and spill
   // it to the raw equation file (ctx.appendRawEquation) for the global
-  // reduction. Subsector master integrals are forwarded by the
-  // needed_indepvars() propagation above (the sweep result); the subsector-depth
-  // filter (offset +1) keeps the full directly-generated subsector layer in the
-  // columns, so nothing extra needs to be forwarded here.
+  // reduction. Subsector master integrals are forwarded by the master
+  // propagation above (the sweep result); the subsector filter keeps the top
+  // layer in the columns, so nothing extra needs to be forwarded here.
   {
     std::vector<GlobalEquation> local_eqs;
     std::vector<RawIntegral> new_uptargets;
@@ -969,10 +773,114 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
         local_eqs.push_back(std::move(eq));
     }
 
+    // Sector symmetry relations (spec 5.1-5.3).  One equation per prescription
+    // out of this sector, for every seed this round admitted -- the IBP seed set
+    // (_bound.admits), which is what Kira generates its relations on (spec 5.2).
+    // An image that is not a variable of this sector's own system is requested
+    // from *its own* sector through the same uptargets push the IBP terms use;
+    // the symmetry edge in _run_reduce_fine is what makes that sector run after
+    // this one, and -- the edge putting `to` after this sector, every image
+    // sector being a subset of `to` -- running after this sector is the only
+    // thing needed.
+    if (ctx.symmetries) {
+      const std::vector<PropPrescription> &pres = ctx.symmetries->bySource(_id);
+      if (!pres.empty()) {
+        const auto trivial = [&](unsigned sector) {
+          return _trivialsectors.contains(sector);
+        };
+        std::vector<GlobalEquation> sym_eqs;
+        for (const PropPrescription &p : pres) {
+          if (ibps_sym) {
+            // The prescription's rows in the ring this sector works in: GiNaC
+            // for a symbolic family, the pre-converted rationals otherwise
+            // (spec 5.1).  GiNaC is not thread-safe, so its arithmetic takes the
+            // same guard the IBP spill does.
+            std::vector<std::vector<GiNaC::ex>> f_ex(p.f.rows(),
+                                                     std::vector<GiNaC::ex>(p.f.cols()));
+            std::vector<GiNaC::ex> c_ex(p.c.rows());
+            for (unsigned i = 0; i < p.f.rows(); ++i)
+              for (unsigned j = 0; j < p.f.cols(); ++j)
+                f_ex[i][j] = p.f(i, j);
+            for (unsigned i = 0; i < p.c.rows(); ++i)
+              c_ex[i] = p.c(i, 0);
+            std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
+            for (const RawIntegral &seed : _seeds) {
+              if (!_bound.admits(seed))
+                continue;
+              std::vector<SymTerm<GiNaC::ex>> terms;
+              if (!expand_prescription<GiNaC::ex>(p, f_ex, c_ex, seed, trivial, terms))
+                continue;
+              // Merge the image terms by integral and add the seed itself with
+              // coefficient -1 (Kira's convention, spec 5.1): a seed the
+              // correspondence fixes -- the all-ones seed of a sector, whose
+              // in-sector lines all carry power one -- cancels to nothing here
+              // and carries no equation.
+              std::map<RawIntegral, GiNaC::ex> agg;
+              for (const SymTerm<GiNaC::ex> &t : terms)
+                agg[RawIntegral(t.powers)] += t.coeff;
+              agg[seed] += GiNaC::ex(-1);
+              GlobalEquation eq;
+              for (const auto &[integ, coeff] : agg) {
+                if (coeff.is_zero())
+                  continue;
+                std::ostringstream oss;
+                oss << coeff;
+                if (_weights.contains(integ)) {
+                  eq.emplace_back(integ, oss.str());
+                } else if (!_trivialsectors.contains(integ.sector())) {
+                  eq.emplace_back(integ, oss.str());
+                  new_uptargets.push_back(integ);
+                }
+              }
+              if (!eq.empty())
+                sym_eqs.push_back(std::move(eq));
+            }
+          } else {
+            for (const RawIntegral &seed : _seeds) {
+              if (!_bound.admits(seed))
+                continue;
+              std::vector<SymTerm<rational>> terms;
+              if (!expand_prescription<rational>(p, p.f_num, p.c_num, seed, trivial, terms))
+                continue;
+              std::map<RawIntegral, rational> agg;
+              for (const SymTerm<rational> &t : terms)
+                agg[RawIntegral(t.powers)] += t.coeff;
+              agg[seed] += rational(-1);
+              GlobalEquation eq;
+              for (const auto &[integ, coeff] : agg) {
+                if (coeff.is_zero())
+                  continue;
+                if (_weights.contains(integ)) {
+                  eq.emplace_back(integ, coeff.str());
+                } else if (!_trivialsectors.contains(integ.sector())) {
+                  eq.emplace_back(integ, coeff.str());
+                  new_uptargets.push_back(integ);
+                }
+              }
+              if (!eq.empty())
+                sym_eqs.push_back(std::move(eq));
+            }
+          }
+        }
+        for (auto &eq : sym_eqs)
+          ctx.appendRawEquation(eq);
+      }
+    }
+
     if (!new_uptargets.empty()) {
       std::lock_guard lk(ctx.uptargetsMutex);
       for (const auto &integ : new_uptargets)
         ctx.uptargets[integ.sector()].insert(integ);
+      // A self relation's image is a permutation of an admitted seed, so every
+      // SeedBound rule (all permutation-invariant) admits it too and it is a
+      // variable of this sector's own system already (spec 5.3).  A self image
+      // landing here would be a column with no equation anywhere, i.e. a
+      // spurious master; it cannot happen, so say so loudly if it does.
+      if (ctx.symmetries && ctx.symmetries->representative(_id) == _id)
+        for (const auto &integ : new_uptargets)
+          if (integ.sector() == _id)
+            std::cerr << "sector " << _id
+                      << ": symmetry image missing from the local system\n";
     }
     for (auto &eq : local_eqs)
       ctx.appendRawEquation(eq);
