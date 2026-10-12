@@ -673,3 +673,145 @@ void SymmetryTable::dump(const std::string &path) const {
       }
     }
 }
+
+namespace {
+
+// The expansion is written once over the coefficient type (spec 5.1): GiNaC::ex
+// for a symbolic family, rational for a numeric one.  Both types have is_zero(),
+// so only these two primitives differ.
+template <typename Coeff>
+Coeff ring_one();
+
+template <>
+GiNaC::ex ring_one<GiNaC::ex>() {
+  return GiNaC::ex(1);
+}
+
+template <>
+rational ring_one<rational>() {
+  return rational(1);
+}
+
+// x^e for e >= 1.  The generic form is the repeated product, which is what the
+// numeric type has; GiNaC gets its own.
+template <typename Coeff>
+Coeff ring_pow(const Coeff &x, unsigned e) {
+  Coeff r = ring_one<Coeff>();
+  for (unsigned i = 0; i < e; ++i)
+    r = r * x;
+  return r;
+}
+
+template <>
+GiNaC::ex ring_pow<GiNaC::ex>(const GiNaC::ex &x, unsigned e) {
+  return GiNaC::pow(x, e);
+}
+
+constexpr const char *kDenominatorRowError =
+    "symmetry: a denominator line's row is not a single propagator (Kira: "
+    "\"encountered a linear combination of propagators in the denominator\")";
+
+}  // namespace
+
+template <typename Coeff>
+bool expand_prescription(const PropPrescription &p, const std::vector<std::vector<Coeff>> &f,
+                         const std::vector<Coeff> &c, const RawIntegral &seed,
+                         const std::function<bool(unsigned)> &trivial,
+                         std::vector<SymTerm<Coeff>> &out) {
+  out.clear();
+  // `f` is the family's nprops x nprops row matrix, so the image index vector is
+  // a full family vector; the seed carries that same length, and its own size
+  // bounds which lines are read.
+  const unsigned n = f.size();
+  if (p.dot_only) {
+    // The relation holds only on seeds with no numerator outside `from`: those
+    // are the lines the correspondence does not cover, so the
+    // restricted-polynomial identity does not apply to them (spec 5.1, pyred
+    // relations.cpp:481-483).
+    for (unsigned k = 0; k < seed.size(); ++k)
+      if (!(p.from & (1u << k)) && seed[k] != 0)
+        return false;
+  }
+
+  // Denominators first (a_k > 0), as a permutation of the seed's positive
+  // powers: Kira does the same in one step (relations.cpp:490-500), so the
+  // result cannot depend on the order the lines are visited in.
+  std::vector<int> image(n, 0);
+  Coeff coeff = ring_one<Coeff>();
+  for (unsigned k = 0; k < seed.size(); ++k) {
+    const int e = seed[k];
+    if (e <= 0)
+      continue;
+    unsigned nonzero = 0;
+    int j = -1;
+    for (unsigned l = 0; l < n; ++l)
+      if (!f[k][l].is_zero()) {
+        ++nonzero;
+        j = int(l);
+      }
+    if (nonzero != 1 || !c[k].is_zero())
+      throw std::runtime_error(kDenominatorRowError);
+    // D_k^-e = (f_kj D'_j)^-e = f_kj^-e D'_j^-e
+    image[unsigned(j)] += e;
+    coeff = coeff / ring_pow(f[k][unsigned(j)], unsigned(e));
+  }
+
+  std::map<std::vector<int>, Coeff> acc;
+  acc[image] = coeff;
+
+  // Numerators (a_k < 0): one factor of the row's polynomial at a time.  Each
+  // D'_j factor *subtracts* one from the target's power at j, because
+  // I(a) = prod D^-a and multiplying the integrand by D'_j lowers a'_j.
+  for (unsigned k = 0; k < seed.size(); ++k) {
+    if (seed[k] >= 0)
+      continue;
+    for (int factor = 0; factor < -seed[k]; ++factor) {
+      std::map<std::vector<int>, Coeff> next;
+      for (const auto &[vec, cf] : acc) {
+        for (unsigned j = 0; j < n; ++j) {
+          if (f[k][j].is_zero())
+            continue;
+          std::vector<int> v = vec;
+          if (v[j] == 1) {
+            // Line j drops out of the target sector here.  A trivial lowered
+            // sector is a scaleless integral, so the whole term goes with it
+            // (Kira's pinch test, relations.cpp:533-540 -- the same convention
+            // sector_reduction_ff_n uses for its IBP terms).
+            v[j] = 0;
+            unsigned sector = 0;
+            for (unsigned m = 0; m < n; ++m)
+              if (v[m] > 0)
+                sector |= 1u << m;
+            if (trivial(sector))
+              continue;
+          } else {
+            v[j] -= 1;
+          }
+          next[v] += cf * f[k][j];
+        }
+        if (!c[k].is_zero())
+          next[vec] += cf * c[k];
+      }
+      acc.swap(next);
+    }
+  }
+
+  out.reserve(acc.size());
+  for (const auto &[vec, cf] : acc)
+    // Defensive: a zero coefficient would reach the caller as a phantom
+    // integral, and so as a phantom column of the global system.
+    if (!cf.is_zero())
+      out.push_back(SymTerm<Coeff>{vec, cf});
+  return true;
+}
+
+template bool expand_prescription<GiNaC::ex>(const PropPrescription &,
+                                             const std::vector<std::vector<GiNaC::ex>> &,
+                                             const std::vector<GiNaC::ex> &, const RawIntegral &,
+                                             const std::function<bool(unsigned)> &,
+                                             std::vector<SymTerm<GiNaC::ex>> &);
+template bool expand_prescription<rational>(const PropPrescription &,
+                                            const std::vector<std::vector<rational>> &,
+                                            const std::vector<rational> &, const RawIntegral &,
+                                            const std::function<bool(unsigned)> &,
+                                            std::vector<SymTerm<rational>> &);

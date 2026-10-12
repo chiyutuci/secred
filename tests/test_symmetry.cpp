@@ -716,3 +716,266 @@ TEST(symmetry_restrict_to_prunes_and_self_reports) {
   REQUIRE_EQ(u.bySource(6).size(), 0u);  // 6 was a cross source
   REQUIRE_EQ(u.bySource(5).size(), 1u);  // 5 was a self source
 }
+
+// ---------------------------------------------------------------------------
+// The relation expansion (spec 5.1).  The hand prescriptions are written out so
+// the algebra can be checked by hand.  The convention throughout is
+// I(a) = prod_k D_k^{-a_k}: multiplying the integrand by D'_j therefore
+// *subtracts* one from a'_j, which is what makes the numerator row of the
+// spec's table read "subtract" and not "add".
+//
+//   hand_prescription():  D_0 = D'_0,   D_1 = D'_0 + D'_1 + 4
+//
+// Line 1's row is a combination, so line 1 can never be a denominator -- which
+// is exactly the configuration Kira rejects (relations.cpp:514-521).
+// ---------------------------------------------------------------------------
+
+static PropPrescription hand_prescription(unsigned from, unsigned to, bool dot_only) {
+  PropPrescription p;
+  p.from = from;
+  p.to = to;
+  p.ing = {0, 1};
+  p.dot_only = dot_only;
+  p.f = GiNaC::matrix(2, 2);
+  p.f(0, 0) = 1;
+  p.f(1, 0) = 1;
+  p.f(1, 1) = 1;
+  p.c = GiNaC::matrix(2, 1);
+  p.c(1, 0) = 4;
+  return p;
+}
+
+// Rows given as plain numbers, for the shapes hand_prescription() does not have.
+static PropPrescription rows_prescription(unsigned from, unsigned to, bool dot_only,
+                                          const std::vector<std::vector<int>> &f,
+                                          const std::vector<int> &c) {
+  PropPrescription p;
+  p.from = from;
+  p.to = to;
+  p.ing = {0, 1};
+  p.dot_only = dot_only;
+  p.f = GiNaC::matrix(2, 2);
+  p.c = GiNaC::matrix(2, 1);
+  for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned j = 0; j < 2; ++j)
+      p.f(i, j) = f[i][j];
+    p.c(i, 0) = c[i];
+  }
+  return p;
+}
+
+static std::vector<std::vector<GiNaC::ex>> ex_rows(const PropPrescription &p) {
+  std::vector<std::vector<GiNaC::ex>> f(p.f.rows(), std::vector<GiNaC::ex>(p.f.cols()));
+  for (unsigned i = 0; i < p.f.rows(); ++i)
+    for (unsigned j = 0; j < p.f.cols(); ++j)
+      f[i][j] = p.f(i, j);
+  return f;
+}
+
+static std::vector<GiNaC::ex> ex_col(const PropPrescription &p) {
+  std::vector<GiNaC::ex> c(p.c.rows());
+  for (unsigned i = 0; i < p.c.rows(); ++i)
+    c[i] = p.c(i, 0);
+  return c;
+}
+
+// The brace form RawIntegral({1, 1}) is ambiguous (vector<int> and vector<bool>
+// are both constructible from it), so the tests spell the type out.
+static RawIntegral seed_of(std::initializer_list<int> il) {
+  return RawIntegral(std::vector<int>(il));
+}
+
+static bool never_trivial(unsigned) { return false; }
+
+static std::map<std::vector<int>, GiNaC::ex>
+ex_terms(const std::vector<SymTerm<GiNaC::ex>> &out) {
+  std::map<std::vector<int>, GiNaC::ex> m;
+  for (const SymTerm<GiNaC::ex> &t : out)
+    m[t.powers] = t.coeff;
+  return m;
+}
+
+static std::map<std::vector<int>, rational> rat_terms(const std::vector<SymTerm<rational>> &out) {
+  std::map<std::vector<int>, rational> m;
+  for (const SymTerm<rational> &t : out)
+    m[t.powers] = t.coeff;
+  return m;
+}
+
+// D_0 = D'_1, D_1 = D'_0: a pure line swap.  I(2,1) = D_0^-2 D_1^-1
+// = D'_1^-2 D'_0^-1, i.e. the image index vector is the seed's with the two
+// lines exchanged, and the coefficient stays 1.
+TEST(symmetry_expansion_denominators_are_a_permutation) {
+  PropPrescription p = rows_prescription(3, 0, false, {{0, 1}, {1, 0}}, {0, 0});
+  std::vector<SymTerm<GiNaC::ex>> out;
+  REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({2, 1}),
+                                         never_trivial, out));
+  REQUIRE_EQ(out.size(), 1u);
+  REQUIRE(out[0].powers == std::vector<int>({1, 2}));
+  REQUIRE(out[0].coeff.is_equal(1));
+}
+
+// D_0 = 2 D'_0: a single-term denominator row whose scalar is not 1, so the
+// coefficient picks up 2^-e -- I(2,0) = D_0^-2 = 2^-2 D'_0^-2 = (1/4) I(2,0).
+TEST(symmetry_expansion_denominator_scalar_multiplies_the_coefficient) {
+  PropPrescription p = rows_prescription(3, 0, false, {{2, 0}, {0, 1}}, {0, 0});
+  std::vector<SymTerm<GiNaC::ex>> out;
+  REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({2, 0}),
+                                         never_trivial, out));
+  REQUIRE_EQ(out.size(), 1u);
+  REQUIRE(out[0].powers == std::vector<int>({2, 0}));
+  REQUIRE(out[0].coeff.is_equal(GiNaC::ex(1) / 4));
+}
+
+// A denominator row that is a linear combination is a hard error, not a
+// recovery path: the detector already cannot emit such a prescription
+// (print_relations drops any mapping whose in-sector line has two non-zero
+// entries, ReadYamlFiles.cpp:1955-1971), so the implementation asserts it.
+// Seed (1,1) makes line 1 a denominator, and line 1's row is D'_0 + D'_1 + 4.
+TEST(symmetry_expansion_denominator_combination_throws) {
+  PropPrescription p = hand_prescription(3, 0, false);
+  std::vector<SymTerm<GiNaC::ex>> out;
+  REQUIRE_THROWS_AS(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({1, 1}),
+                                                   never_trivial, out),
+                    std::runtime_error);
+}
+
+// I(1,-1) = D_0^-1 D_1 = D'_0^-1 (D'_0 + D'_1 + 4)
+//         = 1 + D'_0^-1 D'_1 + 4 D'_0^-1
+//         = I(0,0) + I(1,-1) + 4 I(1,0).
+// The I(0,0) term is the pinch: the numerator's D'_0 cancels the denominator's,
+// so line 0 leaves the target sector.
+TEST(symmetry_expansion_numerator_cancels_a_denominator) {
+  PropPrescription p = hand_prescription(3, 0, false);
+  std::vector<SymTerm<GiNaC::ex>> out;
+  REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({1, -1}),
+                                         never_trivial, out));
+  std::map<std::vector<int>, GiNaC::ex> got = ex_terms(out);
+  REQUIRE_EQ(out.size(), 3u);
+  REQUIRE((got[{0, 0}].is_equal(1)));
+  REQUIRE((got[{1, -1}].is_equal(1)));
+  REQUIRE((got[{1, 0}].is_equal(4)));
+}
+
+// The same expansion with the pinched sector declared trivial: the I(0,0) term
+// is a scaleless integral and drops, leaving the other two.  A trivial sector
+// that is *not* the pinched one changes nothing -- the drop is on the term whose
+// line leaves the target sector, never on the seed's own sector.
+TEST(symmetry_expansion_pinch_drops_a_trivial_sector) {
+  PropPrescription p = hand_prescription(3, 0, false);
+  const auto sector_zero_trivial = [](unsigned sector) { return sector == 0; };
+  std::vector<SymTerm<GiNaC::ex>> out;
+  REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({1, -1}),
+                                         sector_zero_trivial, out));
+  std::map<std::vector<int>, GiNaC::ex> got = ex_terms(out);
+  REQUIRE_EQ(out.size(), 2u);
+  REQUIRE((got.count({0, 0}) == 0));
+  REQUIRE((got[{1, -1}].is_equal(1)));
+  REQUIRE((got[{1, 0}].is_equal(4)));
+
+  const auto sector_one_trivial = [](unsigned sector) { return sector == 1; };
+  std::vector<SymTerm<GiNaC::ex>> out2;
+  REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({1, -1}),
+                                         sector_one_trivial, out2));
+  REQUIRE_EQ(out2.size(), 3u);
+}
+
+// dot_only applies to numerator-free seeds only (spec 5.1, pyred
+// relations.cpp:481-483).  The rows are Kira's faked ones for a sector-1 source:
+// line 0 maps to itself, and line 1 -- which the correspondence does not cover
+// -- carries the unit vector at line 0, the lowest line outside the target.
+TEST(symmetry_expansion_dot_only_skips_numerator_seeds) {
+  PropPrescription p = rows_prescription(1, 0, true, {{1, 0}, {1, 0}}, {0, 0});
+  std::vector<SymTerm<GiNaC::ex>> out;
+  REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({1, 0}),
+                                         never_trivial, out));
+  REQUIRE_EQ(out.size(), 1u);  // the numerator-free seed does expand
+  REQUIRE(out[0].powers == std::vector<int>({1, 0}));
+  REQUIRE(out[0].coeff.is_equal(1));
+
+  std::vector<SymTerm<GiNaC::ex>> out2;
+  REQUIRE(!expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p), seed_of({1, -1}),
+                                           never_trivial, out2));
+  REQUIRE(out2.empty());  // the refusal leaves nothing behind
+
+  // The same seed under a verified prescription does expand.  With line 1's row
+  // genuinely equal to line 0, the numerator on line 1 cancels line 0's
+  // denominator and the only term left is I(0,0).
+  PropPrescription v = rows_prescription(1, 0, false, {{1, 0}, {1, 0}}, {0, 0});
+  std::vector<SymTerm<GiNaC::ex>> out3;
+  REQUIRE(expand_prescription<GiNaC::ex>(v, ex_rows(v), ex_col(v), seed_of({1, -1}),
+                                         never_trivial, out3));
+  REQUIRE_EQ(out3.size(), 1u);
+  REQUIRE(out3[0].powers == std::vector<int>({0, 0}));
+  REQUIRE(out3[0].coeff.is_equal(1));
+}
+
+// The numeric path: the same expansion over FLINT rationals, no symbols.
+//   I(1,-1) with D_1 = D'_0 + D'_1 + 1/2 gives I(0,0) + I(1,-1) + (1/2) I(1,0),
+//   and the scalar denominator D_0 = 2 D'_0 sends I(2,0) to (1/4) I(2,0).
+TEST(symmetry_expansion_numeric_path) {
+  PropPrescription p;
+  p.from = 3;
+  p.to = 1;
+  p.ing = {0, 1};
+  p.f_num = {{rational(1), rational(0)}, {rational(1), rational(1)}};
+  p.c_num = {rational(0), rational("1/2")};
+  std::vector<SymTerm<rational>> out;
+  REQUIRE(expand_prescription<rational>(p, p.f_num, p.c_num, seed_of({1, -1}),
+                                        never_trivial, out));
+  std::map<std::vector<int>, rational> got = rat_terms(out);
+  REQUIRE_EQ(out.size(), 3u);
+  REQUIRE((got[{0, 0}] == rational(1)));
+  REQUIRE((got[{1, -1}] == rational(1)));
+  REQUIRE((got[{1, 0}] == rational("1/2")));
+
+  PropPrescription q;
+  q.from = 3;
+  q.to = 1;
+  q.ing = {0, 1};
+  q.f_num = {{rational(2), rational(0)}, {rational(0), rational(1)}};
+  q.c_num = {rational(0), rational(0)};
+  std::vector<SymTerm<rational>> out2;
+  REQUIRE(expand_prescription<rational>(q, q.f_num, q.c_num, seed_of({2, 0}),
+                                        never_trivial, out2));
+  REQUIRE_EQ(out2.size(), 1u);
+  REQUIRE(out2[0].powers == std::vector<int>({2, 0}));
+  REQUIRE(out2[0].coeff == rational("1/4"));
+}
+
+// The expansion against Kira's own data: a dot_only entry's stored unit-vector
+// rows must reproduce the correspondence `ing` says they encode.  The source
+// sector's own seed -- one power on each of its lines, nothing outside -- is
+// numerator-free, so every dot_only prescription applies, and each denominator
+// line k must land its power on line ing[k] with coefficient 1.
+TEST(symmetry_expansion_reproduces_the_dot_only_correspondence) {
+  Family f = make_box("expansion_dots");
+  const unsigned top = (1u << f.nprops()) - 1;
+  SymmetryTable t = SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+
+  unsigned checked = 0;
+  for (unsigned s = 0; s <= top; ++s)
+    for (const PropPrescription &p : t.bySource(s)) {
+      if (!p.dot_only)
+        continue;
+      ++checked;
+      std::vector<int> seed(f.nprops(), 0);
+      for (unsigned k = 0; k < f.nprops(); ++k)
+        if (p.from & (1u << k))
+          seed[k] = 1;
+      std::vector<int> want(f.nprops(), 0);
+      for (unsigned k = 0; k < f.nprops(); ++k)
+        if (p.from & (1u << k)) {
+          REQUIRE(p.ing[k] >= 0);
+          want[unsigned(p.ing[k])] = 1;
+        }
+      std::vector<SymTerm<GiNaC::ex>> out;
+      REQUIRE(expand_prescription<GiNaC::ex>(p, ex_rows(p), ex_col(p),
+                                             RawIntegral(std::vector<int>(seed)), never_trivial,
+                                             out));
+      REQUIRE_EQ(out.size(), 1u);
+      REQUIRE(out[0].powers == want);
+      REQUIRE(out[0].coeff.is_equal(1));
+    }
+  REQUIRE_EQ(checked, 4u);  // box's four dot_only entries, so this is not vacuous
+}
