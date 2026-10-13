@@ -303,11 +303,65 @@ struct DumSink {
   }
 };
 
+// The symbolic sink: the strict grammar first, the GiNaC parser (with the expand +
+// zero-drop + make_sym_coeff pipeline the old reader ran) only for what it refuses.
+// `started` keeps the old reader's equation bookkeeping: it pushed an equation as soon
+// as one of its terms had a known integral, even when every coefficient then turned out
+// to be zero -- such an equation stays in the system, empty.
+struct SymbolicSink {
+  std::vector<SymEq> &system;
+  const std::unordered_map<std::string, unsigned> &sym_index;
+  GiNaC::parser &parser;
+  SpillReadStats &stats;
+  std::string &error;
+  std::vector<std::pair<unsigned, SymCoeff>> eq;
+  bool started = false;
+
+  bool term(unsigned id, const char *b, const char *e) {
+    started = true;
+    SymCoeff c;
+    if (!parse_spill_coeff(b, e, sym_index, c)) {
+      ++stats.fallbacks;
+      try {
+        GiNaC::ex ex = parser(std::string(b, e));
+        ex = ex.expand();
+        if (ex.is_zero())
+          return true;
+        c = make_sym_coeff(ex, sym_index);
+      } catch (const std::exception &ex2) {
+        error = "cannot parse coefficient '" + std::string(b, e) + "': " + ex2.what();
+        return false;
+      }
+    } else if (c.num.terms.empty()) {
+      return true; // the empty sum prints as `0`
+    }
+    eq.emplace_back(id, std::move(c));
+    return true;
+  }
+
+  void end_equation() {
+    if (!started)
+      return;
+    started = false;
+    std::sort(eq.begin(), eq.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    SymEq out;
+    out.reserve(eq.size());
+    for (auto &pr : eq)
+      out.push_back(std::move(pr));
+    eq.clear();
+    stats.equations += 1;
+    stats.terms += out.size();
+    system.push_back(std::move(out));
+  }
+};
+
 // ---------------------------------------------------------------------------
 // The coefficient grammar of `print_row_poly` (row_coeff.h:165-232).
 //
 //   factored:  t1[+-]t2...            each term  [n[/d]][*]name[^e][*name[^e]]*
-//   paren:     (t1[+-]t2...)/([q*]mono)          the numerator terms are integral
+//   paren:     (t1[+-]t2...)/([q*]mono)   the printer writes ")/(", so the denominator
+//                                         is parenthesised too; the numerator is integral
 //
 // The factored form reduces each term's denominator by its own gcd(a, den)
 // independently, so one polynomial's terms can carry different denominators
@@ -556,6 +610,22 @@ bool read_spill_numeric(const std::string &path,
                         std::vector<Eq> &system, SpillReadStats &stats,
                         std::string &error) {
   NumericSink sink{system, stats, error};
+  return scan_spill(path, sink, integral_id, /*flush_at_eof=*/true, stats, error);
+}
+
+bool read_spill_symbolic(const std::string &path,
+                         const std::unordered_map<RawIntegral, unsigned> &integral_id,
+                         const std::vector<GiNaC::possymbol> &symbols,
+                         std::vector<SymEq> &system, SpillReadStats &stats,
+                         std::string &error) {
+  GiNaC::symtab symtab;
+  std::unordered_map<std::string, unsigned> sym_index;
+  for (unsigned i = 0; i < symbols.size(); ++i) {
+    symtab[symbols[i].get_name()] = symbols[i];
+    sym_index[symbols[i].get_name()] = i;
+  }
+  GiNaC::parser parser(symtab);
+  SymbolicSink sink{system, sym_index, parser, stats, error};
   return scan_spill(path, sink, integral_id, /*flush_at_eof=*/true, stats, error);
 }
 

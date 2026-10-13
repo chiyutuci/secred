@@ -20,6 +20,7 @@
 #include "numeric_solver_mod.h"
 #include "row_coeff.h"
 #include "sector_engine.h"
+#include "spill_reader.h"
 #include "symmetry.h"
 
 using namespace fflow;
@@ -952,35 +953,9 @@ void Sector::clear() {
 unsigned
 select_dum_eq_from_file(const std::string &path,
                         const std::unordered_map<RawIntegral, unsigned> &id_map) {
-  // Scan the raw spill file (one term per line "<integral>\t<coeff>", equations
-  // separated by blank lines) and return the equation index whose largest
-  // integral ID is smallest. Same selection rule as the former in-memory
-  // select_dum_eq.
-  std::ifstream in(path);
-  unsigned best = 0, best_max = UINT_MAX;
-  unsigned eq_idx = 0, cur_max = 0;
-  bool have_term = false;
-  std::string line;
-  while (std::getline(in, line)) {
-    if (line.empty()) {
-      if (have_term && cur_max < best_max) {
-        best_max = cur_max;
-        best = eq_idx;
-      }
-      ++eq_idx;
-      cur_max = 0;
-      have_term = false;
-      continue;
-    }
-    auto tab = line.find('\t');
-    if (tab == std::string::npos)
-      continue;
-    RawIntegral integ = RawIntegral::from_text(line.substr(0, tab));
-    auto it = id_map.find(integ);
-    if (it != id_map.end()) {
-      cur_max = std::max(cur_max, it->second);
-      have_term = true;
-    }
-  }
-  return best;
+  // Scan the raw spill file and return the equation index whose largest integral ID
+  // is smallest.  Same selection rule as the former in-memory select_dum_eq; the scan
+  // reads through the shared scanner and never looks at a coefficient, so the Kira
+  // path stops paying a third full text parse of a 2.35 GB file.
+  return secred::scan_spill_dum(path, id_map);
 }

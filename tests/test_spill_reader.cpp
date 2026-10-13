@@ -418,3 +418,91 @@ TEST(spill_coeff_refuses_text_outside_the_grammar) {
   secred::SymCoeff c;
   REQUIRE(!secred::parse_spill_coeff(dup, dup + 3, sym_index, c));
 }
+
+TEST(spill_symbolic_reads_polynomials_and_drops_zero_terms) {
+  const std::string p = write_spill("sym",
+      term_line({1, 1}, "3/2*d+1/2") + term_line({0, 1}, "(d-2)/(2*m^2)") + "\n" +
+      term_line({1, 0}, "0") + "\n");
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"), GiNaC::possymbol("s"),
+                                                 GiNaC::possymbol("t"), GiNaC::possymbol("m")};
+  std::vector<secred::SymEq> system;
+  secred::SpillReadStats stats;
+  std::string error;
+  REQUIRE(secred::read_spill_symbolic(p, ids, symbols, system, stats, error));
+  REQUIRE_EQ(system.size(), std::size_t(2));
+  REQUIRE_EQ(system[0].size(), std::size_t(2));
+  REQUIRE_EQ(system[0][0].first, 3u);
+  REQUIRE(system[0][0].second.precompiled);
+  REQUIRE_EQ(stats.fallbacks, std::uint64_t(0));
+  REQUIRE_EQ(system[1].size(), std::size_t(0));   // `0` is dropped, as GiNaC did
+  REQUIRE_EQ(stats.equations, std::uint64_t(2));
+}
+
+// The slow path must stay reachable: a coefficient outside the strict grammar is read
+// by GiNaC, exactly as before.
+TEST(spill_symbolic_falls_back_to_ginac_and_counts_it) {
+  const std::string p = write_spill("symfallback",
+      term_line({1, 1}, "(d-2)*(d+1)/(2*m^2)") + "\n");
+  const auto ids = ids_of({{0, 0}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"), GiNaC::possymbol("s"),
+                                                 GiNaC::possymbol("t"), GiNaC::possymbol("m")};
+  std::vector<secred::SymEq> system;
+  secred::SpillReadStats stats;
+  std::string error;
+  REQUIRE(secred::read_spill_symbolic(p, ids, symbols, system, stats, error));
+  REQUIRE_EQ(system.size(), std::size_t(1));
+  REQUIRE_EQ(system[0].size(), std::size_t(1));
+  REQUIRE_EQ(stats.fallbacks, std::uint64_t(1));
+  REQUIRE(sym_poly_equal(system[0][0].second.num,
+                         secred::SymPoly{{{cln::cl_I(1), {{0, 2}}},
+                                          {cln::cl_I(-1), {{0, 1}}},
+                                          {cln::cl_I(-2), {}}}}));
+}
+
+TEST(spill_symbolic_unparsable_coefficient_is_an_error) {
+  const std::string p = write_spill("symbad", term_line({1, 1}, "d +") + "\n");
+  const auto ids = ids_of({{0, 0}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d")};
+  std::vector<secred::SymEq> system;
+  secred::SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_symbolic(p, ids, symbols, system, stats, error));
+  REQUIRE(error.find("cannot parse coefficient") != std::string::npos);
+}
+
+// The scanner against the reader it replaces (spec §7): every coefficient of a mixed
+// file must come out equal as a rational function -- the same numerator and denominator
+// polynomials -- with the same ids, in the same order.
+TEST(spill_symbolic_matches_the_reference_reader) {
+  const std::string p = write_spill("symdiff",
+      term_line({1, 1}, "3/2*d+1/2") + term_line({0, 1}, "(d-2)/(2*m^2)") +
+          term_line({2, 2}, "7") + "\n" +
+      term_line({1, 0}, "d") + "\n" +
+      term_line({0, 0}, "(d-2)*(d+1)/(2*m^2)") + "\n" +   // outside the fast grammar
+      term_line({1, 0}, "0") + term_line({0, 0}, "1/3*s-2/5") + "\n" + "\n");
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"), GiNaC::possymbol("s"),
+                                                 GiNaC::possymbol("t"), GiNaC::possymbol("m")};
+
+  std::vector<secred::SymEq> theirs;
+  std::uint64_t their_terms = 0;
+  REQUIRE(ref::legacy_symbolic(p, ids, symbols, theirs, their_terms));
+
+  std::vector<secred::SymEq> ours;
+  secred::SpillReadStats stats;
+  std::string error;
+  REQUIRE(secred::read_spill_symbolic(p, ids, symbols, ours, stats, error));
+
+  REQUIRE_EQ(ours.size(), theirs.size());
+  for (std::size_t i = 0; i < ours.size(); ++i) {
+    REQUIRE_EQ(ours[i].size(), theirs[i].size());
+    for (std::size_t j = 0; j < ours[i].size(); ++j) {
+      REQUIRE_EQ(ours[i][j].first, theirs[i][j].first);
+      REQUIRE(sym_poly_equal(ours[i][j].second.num, theirs[i][j].second.num));
+      REQUIRE(sym_poly_equal(ours[i][j].second.den, theirs[i][j].second.den));
+    }
+  }
+  REQUIRE_EQ(stats.fallbacks, std::uint64_t(1));
+  REQUIRE_EQ(stats.terms, their_terms);
+}

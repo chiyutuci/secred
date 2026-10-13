@@ -55,6 +55,17 @@ bool read_spill_numeric(const std::string &path,
                         std::vector<Eq> &system, SpillReadStats &stats,
                         std::string &error);
 
+// Read `path` and append every equation whose integrals are all known to `system`, as
+// (id, precompiled SymCoeff) in descending id, dropping zero coefficients exactly as the
+// GiNaC reader did.  `symbols` are the rational function's parameters in index order:
+// the reader derives the name -> index map, and builds a GiNaC parser from the same
+// table for coefficients the strict grammar refuses (counted in `stats.fallbacks`).
+bool read_spill_symbolic(const std::string &path,
+                         const std::unordered_map<RawIntegral, unsigned> &integral_id,
+                         const std::vector<GiNaC::possymbol> &symbols,
+                         std::vector<SymEq> &system, SpillReadStats &stats,
+                         std::string &error);
+
 // Index of the equation in `path` whose largest known integral id is smallest, i.e. the
 // equation with the simplest leading term (`select_dum_eq_from_file`'s rule).  Never
 // looks at a coefficient; 0 when the file cannot be read, as before.

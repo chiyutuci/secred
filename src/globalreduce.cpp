@@ -38,6 +38,7 @@
 #include "ffred_solver.h"
 #include "masters_file.h"
 #include "progress_bar.h"
+#include "spill_reader.h"
 #include "sym_coeff.h"
 
 // ---------------------------------------------------------------------------
@@ -46,30 +47,6 @@
 
 namespace {
 namespace ff = fflow;
-
-// Parse a coefficient string ("num" or "num/den") into int64 num/den (den > 0). IBP
-// coefficients are small integers or simple fractions and always fit; false on overflow.
-bool parse_rat64(const std::string &s, int64_t &num, int64_t &den) {
-  std::size_t slash = s.find('/');
-  try {
-    if (slash == std::string::npos) {
-      num = std::stoll(s);
-      den = 1;
-    } else {
-      num = std::stoll(s.substr(0, slash));
-      den = std::stoll(s.substr(slash + 1));
-      if (den < 0) {
-        num = -num;
-        den = -den;
-      }
-      if (den == 0)
-        return false;
-    }
-    return true;
-  } catch (const std::exception &) {
-    return false;
-  }
-}
 
 // Simple parallel for: [0,n) split statically over nthreads threads.
 template <typename F>
@@ -291,50 +268,11 @@ GlobalReductionResult reduce_global_finiteflow(
 
   // 1) Read the spill file into vector<Eq> (descending (id, num/den)).
   std::vector<secred::Eq> system;
-  bool parse_failed = false;
-  {
-    std::ifstream in(raw_equations_path);
-    std::string line;
-    std::vector<std::pair<unsigned, std::string>> eq;
-    auto flush = [&]() {
-      if (eq.empty())
-        return;
-      std::sort(eq.begin(), eq.end(),
-                [](const auto &a, const auto &b) { return a.first > b.first; });
-      secred::Eq e;
-      e.reserve(eq.size());
-      for (auto &[id, s] : eq) {
-        int64_t n, d;
-        if (!parse_rat64(s, n, d)) {
-          std::cerr << "finiteflow global reduction: coefficient does not fit "
-                       "in int64: "
-                    << s << "\n";
-          parse_failed = true;
-          return;
-        }
-        e.push_back({id, secred::Rat64{n, d}});
-      }
-      system.push_back(std::move(e));
-      eq.clear();
-    };
-    while (std::getline(in, line)) {
-      if (line.empty()) {
-        flush();
-        continue;
-      }
-      auto tab = line.find('\t');
-      if (tab == std::string::npos)
-        continue;
-      RawIntegral integ = RawIntegral::from_text(line.substr(0, tab));
-      auto it = integral_id.find(integ);
-      if (it == integral_id.end())
-        continue;
-      eq.emplace_back(it->second, line.substr(tab + 1));
-    }
-    flush();
-  }
-
-  if (parse_failed) {
+  secred::SpillReadStats stats;
+  std::string read_error;
+  if (!secred::read_spill_numeric(raw_equations_path, integral_id, system, stats,
+                                  read_error)) {
+    std::cerr << "finiteflow global reduction: " << read_error << "\n";
     res.ok = false;
     return res;
   }
@@ -349,7 +287,12 @@ GlobalReductionResult reduce_global_finiteflow(
   std::cout << "  " << secred::kFlowTag << " system built: " << neqs << " equations x "
             << nvars << " variables ("
             << secred::format_duration(std::chrono::duration<double>(t1 - t0).count())
-            << ")\n";
+            << ")";
+  if (stats.fallbacks)
+    std::cout << " [" << stats.fallbacks << " coefficient(s) by the fallback parser]";
+  if (stats.skipped_unknown)
+    std::cout << " [" << stats.skipped_unknown << " term(s): unknown integral]";
+  std::cout << "\n";
 
   // 2) Target ids.
   std::vector<unsigned> target_ids;
@@ -852,64 +795,13 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   std::cout << "\n  " << secred::kFlowTag << " reading spill file, building symbolic "
                "system...\n";
 
-  // Symbol table (name -> symbol) for parsing coefficient strings, and the
-  // name -> parameter-index map the coefficient precompiler works from.
-  GiNaC::symtab symtab;
-  std::unordered_map<std::string, unsigned> sym_index;
-  for (unsigned i = 0; i < nparams; ++i) {
-    symtab[symbols[i].get_name()] = symbols[i];
-    sym_index[symbols[i].get_name()] = i;
-  }
-  GiNaC::parser parser(symtab);
-
   // 1) Read the spill file into vector<SymEq> (descending (id, symbolic polynomial)).
   std::vector<SymEq> system;
-  bool parse_failed = false;
-  {
-    std::ifstream in(raw_equations_path);
-    std::string line;
-    std::vector<std::pair<unsigned, GiNaC::ex>> eq;
-    auto flush = [&]() {
-      if (eq.empty())
-        return;
-      std::sort(eq.begin(), eq.end(),
-                [](const auto &a, const auto &b) { return a.first > b.first; });
-      SymEq e;
-      e.reserve(eq.size());
-      for (auto &[id, ex] : eq) {
-        ex = ex.expand();
-        if (ex.is_zero())
-          continue;
-        e.push_back({id, make_sym_coeff(ex, sym_index)});
-      }
-      system.push_back(std::move(e));
-      eq.clear();
-    };
-    while (std::getline(in, line)) {
-      if (line.empty()) {
-        flush();
-        continue;
-      }
-      auto tab = line.find('\t');
-      if (tab == std::string::npos)
-        continue;
-      RawIntegral integ = RawIntegral::from_text(line.substr(0, tab));
-      auto it = integral_id.find(integ);
-      if (it == integral_id.end())
-        continue;
-      try {
-        eq.emplace_back(it->second, parser(line.substr(tab + 1)));
-      } catch (const std::exception &ex) {
-        std::cerr << "finiteflow symbolic global reduction: cannot parse "
-                     "coefficient '"
-                  << line.substr(tab + 1) << "': " << ex.what() << "\n";
-        parse_failed = true;
-        break;
-      }
-    }
-    flush();
-  }
-  if (parse_failed) {
+  secred::SpillReadStats stats;
+  std::string read_error;
+  if (!secred::read_spill_symbolic(raw_equations_path, integral_id, symbols, system,
+                                   stats, read_error)) {
+    std::cerr << "finiteflow symbolic global reduction: " << read_error << "\n";
     res.ok = false;
     return res;
   }
@@ -923,7 +815,12 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
             << " equations x " << nvars << " variables, " << nparams
             << " parameters ("
             << secred::format_duration(std::chrono::duration<double>(t1 - t0).count())
-            << ")\n";
+            << ")";
+  if (stats.fallbacks)
+    std::cout << " [" << stats.fallbacks << " coefficient(s) by the fallback parser]";
+  if (stats.skipped_unknown)
+    std::cout << " [" << stats.skipped_unknown << " term(s): unknown integral]";
+  std::cout << "\n";
 
   // 2) Target ids.
   std::vector<unsigned> target_ids;

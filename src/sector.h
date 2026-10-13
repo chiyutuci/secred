@@ -268,7 +268,8 @@ using GlobalEquation = std::vector<std::pair<RawIntegral, std::string>>;
 // (largest integral ID) is smallest, i.e. the equation with the simplest
 // leading term.  Used by _run_global_kira to pick the single equation into
 // which the auxiliary 'dum' variable is injected so that kira accepts a
-// symbol-free rational system.
+// symbol-free rational system.  The scan is coefficient-free: it reads the
+// integrals only (spill_reader.h), so it never parses the coefficient text.
 unsigned select_dum_eq_from_file(
     const std::string &path,
     const std::unordered_map<RawIntegral, unsigned> &id_map);
