@@ -276,3 +276,43 @@ TEST(firefly_driver_handles_a_zero_output_system) {
   REQUIRE_EQ(r.reductions.size(), std::size_t(1));   // just the (target, "-1") marker
   REQUIRE_EQ(r.reductions[0].second, std::string("-1"));
 }
+
+// A global phase that did not complete (`ok == false`) returns an empty or truncated
+// table.  Written to cache/reductions and exited 0, that is a silently wrong result:
+// the run failed, so it has to stop the run.  family.cpp calls this before it writes
+// anything, and main.cpp turns the throw into a non-zero exit.
+TEST(a_failed_global_reduction_is_fatal_not_an_empty_table) {
+  const auto integrals = tiny::integrals();
+  const auto ids = tiny::integral_ids();
+  const auto symbols = tiny::symbols();
+  const std::vector<RawIntegral> targets = {integrals[3]};
+
+  // A spill that is not there: the FireFly backend reports the read failure the way a
+  // refused probe is reported, as ok == false with nothing reconstructed.
+  const GlobalReductionResult failed = secred::reduce_global_firefly_symbolic(
+      "/tmp/secred_test_no_such_spill", integrals, ids, targets, symbols, 0u, 0u, 0u,
+      std::size_t(0), "/tmp/secred_test_tiny_masters_req", 2u);
+  REQUIRE(!failed.ok);
+  REQUIRE(failed.reductions.empty());
+
+  std::string message;
+  try {
+    secred::require_global_reduction(failed, "firefly");
+  } catch (const std::runtime_error &e) {
+    message = e.what();
+  }
+  REQUIRE(message.find("firefly") != std::string::npos);        // names the tool asked for
+  REQUIRE(message.find("did not complete cleanly") != std::string::npos);
+
+  // A phase that did complete passes the check unchanged.  (The FiniteFlow symbolic
+  // path on the same tiny system: one FireFly reconstruction is all this process does,
+  // since FireFly's sampling stream continues from the previous Reconstructor and the
+  // tiny system has a degenerate sampling line -- see the ledger note.)
+  const std::string spill = tiny::write_spill("/tmp/secred_test_tiny_spill_req");
+  const GlobalReductionResult done = reduce_global_finiteflow_symbolic(
+      spill, integrals, ids, targets, symbols, 0u, 0u, 0u, std::size_t(0),
+      "/tmp/secred_test_tiny_masters_req", 2u);
+  REQUIRE(done.ok);
+  secred::require_global_reduction(done, "firefly");   // must not throw
+  REQUIRE(!done.reductions.empty());   // what the failed phase does not have to offer
+}

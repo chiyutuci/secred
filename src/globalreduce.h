@@ -8,6 +8,7 @@
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -86,6 +87,18 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::string &masters_final_path, unsigned nthreads = 64);
 
 namespace secred {
+
+// A global phase that did not complete (`ok == false`) leaves `reductions` empty or
+// truncated, so it is not a reduction table: writing one to cache/reductions and
+// exiting 0 would report a silently wrong result.  Every in-process caller checks the
+// result through this before writing anything (family.cpp, right after the phase and
+// before the masters file and the table); main.cpp turns the throw into EXIT_FAILURE.
+// `tool` names the backend the run selected, so the message says which one stopped.
+inline void require_global_reduction(const GlobalReductionResult &result,
+                                     const std::string &tool) {
+  if (!result.ok)
+    throw std::runtime_error(tool + " global reduction did not complete cleanly");
+}
 
 // The `global_tool: firefly` backend: the same learn and the same evaluator as the
 // FiniteFlow symbolic path, with FireFly's Reconstructor as the engine and the system

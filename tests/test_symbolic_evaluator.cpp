@@ -62,6 +62,20 @@ secred::SymbolicFFEvaluator evaluator_of(
                                      std::move(symbol_ex));
 }
 
+// One target one symbol-power deeper than `evaluator_of()`'s system:
+//   E1: [1,0] + (d^4/s)[0,0] = 0,  master [0,0] (id 0), target [1,0] (id 1),
+// so the reduced target is -(d^4/s) times the master.  Its numerators carry d^4, where
+// `evaluator_of()`'s system carries d^1 and s^1 only.
+secred::SymbolicFFEvaluator big_evaluator() {
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"),
+                                                 GiNaC::possymbol("s")};
+  std::vector<secred::SymEq> system = {
+      eq_of({{1, coeff("1", symbols)}, {0, coeff("d^4/s", symbols)}})};
+  std::vector<GiNaC::ex> symbol_ex = {GiNaC::ex(symbols[0]), GiNaC::ex(symbols[1])};
+  return secred::SymbolicFFEvaluator(std::move(system), {0}, {1}, {1}, {{0, 0}}, 1,
+                                     std::move(symbol_ex));
+}
+
 TEST(symbolic_evaluator_flattens_the_target_reduction) {
   secred::SymbolicFFEvaluator ev = evaluator_of();
   REQUIRE_EQ(ev.n_outputs(), 1u);
@@ -95,6 +109,52 @@ TEST(symbolic_evaluator_flattens_the_target_reduction) {
   }();
   REQUIRE_EQ(out[0], expected);
   REQUIRE_EQ(scratch.zero_dens, std::uint64_t(0));
+}
+
+// A Scratch holds the power table for one point; when a worker keeps one across
+// evaluators (firefly_global.h's `scratch_of` is thread_local), the rows must be sized
+// for the evaluator that is about to read them.  Sizing them once, for whichever
+// evaluator ran first, leaves a smaller system's rows behind for a deeper one and reads
+// the power table out of bounds.
+TEST(symbolic_evaluator_resizes_a_reused_scratch_for_a_deeper_system) {
+  const std::uint64_t p = 1125899906842597ULL;
+  secred::SymbolicFFEvaluator small = evaluator_of();
+  secred::SymbolicFFEvaluator big = big_evaluator();
+  small.reduce_for_prime(p, 1);
+  big.reduce_for_prime(p, 1);
+  REQUIRE(small.all_precompiled());
+  REQUIRE(big.all_precompiled());
+
+  secred::SymbolicFFEvaluator::Scratch scratch;   // one scratch, both evaluators
+  const std::uint64_t x[2] = {5, 7};
+  std::uint64_t out[1] = {0};
+  REQUIRE(small.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+
+  out[0] = 0;
+  REQUIRE(big.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  // -(d^4/s) at d = 5, s = 7, i.e. -625/7 mod p
+  const std::uint64_t expected = [&] {
+    __int128 t = 0, newt = 1, r = p, newr = 7;
+    while (newr) {
+      const __int128 q = r / newr;
+      std::swap(t -= q * newt, newt);
+      std::swap(r -= q * newr, newr);
+    }
+    const std::uint64_t inv7 = static_cast<std::uint64_t>((t % p + p) % p);
+    const std::uint64_t q625 = static_cast<std::uint64_t>(
+        (static_cast<__int128>(625) * inv7) % p);
+    return (p - q625) % p;
+  }();
+  REQUIRE_EQ(out[0], expected);
+
+  // `evaluator_of()` again, with the deeper rows now in the scratch: the shallow
+  // evaluator must keep working on the table it shares.
+  out[0] = 0;
+  REQUIRE(small.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  REQUIRE(out[0] != std::uint64_t(0));
 }
 
 // Spec §7: a point evaluated at a prime the tables were not reduced for must report

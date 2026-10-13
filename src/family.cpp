@@ -446,6 +446,10 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
     }
     std::filesystem::remove(ctx.rawEquationsPath);
 
+    // A phase that did not complete has no table to write: stop the run before the
+    // masters file and cache/reductions below turn a failure into an empty reduction.
+    secred::require_global_reduction(result, _global_tool);
+
     fs::create_directories(global_path + "/results/Tuserweight");
     {
       std::ofstream mf(global_path + "/results/Tuserweight/masters");
@@ -467,8 +471,6 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
         }
       }
     }
-    if (!result.ok)
-      std::cerr << "finiteflow global reduction did not complete cleanly\n";
     return result;
   }
 

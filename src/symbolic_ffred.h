@@ -80,7 +80,6 @@ public:
     std::vector<ResEq> res_eqs;
     std::vector<uint32_t> sys_idx;
     std::unordered_map<uint32_t, ResEq> solmap;
-    bool sized = false;
     std::uint64_t zero_dens = 0;   // coefficients whose denominator vanished here
     // Set by a NonMasterRhs result, for the caller's message.
     unsigned fail_target = 0;
@@ -108,13 +107,15 @@ public:
   // `xout[i * nnindeps + j]` (i over dep_targets_, j over the masters).
   PointResult evaluate_point(uint64_t p, const uint64_t *x, Scratch &scratch,
                              uint64_t *xout) const {
+    // A scratch is per-thread and may pass between evaluators (firefly_global.h's
+    // scratch_of is thread_local, and one worker reconstructs several parts), so size
+    // the power table for THIS evaluator's system every point: a smaller earlier system
+    // must not leave rows too short for a deeper one.  Resizing to the size it already
+    // has allocates nothing.
     const unsigned nvars = symbols_.size();
-    if (!scratch.sized) {
-      scratch.powers.assign(nvars, std::vector<uint64_t>(1, 1));
-      for (unsigned i = 0; i < nvars; ++i)
-        scratch.powers[i].resize(mx_[i] + 1);
-      scratch.sized = true;
-    }
+    scratch.powers.resize(nvars);
+    for (unsigned i = 0; i < nvars; ++i)
+      scratch.powers[i].resize(mx_[i] + 1, 1);   // powers[i][0] stays x_i^0 = 1
     fill_powers(scratch.powers, x, p);
 
     GiNaC::exmap subs;
