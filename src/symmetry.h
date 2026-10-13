@@ -1,9 +1,11 @@
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "ginac/ginac.h"
@@ -64,6 +66,33 @@ struct SymTerm {
   std::vector<int> powers;
   Coeff coeff;
 };
+
+// Sum equal keys of a flat term list in place and drop the terms that cancel to
+// zero.  The callers append in arrival order and need the container's own order
+// (sorted by key) for the emitted text to be unchanged, so the sort is stable
+// and the merge is one linear pass: this replaces a tree insertion per term
+// (spec 5.3) and is deterministic because the key order is total.  Only
+// `operator<` is required of the key, and `+=`, `is_zero()` of the coefficient.
+template <typename Key, typename Coeff>
+void flat_merge(std::vector<std::pair<Key, Coeff>> &v) {
+  std::stable_sort(v.begin(), v.end(),
+                   [](const std::pair<Key, Coeff> &a, const std::pair<Key, Coeff> &b) {
+                     return a.first < b.first;
+                   });
+  const auto same = [](const Key &a, const Key &b) { return !(a < b) && !(b < a); };
+  std::size_t out = 0;
+  for (std::size_t i = 0; i < v.size();) {
+    std::size_t j = i + 1;
+    while (j < v.size() && same(v[i].first, v[j].first)) {
+      v[i].second += v[j].second;
+      ++j;
+    }
+    if (!v[i].second.is_zero())
+      v[out++] = std::move(v[i]);
+    i = j;
+  }
+  v.resize(out);
+}
 
 // Spec 5.1.  Expands I(a) = prod_k D_k^{-a_k} through a prescription's rows and
 // returns the image terms of  I(a) = sum_r coeff_r I(a'_r)  -- the seed itself

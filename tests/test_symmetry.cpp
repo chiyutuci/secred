@@ -1263,3 +1263,40 @@ TEST(symmetry_expansion_matches_the_map_based_reference_on_symbolic_rows) {
     }
   REQUIRE(checked > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Flat accumulators (spec 5.3).  The map an expansion accumulates into is
+// replaced by a vector merged in place; the emitted term set and its order must
+// not move, so the merge sorts by key and drops what cancels -- exactly where
+// the map path dropped them, at the end of the accumulation.
+// ---------------------------------------------------------------------------
+
+TEST(symmetry_flat_merge_sums_keys_in_sorted_order) {
+  std::vector<std::pair<int, rational>> v = {{2, rational(1)}, {1, rational(2)},
+                                             {2, rational(5)},  {3, rational(0)},
+                                             {1, rational(-2)}, {0, rational(4)}};
+  flat_merge(v);
+  // Keys 1 and 3 sum to zero and are dropped; 0 and 2 survive in key order.
+  REQUIRE_EQ(v.size(), 2u);
+  REQUIRE_EQ(v[0].first, 0);
+  REQUIRE(v[0].second == rational(4));
+  REQUIRE_EQ(v[1].first, 2);
+  REQUIRE(v[1].second == rational(6));
+}
+
+// The same for a key whose only order is `operator<`, which is what RawIntegral
+// offers.  Its order is index-major, so {0,1} sorts before {1,0}.
+TEST(symmetry_flat_merge_works_on_rawintegral_keys) {
+  std::vector<std::pair<RawIntegral, rational>> v;
+  v.emplace_back(RawIntegral(std::vector<int>({2, 0})), rational(1));
+  v.emplace_back(RawIntegral(std::vector<int>({1, 0})), rational(1));
+  v.emplace_back(RawIntegral(std::vector<int>({2, 0})), rational(-1));
+  v.emplace_back(RawIntegral(std::vector<int>({1, 1})), rational(0));
+  v.emplace_back(RawIntegral(std::vector<int>({0, 1})), rational(5));
+  flat_merge(v);
+  REQUIRE_EQ(v.size(), 2u);
+  REQUIRE(v[0].first == RawIntegral(std::vector<int>({0, 1})));
+  REQUIRE(v[0].second == rational(5));
+  REQUIRE(v[1].first == RawIntegral(std::vector<int>({1, 0})));
+  REQUIRE(v[1].second == rational(1));
+}

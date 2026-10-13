@@ -1,7 +1,9 @@
 #include "symmetry.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstdint>
 #include <fstream>
 #include <map>
 #include <sstream>
@@ -723,6 +725,40 @@ GiNaC::ex ring_pow<GiNaC::ex>(const GiNaC::ex &x, unsigned e) {
   return GiNaC::pow(x, e);
 }
 
+// The expansion's image, packed into a fixed-size key: MAX_PROPS exponents of
+// 16 bits.  An image exponent starts at the seed's own power, which is int8
+// (RawIntegral::indices_), and only ever *decreases* -- by one per numerator
+// factor, so by at most |seed[k]| <= 127 per line k, and so by at most
+// MAX_PROPS * 127 = 4064 in all.  Every image exponent therefore lies in
+// [-4064 - 127, 127], far inside int16: 16 bits cannot overflow.
+//
+// This must order the images exactly as the std::map<std::vector<int>, Coeff>
+// it replaces did, because that order is the emitted term order.  A vector
+// compares lexicographically and uses the length only as a tie-break on a shared
+// prefix, whereas the `n` test here is tried first -- the two agree because every
+// key in one accumulator is an image of the same family and so has the same
+// length, which makes the `n` test unreachable.  It is kept so that a key is
+// never compared against a shorter one field by field.
+struct RowKey {
+  std::array<std::int16_t, RawIntegral::MAX_PROPS> e{};
+  std::uint32_t n = 0;
+
+  bool operator<(const RowKey &o) const {
+    if (n != o.n)
+      return n < o.n; // a vector's own rule: the shorter prefix compares less
+    return std::lexicographical_compare(e.begin(), e.begin() + n, o.e.begin(),
+                                        o.e.begin() + o.n);
+  }
+};
+
+inline RowKey row_key(const std::vector<int> &powers) {
+  RowKey k;
+  k.n = static_cast<std::uint32_t>(powers.size());
+  for (std::size_t i = 0; i < powers.size(); ++i)
+    k.e[i] = static_cast<std::int16_t>(powers[i]);
+  return k;
+}
+
 constexpr const char *kDenominatorRowError =
     "symmetry: a denominator line's row is not a single propagator (Kira: "
     "\"encountered a linear combination of propagators in the denominator\")";
@@ -790,52 +826,63 @@ bool expand_prescription(const PropPrescription &p, const std::vector<std::vecto
     return true;
   }
 
-  std::map<std::vector<int>, Coeff> acc;
-  acc[image] = coeff;
+  std::vector<std::pair<RowKey, Coeff>> acc;
+  acc.emplace_back(row_key(image), coeff);
 
   // Numerators (a_k < 0): one factor of the row's polynomial at a time.  Each
   // D'_j factor *subtracts* one from the target's power at j, because
-  // I(a) = prod D^-a and multiplying the integrand by D'_j lowers a'_j.
+  // I(a) = prod D^-a and multiplying the integrand by D'_j lowers a'_j.  The
+  // accumulator is flat and re-merged after every factor (spec 5.3): the same
+  // terms, in the same order, without a tree node per term -- and a term that
+  // cancels to zero is dropped here rather than at the end, which changes
+  // nothing downstream because a zero term's descendants are all zero.
   for (unsigned k = 0; k < seed.size(); ++k) {
     if (seed[k] >= 0)
       continue;
     for (int factor = 0; factor < -seed[k]; ++factor) {
-      std::map<std::vector<int>, Coeff> next;
-      for (const auto &[vec, cf] : acc) {
+      std::vector<std::pair<RowKey, Coeff>> next;
+      next.reserve(2 * acc.size());
+      for (const auto &[key, cf] : acc) {
+        if (!c[k].is_zero())
+          next.emplace_back(key, cf * c[k]);
         for (unsigned j = 0; j < n; ++j) {
           if (f[k][j].is_zero())
             continue;
-          std::vector<int> v = vec;
-          if (v[j] == 1) {
+          RowKey v = key;
+          if (v.e[j] == 1) {
             // Line j drops out of the target sector here.  A trivial lowered
             // sector is a scaleless integral, so the whole term goes with it
             // (Kira's pinch test, relations.cpp:533-540 -- the same convention
             // sector_reduction_ff_n uses for its IBP terms).
-            v[j] = 0;
+            v.e[j] = 0;
             unsigned sector = 0;
             for (unsigned m = 0; m < n; ++m)
-              if (v[m] > 0)
+              if (v.e[m] > 0)
                 sector |= 1u << m;
             if (trivial(sector))
               continue;
           } else {
-            v[j] -= 1;
+            v.e[j] -= 1;
           }
-          next[v] += cf * f[k][j];
+          next.emplace_back(v, cf * f[k][j]);
         }
-        if (!c[k].is_zero())
-          next[vec] += cf * c[k];
       }
+      flat_merge(next);
       acc.swap(next);
     }
   }
 
   out.reserve(acc.size());
-  for (const auto &[vec, cf] : acc)
-    // Defensive: a zero coefficient would reach the caller as a phantom
-    // integral, and so as a phantom column of the global system.
-    if (!cf.is_zero())
-      out.push_back(SymTerm<Coeff>{vec, cf});
+  for (const auto &[key, cf] : acc)
+    // Defensive: flat_merge already dropped the zeros, and the fast path above
+    // checks its single term -- a zero coefficient would reach the caller as a
+    // phantom integral, and so as a phantom column of the global system.
+    if (!cf.is_zero()) {
+      std::vector<int> powers(key.n);
+      for (std::uint32_t i = 0; i < key.n; ++i)
+        powers[i] = key.e[i];
+      out.push_back(SymTerm<Coeff>{std::move(powers), cf});
+    }
   return true;
 }
 

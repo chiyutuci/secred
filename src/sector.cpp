@@ -844,11 +844,15 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
               // coefficient -1 (Kira's convention, spec 5.1): a seed the
               // correspondence fixes -- the all-ones seed of a sector, whose
               // in-sector lines all carry power one -- cancels to nothing here
-              // and carries no equation.
-              std::map<RawIntegral, GiNaC::ex> agg;
+              // and carries no equation.  A flat list replaces the map's
+              // insertion per term (spec 5.3); the order is the map's own,
+              // sorted by integral.
+              std::vector<std::pair<RawIntegral, GiNaC::ex>> agg;
+              agg.reserve(terms.size() + 1);
               for (const SymTerm<GiNaC::ex> &t : terms)
-                agg[RawIntegral(t.powers)] += t.coeff;
-              agg[seed] += GiNaC::ex(-1);
+                agg.emplace_back(RawIntegral(t.powers), t.coeff);
+              agg.emplace_back(seed, GiNaC::ex(-1));
+              flat_merge(agg);
               GlobalEquation eq;
               for (const auto &[integ, coeff] : agg) {
                 if (coeff.is_zero())
@@ -872,10 +876,12 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
               std::vector<SymTerm<rational>> terms;
               if (!expand_prescription<rational>(p, p.f_num, p.c_num, seed, trivial, terms))
                 continue;
-              std::map<RawIntegral, rational> agg;
+              std::vector<std::pair<RawIntegral, rational>> agg;
+              agg.reserve(terms.size() + 1);
               for (const SymTerm<rational> &t : terms)
-                agg[RawIntegral(t.powers)] += t.coeff;
-              agg[seed] += rational(-1);
+                agg.emplace_back(RawIntegral(t.powers), t.coeff);
+              agg.emplace_back(seed, rational(-1));
+              flat_merge(agg);
               GlobalEquation eq;
               for (const auto &[integ, coeff] : agg) {
                 if (coeff.is_zero())
