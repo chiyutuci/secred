@@ -823,6 +823,11 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
       std::cout << " #0.4   parallel_mode layer: cross-sector symmetry relations "
                    "are dropped, self relations are kept.\n";
     }
+    // Spec 5.1: the rational rows exist for every prescription whose entries are
+    // numbers -- all of them on a numeric family, most of them on a symbolic
+    // one.  Filled here, before prepare_sectors starts any thread: the sector
+    // stage reads them without a lock.
+    reduce._symmetries.try_to_numeric_all();
     reduce._symmetries.dump(_cache_dir + "/symmetries.txt");
     std::cout << "\n #0.4   Searching sector symmetries finished.\n";
   }

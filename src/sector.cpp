@@ -821,11 +821,10 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
         };
         std::vector<GlobalEquation> sym_eqs;
         for (const PropPrescription &p : pres) {
-          if (ibps_sym) {
-            // The prescription's rows in the ring this sector works in: GiNaC
-            // for a symbolic family, the pre-converted rationals otherwise
-            // (spec 5.1).  GiNaC is not thread-safe, so its arithmetic takes the
-            // same guard the IBP spill does.
+          if (!p.has_numeric_rows) {
+            // No rational rows for this prescription: the relation is expanded
+            // in the family's own ring, and GiNaC is not thread-safe, so its
+            // arithmetic takes the same guard the IBP spill does (spec 5.1).
             std::vector<std::vector<GiNaC::ex>> f_ex(p.f.rows(),
                                                      std::vector<GiNaC::ex>(p.f.cols()));
             std::vector<GiNaC::ex> c_ex(p.c.rows());

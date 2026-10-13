@@ -123,6 +123,22 @@ void PropPrescription::to_numeric() {
   c_num.assign(c.rows(), rational());
   for (unsigned i = 0; i < c.rows(); ++i)
     c_num[i] = to_rational(c(i, 0));
+  has_numeric_rows = true;
+}
+
+bool PropPrescription::try_to_numeric() {
+  try {
+    to_numeric(); // sets has_numeric_rows on success
+  } catch (const std::exception &) {
+    has_numeric_rows = false;
+  }
+  return has_numeric_rows;
+}
+
+void SymmetryTable::try_to_numeric_all() {
+  for (std::vector<PropPrescription> &per_source : _bySource)
+    for (PropPrescription &p : per_source)
+      p.try_to_numeric();
 }
 
 bool PropPrescription::rows_ok(const std::vector<std::vector<std::string>> &rows,

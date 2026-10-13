@@ -35,12 +35,20 @@ struct PropPrescription {
   // 5.1).
   bool dot_only = false;
 
-  // The same entries as exact rationals, for the numeric path
-  // (ibps_sym == nullptr).  Filled once by the detector, before any thread
-  // starts; throws when an entry is not a number (spec 5.1).
+  // The same entries as exact rationals, for the numeric path.  Filled once,
+  // before any thread starts; throws when an entry is not a number (spec 5.1).
   std::vector<std::vector<rational>> f_num;
   std::vector<rational> c_num;
+  // True when f_num/c_num hold this prescription's rows.  Filled by to_numeric()
+  // (throwing) or try_to_numeric() (not); the sector stage reads it to choose
+  // between the rational expansion and the GiNaC one, and never reads f_num when
+  // it is false (a failed conversion may have filled part of it) -- spec 5.1.
+  bool has_numeric_rows = false;
   void to_numeric();
+  // Fill the rational rows when every entry is a number, and report whether it
+  // worked, without throwing: a symbolic row leaves the flag false and the
+  // sector stage keeps the GiNaC expansion for that prescription.
+  bool try_to_numeric();
 
   // Compare the stored rows with Kira-printed cells (nprops coefficients then
   // the constant, one row per family line) as expressions, after the m2
@@ -162,6 +170,10 @@ public:
   void restrictTo(const std::set<unsigned> &reduced);
   // Drop every cross prescription, keeping the self ones (spec 5.5, `layer`).
   void dropCross();
+  // Spec 5.1: give every prescription its rational rows where they exist, so a
+  // symbolic family's sector stage can expand with `rational` instead of GiNaC.
+  // One-off work, called from Family::init_reduce before any thread starts.
+  void try_to_numeric_all();
   // Diagnostic dump of the table (spec 4.1).
   void dump(const std::string &path) const;
 

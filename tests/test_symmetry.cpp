@@ -11,6 +11,11 @@
 #include <string>
 #include <vector>
 
+// A symbolic entry for a hand-built prescription: to_rational refuses anything
+// that is not a rational numeric, and a plain symbol is the cheapest such entry
+// to write.  Which symbol it is does not matter.
+static GiNaC::ex symbolic_entry() { return GiNaC::symbol("d"); }
+
 // ---------------------------------------------------------------------------
 // The archived goldens (bench/symmetry/native, spec 4.8), generated into
 // tests/symmetry_golden.h by tests/make_symmetry_golden.py.
@@ -978,4 +983,81 @@ TEST(symmetry_expansion_reproduces_the_dot_only_correspondence) {
       REQUIRE(out[0].coeff.is_equal(1));
     }
   REQUIRE_EQ(checked, 4u);  // box's four dot_only entries, so this is not vacuous
+}
+
+// ---------------------------------------------------------------------------
+// Rational rows for every family (spec 5.1).  A prescription's rows are numbers
+// whenever the momentum map and the masses allow it -- all of box's hand-built
+// ones are -- so the rational expansion is available even when the family as a
+// whole is symbolic.
+// ---------------------------------------------------------------------------
+
+TEST(symmetry_try_to_numeric_fills_the_rows_it_can) {
+  PropPrescription p = hand_prescription(3, 1, false);
+  REQUIRE(!p.has_numeric_rows);
+  REQUIRE(p.try_to_numeric());
+  REQUIRE(p.has_numeric_rows);
+  REQUIRE_EQ(p.f_num.size(), 2u);
+  REQUIRE(p.f_num[0][0] == rational(1));
+  REQUIRE(p.f_num[1][1] == rational(1));
+  REQUIRE(p.c_num[1] == rational(4));
+
+  // A symbolic entry must report the miss instead of throwing, and must leave
+  // the flag off.
+  PropPrescription q = hand_prescription(3, 1, false);
+  q.f(0, 0) = symbolic_entry(); // a symbolic entry: no rational rows exist here
+  REQUIRE(!q.try_to_numeric());
+  REQUIRE(!q.has_numeric_rows);
+
+  // The throwing entry point keeps naming the coefficient it refused.
+  PropPrescription r = hand_prescription(3, 1, false);
+  r.f(0, 0) = symbolic_entry();
+  REQUIRE_THROWS(r.to_numeric());
+  REQUIRE(!r.has_numeric_rows);
+}
+
+// The table-level pass: every prescription whose entries are numbers gets its
+// rational rows before any thread starts, and a symbolic one keeps the GiNaC
+// path without a throw.  Box is the mixed case -- its dot-only entries are unit
+// rows of 0s and 1s with a zero constant, i.e. numbers, while a relation that
+// moves a massive line carries t -- and the mix is the whole reason the flag is
+// per prescription rather than per family (spec 5.1).
+//
+// find() itself must not convert a symbolic family: no flag is set before the
+// pass runs, because the detector's two to_numeric() calls sit behind
+// `if (in.numeric)`.
+TEST(symmetry_try_to_numeric_all_converts_every_prescription_it_can) {
+  Family f = make_box("try_numeric_box");
+  const unsigned top = (1u << f.nprops()) - 1;
+  SymmetryTable t =
+      SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+  unsigned total = 0;
+  for (unsigned s = 0; s <= top; ++s)
+    for (const PropPrescription &p : t.bySource(s)) {
+      ++total;
+      REQUIRE(!p.has_numeric_rows);
+    }
+  REQUIRE(total > 0);
+
+  t.try_to_numeric_all();
+
+  unsigned converted = 0;
+  for (unsigned s = 0; s <= top; ++s)
+    for (const PropPrescription &p : t.bySource(s)) {
+      if (!p.has_numeric_rows)
+        continue;
+      ++converted;
+      // The flag means the rows are there, and they are the right shape.
+      REQUIRE_EQ(p.f_num.size(), p.f.rows());
+      REQUIRE_EQ(p.c_num.size(), p.c.rows());
+    }
+  REQUIRE(converted > 0);     // the dot-only relations are unit rows
+  REQUIRE(converted < total); // the t-dependent ones are not
+
+  // A relation that carries t can never convert, and the flag says so.
+  const SymmetryTable::Inputs in = f.symmetry_inputs();
+  auto p41 = SymmetryTable::verify(4, 1, {-1, -1, 0, -1}, in);
+  REQUIRE(p41.has_value());
+  REQUIRE(!p41->try_to_numeric());
+  REQUIRE(!p41->has_numeric_rows);
 }
