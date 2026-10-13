@@ -772,6 +772,24 @@ bool expand_prescription(const PropPrescription &p, const std::vector<std::vecto
     coeff = coeff / ring_pow(f[k][unsigned(j)], unsigned(e));
   }
 
+  // Fast path (spec 5.2): a seed with no negative power anywhere -- every line
+  // outside its sector at or above zero -- has nothing to expand.  The image is
+  // the denominator permutation and the coefficient its product, one term, and
+  // the pinch test cannot fire because it lives in the numerator loop, which has
+  // no factors.  The general path would build a one-entry accumulator and emit
+  // exactly this term.
+  bool has_numerator = false;
+  for (unsigned k = 0; k < seed.size(); ++k)
+    if (seed[k] < 0) {
+      has_numerator = true;
+      break;
+    }
+  if (!has_numerator) {
+    if (!coeff.is_zero())
+      out.push_back(SymTerm<Coeff>{image, coeff});
+    return true;
+  }
+
   std::map<std::vector<int>, Coeff> acc;
   acc[image] = coeff;
 

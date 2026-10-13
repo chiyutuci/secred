@@ -1061,3 +1061,205 @@ TEST(symmetry_try_to_numeric_all_converts_every_prescription_it_can) {
   REQUIRE(!p41->try_to_numeric());
   REQUIRE(!p41->has_numeric_rows);
 }
+
+// ---------------------------------------------------------------------------
+// The pre-change expansion, kept as the oracle for the fast path (spec 5.2) and
+// for the container swap (spec 5.3).  A verbatim copy of the map-based body,
+// with its two ring primitives: the point is that it shares no code with the
+// implementation under test.
+// ---------------------------------------------------------------------------
+
+template <typename Coeff> static Coeff ref_one();
+
+template <> GiNaC::ex ref_one<GiNaC::ex>() { return GiNaC::ex(1); }
+
+template <> rational ref_one<rational>() { return rational(1); }
+
+template <typename Coeff> static Coeff ref_pow(const Coeff &x, unsigned e) {
+  Coeff r = ref_one<Coeff>();
+  for (unsigned i = 0; i < e; ++i)
+    r = r * x;
+  return r;
+}
+
+template <> GiNaC::ex ref_pow<GiNaC::ex>(const GiNaC::ex &x, unsigned e) {
+  return GiNaC::pow(x, e);
+}
+
+template <typename Coeff>
+static bool reference_expand(const PropPrescription &p, const std::vector<std::vector<Coeff>> &f,
+                             const std::vector<Coeff> &c, const RawIntegral &seed,
+                             const std::function<bool(unsigned)> &trivial,
+                             std::vector<SymTerm<Coeff>> &out) {
+  out.clear();
+  const unsigned n = f.size();
+  if (p.dot_only) {
+    for (unsigned k = 0; k < seed.size(); ++k)
+      if (!(p.from & (1u << k)) && seed[k] != 0)
+        return false;
+  }
+  std::vector<int> image(n, 0);
+  Coeff coeff = ref_one<Coeff>();
+  for (unsigned k = 0; k < seed.size(); ++k) {
+    const int e = seed[k];
+    if (e <= 0)
+      continue;
+    unsigned nonzero = 0;
+    int j = -1;
+    for (unsigned l = 0; l < n; ++l)
+      if (!f[k][l].is_zero()) {
+        ++nonzero;
+        j = int(l);
+      }
+    if (nonzero != 1 || !c[k].is_zero())
+      throw std::runtime_error("symmetry: denominator row is not a single propagator");
+    image[unsigned(j)] += e;
+    coeff = coeff / ref_pow(f[k][unsigned(j)], unsigned(e));
+  }
+  std::map<std::vector<int>, Coeff> acc;
+  acc[image] = coeff;
+  for (unsigned k = 0; k < seed.size(); ++k) {
+    if (seed[k] >= 0)
+      continue;
+    for (int factor = 0; factor < -seed[k]; ++factor) {
+      std::map<std::vector<int>, Coeff> next;
+      for (const auto &[vec, cf] : acc) {
+        for (unsigned j = 0; j < n; ++j) {
+          if (f[k][j].is_zero())
+            continue;
+          std::vector<int> v = vec;
+          if (v[j] == 1) {
+            v[j] = 0;
+            unsigned sector = 0;
+            for (unsigned m = 0; m < n; ++m)
+              if (v[m] > 0)
+                sector |= 1u << m;
+            if (trivial(sector))
+              continue;
+          } else {
+            v[j] -= 1;
+          }
+          next[v] += cf * f[k][j];
+        }
+        if (!c[k].is_zero())
+          next[vec] += cf * c[k];
+      }
+      acc.swap(next);
+    }
+  }
+  out.reserve(acc.size());
+  for (const auto &[vec, cf] : acc)
+    if (!cf.is_zero())
+      out.push_back(SymTerm<Coeff>{vec, cf});
+  return true;
+}
+
+// A seed corpus for one prescription: the source's own support, one power
+// doubled, one line negative (the numerator case) on each line in turn, two
+// negatives at once, and the empty seed -- so the pinch test meets both a
+// dropping and a surviving configuration.
+static std::vector<std::vector<int>>
+expansion_seeds(const PropPrescription &p, unsigned nprops) {
+  std::vector<int> base(nprops, 0);
+  for (unsigned k = 0; k < nprops; ++k)
+    if (p.from & (1u << k))
+      base[k] = 1;
+  std::vector<std::vector<int>> seeds;
+  seeds.push_back(base);
+  seeds.push_back(std::vector<int>(nprops, 0));
+  for (unsigned k = 0; k < nprops; ++k) {
+    std::vector<int> sv = base;
+    sv[k] = (p.from & (1u << k)) ? 2 : 1;
+    seeds.push_back(sv);
+    sv = base;
+    sv[k] = -1;
+    seeds.push_back(sv);
+    sv = base;
+    sv[k] = -2;
+    seeds.push_back(sv);
+    sv = base;
+    sv[k] = -1;
+    sv[(k + 1) % nprops] -= 1;
+    seeds.push_back(sv);
+  }
+  return seeds;
+}
+
+// The predicates the pinch test is driven with; all three are used for both
+// implementations, so the comparison covers the branch wherever it fires.
+static std::vector<std::function<bool(unsigned)>> trivial_variants() {
+  return {[](unsigned) { return false; },
+          [](unsigned s) { return s == 0; },
+          [](unsigned s) { return (s & 1u) == 0; }};
+}
+
+// Both expansions must agree term by term, in order, including which inputs they
+// refuse: an expansion that throws must throw for both.
+template <typename Coeff>
+static void require_same_expansion(const PropPrescription &p,
+                                   const std::vector<std::vector<Coeff>> &f,
+                                   const std::vector<Coeff> &c,
+                                   const std::vector<std::vector<int>> &seeds,
+                                   const std::function<bool(unsigned)> &trivial) {
+  for (const std::vector<int> &sv : seeds) {
+    const RawIntegral seed(sv);
+    std::vector<SymTerm<Coeff>> got, want;
+    bool got_ok = true, want_ok = true;
+    try {
+      got_ok = expand_prescription<Coeff>(p, f, c, seed, trivial, got);
+    } catch (const std::exception &) {
+      got_ok = false;
+    }
+    try {
+      want_ok = reference_expand<Coeff>(p, f, c, seed, trivial, want);
+    } catch (const std::exception &) {
+      want_ok = false;
+    }
+    REQUIRE_EQ(got_ok, want_ok);
+    if (!want_ok)
+      continue;
+    REQUIRE_EQ(got.size(), want.size());
+    for (std::size_t i = 0; i < got.size(); ++i) {
+      REQUIRE(got[i].powers == want[i].powers);
+      REQUIRE((got[i].coeff - want[i].coeff).is_zero());
+    }
+  }
+}
+
+TEST(symmetry_expansion_matches_the_map_based_reference_on_numeric_rows) {
+  const std::vector<PropPrescription> prescriptions = {
+      hand_prescription(3, 1, false),
+      rows_prescription(3, 1, false, {{1, 0}, {0, 1}}, {0, 0}),
+      rows_prescription(3, 1, false, {{2, 3}, {5, 7}}, {4, -6}),
+      rows_prescription(3, 1, false, {{1, 1}, {0, 1}}, {2, 0}),
+      // A single-term denominator row that still carries a constant: the other
+      // half of the throw's condition, and the only shape that reaches it -- a
+      // mutation check on `nonzero != 1 || !c[k].is_zero()` showed the rest of
+      // this corpus never does.
+      rows_prescription(3, 1, false, {{1, 0}, {0, 1}}, {5, 0}),
+      hand_prescription(3, 1, true), // dot_only: refused unless no numerator outside
+  };
+  for (const PropPrescription &p : prescriptions) {
+    PropPrescription q = p;
+    q.try_to_numeric(); // these rows are numbers, so this always succeeds
+    REQUIRE(q.has_numeric_rows);
+    for (const auto &trivial : trivial_variants())
+      require_same_expansion<rational>(q, q.f_num, q.c_num, expansion_seeds(q, 2), trivial);
+  }
+}
+
+TEST(symmetry_expansion_matches_the_map_based_reference_on_symbolic_rows) {
+  Family f = make_box("oracle_box");
+  const unsigned top = (1u << f.nprops()) - 1;
+  SymmetryTable t =
+      SymmetryTable::find(f.symmetry_inputs(), f.nontrivial_sectors(top), top);
+  unsigned checked = 0;
+  for (unsigned s = 0; s <= top; ++s)
+    for (const PropPrescription &p : t.bySource(s)) {
+      ++checked;
+      for (const auto &trivial : trivial_variants())
+        require_same_expansion<GiNaC::ex>(p, ex_rows(p), ex_col(p),
+                                          expansion_seeds(p, f.nprops()), trivial);
+    }
+  REQUIRE(checked > 0);
+}
