@@ -45,6 +45,19 @@ struct TestRegistrar {
     }                                                                         \
   } while (0)
 
+// Assertion with a caller-supplied message, for the cases where the expression
+// text alone cannot say what went wrong (a printed string that does not parse,
+// for instance).
+#define REQUIRE_MSG(expr, msg)                                                 \
+  do {                                                                         \
+    if (!(expr)) {                                                             \
+      std::ostringstream _oss;                                                 \
+      _oss << "  REQUIRE_MSG failed: " << (msg) << "  (line " << __LINE__      \
+           << ")";                                                             \
+      throw std::runtime_error(_oss.str());                                    \
+    }                                                                          \
+  } while (0)
+
 // Check that the expression throws any exception.
 #define REQUIRE_THROWS(expr)                                                   \
   do {                                                                        \

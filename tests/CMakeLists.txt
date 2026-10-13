@@ -18,6 +18,7 @@ set(TEST_SOURCES
     test_forward_selector.cpp
     test_global_order.cpp
     test_sym_coeff.cpp
+    test_row_coeff.cpp
     test_progress_bar.cpp
     test_masters_file.cpp
     test_run_report.cpp
