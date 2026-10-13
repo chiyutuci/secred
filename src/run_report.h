@@ -24,6 +24,11 @@ namespace secred {
 // carries, so `grep '\[fflow\]'` collects the whole phase.
 inline constexpr const char *kFlowTag = "[fflow]";
 
+// The same for the `global_tool: firefly` backend, whose learn, evaluator and
+// report blocks are shared with the FiniteFlow path and whose own lines
+// (reconstruction, probe/prime counters) carry this tag.
+inline constexpr const char *kFireFlyTag = "[firefly]";
+
 // ---------------------------------------------------------------------------
 // Wall clock
 // ---------------------------------------------------------------------------

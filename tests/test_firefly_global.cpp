@@ -8,12 +8,16 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include <ginac/ginac.h>
 
 #include <firefly/FFInt.hpp>
 #include <firefly/FFIntVec.hpp>
 
 #include "firefly_global.h"
+#include "globalreduce.h"
 #include "spill_reader.h"
 #include "symbolic_ffred.h"
 #include "test_runner.h"
@@ -211,4 +215,64 @@ TEST(firefly_box_handles_a_zero_output_system) {
   const std::vector<firefly::FFInt> x = {firefly::FFInt(5), firefly::FFInt(7)};
   REQUIRE_EQ(box(x).size(), std::size_t(0));
   REQUIRE(!box.hard_failure());
+}
+
+// G1 at unit scale: the two symbolic backends must return the same reduction of the same
+// system.  The selection is shared and deterministic (Task 6), so a difference here is a
+// difference between reconstruction engines.
+TEST(firefly_and_finiteflow_agree_on_the_tiny_system) {
+  const std::string spill = tiny::write_spill("/tmp/secred_test_tiny_spill");
+  const auto integrals = tiny::integrals();
+  const auto ids = tiny::integral_ids();
+  const auto symbols = tiny::symbols();
+  const std::vector<RawIntegral> targets = {integrals[3]};
+  const auto run = [&](auto &&fn) {
+    return fn(spill, integrals, ids, targets, symbols, 0u, 0u, 0u, std::size_t(0),
+              "/tmp/secred_test_tiny_masters", 2u);
+  };
+  const GlobalReductionResult ff = run(
+      [](auto &&...args) { return reduce_global_finiteflow_symbolic(args...); });
+  const GlobalReductionResult fly = run(
+      [](auto &&...args) { return secred::reduce_global_firefly_symbolic(args...); });
+  REQUIRE(ff.ok);
+  REQUIRE(fly.ok);
+  REQUIRE_EQ(ff.masters.size(), fly.masters.size());
+  REQUIRE(ff.masters == fly.masters);
+  REQUIRE_EQ(ff.reductions.size(), fly.reductions.size());
+  // The two engines spell a rational function differently ((1/2*d^2+3/2)/(1/2*d+1) vs
+  // (d^2+3)/(d+2)), so compare values: exact rational arithmetic at a few points.
+  GiNaC::symtab tab;
+  for (const auto &s : symbols)
+    tab[s.get_name()] = s;
+  GiNaC::parser parser(tab);
+  for (std::size_t i = 0; i < ff.reductions.size(); ++i) {
+    REQUIRE(ff.reductions[i].first == fly.reductions[i].first);
+    if (ff.reductions[i].second == "-1")
+      continue;
+    const GiNaC::ex a = parser(ff.reductions[i].second);
+    const GiNaC::ex b = parser(fly.reductions[i].second);
+    for (const auto &pt : {std::pair<int, int>{3, 5}, {7, 11}, {-2, 13}}) {
+      GiNaC::exmap sub;
+      sub[symbols[0]] = GiNaC::numeric(pt.first);
+      sub[symbols[1]] = GiNaC::numeric(pt.second);
+      REQUIRE(GiNaC::ex_to<GiNaC::numeric>(a.subs(sub))
+                  .is_equal(GiNaC::ex_to<GiNaC::numeric>(b.subs(sub))));
+    }
+  }
+}
+
+// Review Focus 4: every target is already a master -> zero outputs.  FireFly's
+// Reconstructor is fatal with n == 0, so the driver must return before constructing it.
+TEST(firefly_driver_handles_a_zero_output_system) {
+  const std::string spill = tiny::write_spill("/tmp/secred_test_tiny_spill0");
+  const auto integrals = tiny::integrals();
+  const auto ids = tiny::integral_ids();
+  const auto symbols = tiny::symbols();
+  const std::vector<RawIntegral> targets = {integrals[0]};   // never a pivot
+  const GlobalReductionResult r = secred::reduce_global_firefly_symbolic(
+      spill, integrals, ids, targets, symbols, 0u, 0u, 0u, std::size_t(0),
+      "/tmp/secred_test_tiny_masters0", 2u);
+  REQUIRE(r.ok);
+  REQUIRE_EQ(r.reductions.size(), std::size_t(1));   // just the (target, "-1") marker
+  REQUIRE_EQ(r.reductions[0].second, std::string("-1"));
 }

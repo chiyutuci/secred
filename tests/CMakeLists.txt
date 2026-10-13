@@ -33,6 +33,7 @@ set(SECRED_CORE_SOURCES
     ${CMAKE_SOURCE_DIR}/src/equation.cpp
     ${CMAKE_SOURCE_DIR}/src/family.cpp
     ${CMAKE_SOURCE_DIR}/src/forward_selector.cpp
+    ${CMAKE_SOURCE_DIR}/src/firefly_global.cpp
     ${CMAKE_SOURCE_DIR}/src/globalreduce.cpp
     ${CMAKE_SOURCE_DIR}/src/numeric_solver_mod.cpp
     ${CMAKE_SOURCE_DIR}/src/ffred_solver.cpp

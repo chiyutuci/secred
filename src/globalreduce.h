@@ -84,3 +84,23 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
     const std::string &masters_final_path, unsigned nthreads = 64);
+
+namespace secred {
+
+// The `global_tool: firefly` backend: the same learn and the same evaluator as the
+// FiniteFlow symbolic path, with FireFly's Reconstructor as the engine and the system
+// living inside the black box (src/firefly_global.cpp, src/firefly_global.h).  The
+// signature and the returned result are deliberately identical to the FiniteFlow
+// symbolic path's, so the two are interchangeable and can be compared output for
+// output.
+GlobalReductionResult reduce_global_firefly_symbolic(
+    const std::string &raw_equations_path,
+    const std::vector<RawIntegral> &all_integrals,
+    const std::unordered_map<RawIntegral, unsigned> &integral_id,
+    const std::vector<RawIntegral> &targets,
+    const std::vector<GiNaC::possymbol> &symbols,
+    unsigned narrowing_success, unsigned narrowing_fail,
+    unsigned raw_equations_total, std::size_t global_equations_count,
+    const std::string &masters_final_path, unsigned nthreads = 64);
+
+} // namespace secred
