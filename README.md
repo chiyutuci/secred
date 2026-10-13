@@ -150,8 +150,8 @@ Powers of an invariant are written with `^` in the expressions
 | `cache_dir` | `cache` | Directory for all output and for Kira's scratch files. |
 | `threads` | `64` | Worker threads for the sector-wise reduction. |
 | `parallel_mode` | `fine` | `layer`: sectors of the same depth run as a batch; `fine`: sectors are scheduled individually. |
-| `ordering_mode` | `balance` | Master-selection ordering: `normal` or `balance`. |
-| `subsector_depth_offset` | `1` | Depth offset *n* of the subsector filter: subsectors with `depth < depth_max − n` are dropped. |
+| `ordering_mode` | `balance` | Integral ordering: `normal` (generation order) or `balance` (default: seeds, subsector columns and the global integral numbering all follow the balance key — total power, depth, rank, max denominator power, max numerator power). |
+| `subsector_filter_n` | `1` | Offset *n* of the subsector filter: a subsector integral is dropped when its boundary quantity `depth + rank` is more than *n* below the boundary. |
 | `cut` | — | Cut propagator flags (family section). |
 | `max_memory` | `512` | Allowed total memory in GB. Set it smaller to run on a machine with less RAM; sectors are admitted only while the process stays below this ceiling. |
 | `memory_reserve` | `60` | Headroom kept free below `max_memory`, in GB. |
@@ -160,9 +160,15 @@ Powers of an invariant are written with `^` in the expressions
 | `kira_jobs_file` | `jobs.yaml` | Name of the Kira job file. |
 | `kira_bunch_size` | `64` | Kira's `--bunch_size` (integrals reduced per bunch). |
 | `kira_parallel` | `64` | Kira's `-p` (parallel workers; Kira also starts this many Fermat instances in its final result-writing step — see Examples). |
-| `global_otf` | `false` | Kira's on-the-fly loading of the global system. |
 | `global_tool` | `kira` | `kira` or `finiteflow` — see the table above. |
 | `global_finiteflow_threads` | `64` | Threads used by the in-process FiniteFlow reconstruction. |
+
+The equation set of the global reduction (forward closure plus numeric sufficiency repair),
+the elimination engine of both stages (ffred: forward elimination with back substitution) and
+the seed-boundary rule of the sector stage (independent depth and rank hard caps plus a cap on
+the total power `depth + rank` starting at the top of the seed box) are fixed and have no keys;
+an input file that still carries the former keys `equation_selection`, `sector_elimination`,
+`boundary_mode`, `global_otf` or `subsector_depth_offset` parses, but those lines are ignored.
 
 ## Output
 
@@ -171,13 +177,18 @@ Everything is written below `cache_dir`:
 | Path | Content |
 |------|---------|
 | `reductions` | The result: for each target, one line per term, `[a₁, …, aₙ]*<coefficient>`, with the target's own row first (coefficient `-1`) followed by the masters. A blank line separates consecutive targets. |
-| `masters` | The master candidates left by the sector-wise stage, one `[a₁, …, aₙ]` per line (this is not yet the final basis — the global step may keep fewer). |
+| `masters_sector` | The master candidates left by the sector-wise stage, one `[a₁, …, aₙ]` per line (this is not yet the final basis — the global step may keep fewer). |
 | `global/results/Tuserweight/masters` | The master integrals of the global reduction: the final basis. |
+| `masters_final` | The same final basis, written by the FiniteFlow backend as soon as its learn pass has fixed it — i.e. before the reconstruction, which can be the longest phase of a run. Absent on the Kira path, which has no separate learn phase. |
 | `sectors/` | Per-sector logs and target lists of the sector-wise stage. |
 | `global/` | The global system, Kira's job file and results, and the FiniteFlow reconstruction data. |
 
 The run also prints a summary with the sector-level timings (the adaptive
-two-pass seeding of the sector stage) and a `Reduction Statistics` block.
+two-pass seeding of the sector stage) and a `Reduction Statistics` block. It
+closes with a `Timing Statistics` block — the sector and global phases, the
+FiniteFlow backend's learn and reconstruction phases, the total wall clock and
+the peak memory. Lines from the in-process FiniteFlow backend carry the
+`[fflow]` tag, so `grep '\[fflow\]'` collects that whole phase.
 
 ## Examples
 

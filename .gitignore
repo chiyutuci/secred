@@ -4,6 +4,7 @@ build/
 # local-only notes and benchmark records (not part of the released package)
 ARCHITECTURE.md
 bench/
+docs/
 CLAUDE.md
 
 # run output

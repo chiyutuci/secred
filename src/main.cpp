@@ -10,6 +10,10 @@
 #include "secred.h"
 
 int main(int argc, char **argv) {
+  // The end-of-run Timing Statistics block reports the total against this mark,
+  // so it is the first thing main does.
+  secred::mark_run_start();
+
   // glibc tuning, before any allocation: (1) allocations above 64 KB go
   // straight to mmap, so they are munmap'd on free and the process RSS drops
   // immediately instead of lingering in a per-thread malloc arena; (2) cap the

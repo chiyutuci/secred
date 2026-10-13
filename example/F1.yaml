@@ -44,7 +44,9 @@ family:
 settings:
   threads: 64                 # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
-  subsector_depth_offset: 0   # depth offset n for the subsector filter: depth < _depth - n
+  subsector_filter_n: 0       # subsector filter offset n: a subsector integral is dropped when
+                              # its boundary quantity (depth + rank) falls more than n below
+                              # the boundary (0 = drop every subsector integral)
   cache_dir: cache_F1         # directory for the global system and scratch files
   global_tool: finiteflow     # numeric system: reduce in-process with FiniteFlow
   global_finiteflow_threads: 64

@@ -91,7 +91,6 @@ public:
   static std::uint64_t memory_reserve(const Family &f) {
     return f._memory_reserve;
   }
-  static bool global_otf(const Family &f) { return f._global_otf; }
   static const std::string &global_tool(const Family &f) {
     return f._global_tool;
   }
@@ -101,6 +100,12 @@ public:
   static unsigned threads(const Family &f) { return f._threads; }
   static const std::string &parallel_mode(const Family &f) {
     return f._parallel_mode;
+  }
+  static OrderingMode ordering_mode(const Family &f) {
+    return f._ordering_mode;
+  }
+  static unsigned subsector_filter_n(const Family &f) {
+    return f._subsector_filter_n;
   }
 };
 
@@ -176,21 +181,6 @@ TEST(family_parse_memory_reserve_custom) {
   cfg["settings"]["memory_reserve"] = 40;
   Family f(cfg);
   REQUIRE(FamilyTestHelper::memory_reserve(f) == 40ULL * 1024 * 1024 * 1024);
-}
-
-TEST(family_parse_global_otf_default) {
-  clear_symtab();
-  YAML::Node cfg = box_config("tc_global_otf_default");
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_otf(f) == false);
-}
-
-TEST(family_parse_global_otf_custom) {
-  clear_symtab();
-  YAML::Node cfg = box_config("tc_global_otf_custom");
-  cfg["settings"]["global_otf"] = true;
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_otf(f) == true);
 }
 
 TEST(family_parse_global_tool_default) {
@@ -811,3 +801,114 @@ targets: []
   REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
+
+// ---------------------------------------------------------------------------
+// Removed options — the keys must be silently ignored
+// (boundary_mode, equation_selection, sector_elimination, global_otf and
+// subsector_depth_offset are hardcoded or gone; old input files must keep
+// running while the removed keys take no effect)
+// ---------------------------------------------------------------------------
+
+TEST(family_parse_removed_options_are_ignored) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_removed_keys");
+  cfg["settings"]["boundary_mode"] = "totall";
+  cfg["settings"]["equation_selection"] = "kira4";
+  cfg["settings"]["sector_elimination"] = "ffredx";
+  cfg["settings"]["global_otf"] = true;
+  cfg["settings"]["subsector_depth_offset"] = 3;
+  cfg["settings"]["subsector_filter_n"] = 2;
+  Family f(cfg);
+  // Only the surviving key has an effect.
+  REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 2u);
+  REQUIRE(FamilyTestHelper::ordering_mode(f) == OrderingMode::Balance);
+}
+
+TEST(family_parse_removed_options_do_not_change_the_defaults) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_removed_keys_only");
+  cfg["settings"]["boundary_mode"] = "total";
+  cfg["settings"]["equation_selection"] = "legacy";
+  cfg["settings"]["sector_elimination"] = "fflow";
+  cfg["settings"]["global_otf"] = true;
+  cfg["settings"]["subsector_depth_offset"] = 3;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 1u);
+}
+
+// ---------------------------------------------------------------------------
+// ordering_mode — integral order: per-sector seeds/columns, and under
+// balance the global IDs too (see test_global_order.cpp)
+// ---------------------------------------------------------------------------
+
+TEST(family_parse_ordering_mode_default) {
+  // Absent key → Balance.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_om_default");
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::ordering_mode(f) == OrderingMode::Balance);
+}
+
+TEST(family_parse_ordering_mode_existing_values) {
+  clear_symtab();
+  YAML::Node cfg_normal = box_config("tc_om_normal");
+  cfg_normal["settings"]["ordering_mode"] = "normal";
+  REQUIRE(FamilyTestHelper::ordering_mode(Family(cfg_normal)) ==
+          OrderingMode::Normal);
+  clear_symtab();
+  YAML::Node cfg_balance = box_config("tc_om_balance");
+  cfg_balance["settings"]["ordering_mode"] = "balance";
+  REQUIRE(FamilyTestHelper::ordering_mode(Family(cfg_balance)) ==
+          OrderingMode::Balance);
+}
+
+TEST(family_parse_ordering_mode_invalid) {
+  // Typos throw instead of silently running Balance, matching parallel_mode.
+  // "complexity" is the pre-rename spelling and is no longer accepted.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_om_bad");
+  cfg["settings"]["ordering_mode"] = "complex";
+  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
+  clear_symtab();
+  YAML::Node cfg_old = box_config("tc_om_old_name");
+  cfg_old["settings"]["ordering_mode"] = "complexity";
+  REQUIRE_THROWS_AS(Family(cfg_old), std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------
+// subsector_filter_n — offset of the subsector filter
+// ---------------------------------------------------------------------------
+
+TEST(family_parse_subsector_filter_n_default) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_sfn_default");
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 1u);
+}
+
+TEST(family_parse_subsector_filter_n_value) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_sfn_2");
+  cfg["settings"]["subsector_filter_n"] = 2;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 2u);
+}
+
+TEST(family_parse_subsector_filter_n_zero) {
+  // 0 is meaningful (no offset), not "unset".
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_sfn_0");
+  cfg["settings"]["subsector_filter_n"] = 0;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 0u);
+}
+
+TEST(family_parse_subsector_depth_offset_is_gone) {
+  // The key is removed: an old input file still loads, but the value has no
+  // effect on subsector_filter_n.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_sdo_removed");
+  cfg["settings"]["subsector_depth_offset"] = 3;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 1u);
+}

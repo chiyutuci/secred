@@ -1,10 +1,12 @@
-// 进程内全局约化:纯数值与带符号两条 FiniteFlow 路径。
-// 两者都先用自带的模算术高斯消元(pyred_solver)选出独立方程,
-// 再交给 FiniteFlow 做系数重建;不依赖任何外部工具。
+// In-process global reduction: a pure-numeric and a symbolic FiniteFlow path.
+// Both select their equations with the built-in modular Gaussian elimination
+// (ffred_solver) and hand the system to FiniteFlow for the coefficient
+// reconstruction; no external tool is involved.
 #pragma once
 
 #include <cstdint>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -13,39 +15,48 @@
 
 #include <ginac/ginac.h>
 
-#include "sector.h" // RawIntegral, GlobalEquation
-
-// 将秒数格式化为 "XhYminZs" / "XminYs" / "Xs" 的紧凑时长字符串。
-inline std::string format_duration(double seconds) {
-  using ull = unsigned long long;
-  ull h = static_cast<ull>(seconds) / 3600;
-  ull m = (static_cast<ull>(seconds) % 3600) / 60;
-  double s = seconds - static_cast<double>(h) * 3600.0 -
-             static_cast<double>(m) * 60.0;
-  std::ostringstream oss;
-  if (h)
-    oss << h << "h" << m << "min" << static_cast<ull>(s) << "s";
-  else if (m)
-    oss << m << "min" << static_cast<ull>(s) << "s";
-  else
-    oss << std::fixed << std::setprecision(1) << s << "s";
-  return oss.str();
-}
+#include "run_report.h" // format_duration, the statistics blocks
+#include "sector.h"     // RawIntegral, GlobalEquation
 
 struct GlobalReductionResult {
-  std::vector<RawIntegral> masters;              // 主积分
-  std::vector<std::pair<RawIntegral, std::string>> reductions; // 目标约化(符号系数串,每项一行)
-  std::uint64_t raw_equations = 0;               // 送入全局系统的方程数
-  std::uint64_t selected_equations = 0;          // select 选中的方程数
+  std::vector<RawIntegral> masters;                            // masters
+  std::vector<std::pair<RawIntegral, std::string>> reductions; // target -> coefficient string
+  std::uint64_t raw_equations = 0;                             // equations sent to the global system
+  std::uint64_t selected_equations = 0;                        // equations the selection kept
   bool ok = false;
+  // Wall-clock split of the in-process FiniteFlow phase.  The Kira path has no
+  // separate learn and reconstruction steps, so it leaves phase_split false and
+  // the end-of-run Timing Statistics block prints only its one global phase.
+  bool phase_split = false;
+  double learn_seconds = 0.0;
+  double reconstruction_seconds = 0.0;
+  // Kira path only: the equations Kira selected out of the system it was handed
+  // and submitted to FireFly, read back from its log.  This is the count the
+  // reduction is measured by — not the number SecRed sent.  nullopt when the log
+  // could not be read, and the statistics block then leaves the row out rather
+  // than reporting a zero it did not observe.
+  std::optional<std::uint64_t> firefly_equations;
+  // Kira path only: peak resident memory of the Kira subprocess including what it
+  // ran, in bytes.  The kernel accounts for a child separately, so SecRed's own
+  // high-water mark would otherwise hide the global stage's memory.
+  std::uint64_t child_peak_bytes = 0;
 };
 
-// 纯数值(无符号)进程内全局约化:直接用 FiniteFlow 的稀疏求解器消元 +
-// algorithm_reconstruct_numeric 做有理数重建,无需 Kira 与 dum 哑变量。
-// 输入 raw_equations_path 为落盘方程文件(<RawIntegral>\t<coeff> 每行、空行分
-// 隔方程);all_integrals / integral_id 为全局积分排序与编号;targets 为目标积分。
-// 末尾四个统计量用于在 learn 之后、重建之前打印统一的 Reduction Statistics
-// 汇总(探测趟收窄 + learn 后方程数 + 最终约化统计)。
+// Pure-numeric in-process global reduction: the elimination runs on FiniteFlow's
+// sparse solver and the coefficients are reconstructed as rational numbers with
+// algorithm_reconstruct_numeric, so neither Kira nor a "dum" symbol is needed.
+// raw_equations_path is the spilled system file (<RawIntegral>\t<coeff> per line,
+// a blank line between equations); all_integrals / integral_id are the global
+// integral order and numbering; targets are the target integrals.  The last four
+// statistics feed the "Reduction Statistics" summary printed after the learn step
+// and before the reconstruction (narrowing counts, the equation count after learn
+// and the final reduction counts).
+// masters_final_path receives the final master basis (one integral per line, the same
+// format as masters_sector) as soon as the learn pass has run — before the
+// reconstruction, which can be the longest phase of the run.
+// The reconstruction set is always the forward closure plus the numeric
+// sufficiency repair (see global_select.h); when the repair does not converge the
+// selection falls back to the forward-and-backward closure.
 GlobalReductionResult reduce_global_finiteflow(
     const std::string &raw_equations_path,
     const std::vector<RawIntegral> &all_integrals,
@@ -53,12 +64,17 @@ GlobalReductionResult reduce_global_finiteflow(
     const std::vector<RawIntegral> &targets,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    unsigned nthreads = 64);
+    const std::string &masters_final_path, unsigned nthreads = 64);
 
-// 符号(带符号参数)进程内全局约化:系数是 symbols 中的 GiNaC 多项式,消元用
-// pyred(与纯数值路径同一套优化),系数重建用 FiniteFlow 的多变量有理函数
-// 重建(algorithm_reconstruct)。symbols 为有理函数的变量(d + 运动学不变量),
-// 顺序即 FiniteFlow 重建的 nparsin 变量顺序。
+// Symbolic in-process global reduction: the coefficients are GiNaC polynomials in
+// `symbols`, the elimination uses the built-in modular solver (the same machinery
+// as the pure-numeric path, with a different coefficient evaluation) and the
+// coefficients are rebuilt with FiniteFlow's multivariate rational-function
+// reconstruction (algorithm_reconstruct).  `symbols` are the variables of the
+// rational function (d plus the kinematic invariants), in the order FiniteFlow's
+// nparsin expects.
+// masters_final_path is written as in the numeric path, and the sample-point
+// evaluation that dominates the reconstruction reports its progress.
 GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::string &raw_equations_path,
     const std::vector<RawIntegral> &all_integrals,
@@ -67,4 +83,4 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::vector<GiNaC::possymbol> &symbols,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    unsigned nthreads = 64);
+    const std::string &masters_final_path, unsigned nthreads = 64);

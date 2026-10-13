@@ -1,0 +1,100 @@
+# fam96: the two-loop five-point family of the AMFlow/AnaIBP run in
+# ~/Downloads/lizi/96 (cache/anaibp1), converted from that run's Kira input
+# (config/integralfamilies.yaml + config/kinematics.yaml) and reduced with the
+# in-process FiniteFlow global backend.
+#
+# Mapping from the Kira input:
+#   autop1, autop2          -> l1, l2
+#   autop3, autop4, autop5  -> p1, p2, p3     (fam96AuxLeg, the fourth incoming
+#                             momentum, is minus their sum and is dropped: SecRed
+#                             keeps only the three independent external momenta)
+#   autos2, autos3          -> s, t
+#   dimension               -> 1999/500, the value that run set (`set: d = 1999/500`,
+#                             i.e. 4 - 2*eps at AMFlow's eps = 1/1000).  Its result
+#                             results/fam96/kira_target.m contains only autos2 and
+#                             autos3 and no d, so d is numeric there and the reductions
+#                             are rational functions of s and t — the same variables,
+#                             though in a different master basis (see the note below).
+#
+# The propagators carry the mass m = 3/2 (MC in the AMFlow driver): SecRed forms a
+# propagator as momentum^2 - mass^2 (src/family.cpp), so Kira's "-9/4 + x^2" is
+# [x, 3/2] and a massless line is [x, 0].
+#
+# Lines 8 and 9 are auxiliary: they never appear with a positive index in any
+# target, so the derived top sector is 127 (lines 1-7), the same top level the Kira
+# input declares.
+#
+# The note on the master basis.  Verified against the AnaIBP run's own output
+# (`results/fam96/kira_target.m` and `sectormappings/fam96/nonTrivialSector`):
+#   * The family itself reproduces exactly: top sector 127, the same 9 targets, and
+#     SecRed's 89 non-trivial sectors are the same set as Kira's non-trivial sectors
+#     with mask <= 127 (89 = 89, nothing on either side alone).  Since the
+#     trivial-sector test depends on the propagators, masses, kinematics and
+#     dimension, this is what pins the conversion down.
+#   * The master bases differ, and a SecRed basis is not unique: SecRed finds 63
+#     masters, Kira's `masters.final` has 49, of which 43 are in SecRed's set.  Kira's
+#     six extra are the rank-(-2) integrals -- [1,-2,1,1,1,0,1,0,0],
+#     [1,0,-2,1,0,0,1,0,0], [1,0,-2,1,1,0,1,0,0], [1,0,-1,1,1,0,1,0,0],
+#     [1,0,1,-2,0,0,1,0,0], [1,1,1,1,-2,0,1,0,0] -- which SecRed's seed box does not
+#     reach (no master has an index below -1).  SecRed's system is then a subset of
+#     Kira's IBP identities: the reduction is exact but lives in a larger, non-minimal
+#     basis, and Kira's `unreduced integrals: 0` says its 49 span the same space, so
+#     the two reductions are related by a change of basis.
+#   * It is not the target list.  Adding all of Kira's 49 masters as extra targets (58
+#     targets) still gives the same 63 masters, byte-identical `masters_final`.
+#   Therefore `cache_dir/reductions` and Kira's `kira_target.m` must NOT be compared
+#   coefficient by coefficient.  Sharing 43 masters is not enough: whenever the two
+#   reductions bring in different extra masters, the coefficients of the shared ones
+#   differ too, so a disagreement there says nothing about whether the conversion is
+#   right.
+#
+# Run record (64 threads, finiteflow backend): 435758 raw / 37229 global / 26463 final
+# equations, 63 masters, 567 = 9x63 reconstructed outputs; sector reduction 4.4 s,
+# global 1 m 29 s, total 1 m 33 s, peak memory 1.14 GB.
+family:
+  name: fam96
+  dimension: 1999/500
+  internals: [ l1, l2 ]
+  externals: [ p1, p2, p3 ]
+  invariants:
+    - [ s, 2 ]
+    - [ t, 2 ]
+  sps_rules:
+    - [ p1, p1, 0 ]
+    - [ p2, p2, 0 ]
+    - [ p3, p3, 0 ]
+    - [ p1, p2, s ]
+    - [ p1, p3, t ]
+    - [ p2, p3, 9/2-s-t ]
+  propagators:
+    - [ l1, 3/2 ]
+    - [ l1+p1/2+p2/2+p3/2, 0 ]
+    - [ l2, 3/2 ]
+    - [ l2+p2, 3/2 ]
+    - [ l2-p1, 3/2 ]
+    - [ l2-p1/2+p2/2+p3/2, 0 ]
+    - [ l1+l2-p1/2+p2/2+p3/2, 3/2 ]
+    - [ l1+p1, 0 ]
+    - [ l1+p2, 0 ]
+
+settings:
+  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
+  subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
+                              # its boundary quantity (depth + rank) falls more than n below
+                              # the boundary (0 = drop every subsector integral)
+  global_tool: finiteflow     # in-process FiniteFlow global reduction (no external solver)
+  global_finiteflow_threads: 64   # threads for the global FiniteFlow reconstruction
+  cache_dir: cache_fam96      # directory for the global system and scratch files
+
+# Verbatim from the AnaIBP run's target list (`cache/anaibp1/target`).
+targets:
+  - [1, 1, 1, 1, 1, 1, 1, 0, 0]
+  - [1, 1, 1, 1, 1, 1, 1, -1, 0]
+  - [1, 1, 1, 1, 1, 1, 1, 0, -1]
+  - [1, 1, 1, 1, 1, 1, 1, -2, 0]
+  - [1, 1, 1, 1, 1, 1, 1, -1, -1]
+  - [1, 1, 1, 1, 1, 1, 1, 0, -2]
+  - [1, 1, 1, 1, 2, 1, 1, 0, 0]
+  - [1, 1, 1, 1, 2, 1, 1, -1, 0]
+  - [1, 1, 1, 1, 2, 1, 1, 0, -1]

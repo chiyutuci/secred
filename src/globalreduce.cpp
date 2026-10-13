@@ -1,10 +1,12 @@
-// 进程内全局约化实现:纯数值与带符号两条 FiniteFlow 路径。
+// In-process global reduction: a pure-numeric and a symbolic FiniteFlow path.
 #include "globalreduce.h"
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <fstream>
+#include <functional>
 #include <gmp.h>
 #include <iomanip>
 #include <iostream>
@@ -32,17 +34,21 @@
 #include <memory>
 #include <random>
 
-#include "pyred_solver.h"
+#include "global_select.h"
+#include "ffred_solver.h"
+#include "masters_file.h"
+#include "progress_bar.h"
+#include "sym_coeff.h"
 
 // ---------------------------------------------------------------------------
-// 纯数值 FiniteFlow 全局约化(无符号、无 Kira/FireFly、无 dum 哑变量)
+// Pure-numeric FiniteFlow global reduction (no symbols, no Kira/FireFly, no "dum" variable)
 // ---------------------------------------------------------------------------
 
 namespace {
 namespace ff = fflow;
 
-// 把系数串("num" 或 "num/den")解析成 int64 num/den(den>0)。输入系数是 IBP
-// 系数,都是小整数/简单分数,一定能塞进 int64;解析失败(溢出)返回 false。
+// Parse a coefficient string ("num" or "num/den") into int64 num/den (den > 0). IBP
+// coefficients are small integers or simple fractions and always fit; false on overflow.
 bool parse_rat64(const std::string &s, int64_t &num, int64_t &den) {
   std::size_t slash = s.find('/');
   try {
@@ -65,7 +71,7 @@ bool parse_rat64(const std::string &s, int64_t &num, int64_t &den) {
   }
 }
 
-// 简单并行 for:将 [0,n) 静态分块给 nthreads 个线程。
+// Simple parallel for: [0,n) split statically over nthreads threads.
 template <typename F>
 void parallel_for(unsigned nthreads, std::size_t n, F f) {
   if (nthreads <= 1 || n <= 1) {
@@ -89,9 +95,10 @@ void parallel_for(unsigned nthreads, std::size_t n, F f) {
     th.join();
 }
 
-// 带进度日志 + 多线程的有理数重建:逐素数用 pyred 前向消元得到目标系数,
-// 再并行逐系数做 rat_rec / 中国剩余合并。返回 true 表示收敛、false 表示失败。
-bool reconstruct_pyred(const std::vector<secred::Eq> &system,
+// Multithreaded rational reconstruction with progress logging: per prime, ffred
+// forward elimination yields the target coefficients, then rat_rec and CRT run in
+// parallel per coefficient.  True on convergence, false on failure.
+bool reconstruct_ffred(const std::vector<secred::Eq> &system,
                        const std::vector<uint32_t> &eq_idx,
                        const std::vector<uint32_t> &bwd_chain,
                        const std::vector<unsigned> &dep_targets,
@@ -113,7 +120,7 @@ bool reconstruct_pyred(const std::vector<secred::Eq> &system,
     ff::Mod mod(ff::BIG_UINT_PRIMES[prime_i]);
     const uint64_t p = mod.n();
 
-    // 本素数下只在 mark-and-sweep 筛出的「所需方程」上做 pyred 前向消元 + 提取目标系数。
+    // At this prime only the equations mark-and-sweep selected are eliminated.
     auto t_elim0 = std::chrono::steady_clock::now();
     std::vector<secred::ResEq> res_eqs;
     std::vector<uint32_t> sys_idx;
@@ -146,6 +153,18 @@ bool reconstruct_pyred(const std::vector<secred::Eq> &system,
         auto mit = master_index.find(red[k].first);
         if (mit != master_index.end())
           xout[i * nnindeps + mit->second] = red[k].second;
+        else {
+          // Hard check: a non-master on a right-hand side means the selection or the
+          // bootstrap structure disagrees with the learn prime (cancelling columns
+          // dropping an equation, pivot drift), so xout would miss a term and the
+          // reconstructed coefficient would be wrong -- never emit a truncated reduction.
+          std::cerr << "finiteflow global reduction: prime " << p << ": target "
+                    << dep_targets[i] << " reduces to integral " << red[k].first
+                    << ", which is not a master (equation selection is stale "
+                       "for this prime); aborting instead of emitting a "
+                       "truncated reduction\n";
+          return false;
+        }
       }
     }
     auto t_elim1 = std::chrono::steady_clock::now();
@@ -153,7 +172,7 @@ bool reconstruct_pyred(const std::vector<secred::Eq> &system,
     if (elim_seconds)
       *elim_seconds += elim_s;
 
-    // CRT（与 algorithm_reconstruct_numeric 一致）。
+    // CRT (as in algorithm_reconstruct_numeric).
     auto t_rest0 = std::chrono::steady_clock::now();
     bool converged = false;
     bool failed = false;
@@ -201,17 +220,17 @@ bool reconstruct_pyred(const std::vector<secred::Eq> &system,
     auto t_rest1 = std::chrono::steady_clock::now();
     double rest_s = std::chrono::duration<double>(t_rest1 - t_rest0).count();
 
-    std::cout << "[global finiteflow] reconstruct: prime " << ip + 1 << "/"
+    std::cout << "  " << secred::kFlowTag << " reconstruct: prime " << ip + 1 << "/"
               << max_primes << " evaluated (elimination "
-              << format_duration(elim_s) << " [fwd " << format_duration(fwd_s)
-              << " + bwd " << format_duration(bwd_s) << "], CRT/rat_rec "
-              << format_duration(rest_s) << ")\n"
+              << secred::format_duration(elim_s) << " [fwd " << secred::format_duration(fwd_s)
+              << " + bwd " << secred::format_duration(bwd_s) << "], CRT/rat_rec "
+              << secred::format_duration(rest_s) << ")\n"
               << std::flush;
 
     if (failed)
       return false;
     if (converged) {
-      std::cout << "[global finiteflow] reconstruct: converged after "
+      std::cout << "  " << secred::kFlowTag << " reconstruct: converged after "
                 << ip + 1 << " prime(s)\n";
       return true;
     }
@@ -220,6 +239,37 @@ bool reconstruct_pyred(const std::vector<secred::Eq> &system,
   }
 
   return false;
+}
+
+// Forward elimination plus back substitution on an already reduced ResEq subset (used by
+// the symbolic path to evaluate at the learn point).
+void solve_res_eqs(std::vector<secred::ResEq> &res_eqs,
+                   std::vector<uint32_t> &sys_idx, uint64_t p,
+                   secred::SubSolve &out) {
+  out.solmap.clear();
+  out.eq_index.clear();
+  out.fwd_deps.clear();
+  out.bwd_deps.clear();
+  secred::forward_eliminate(res_eqs, sys_idx, p, out.solmap, nullptr, nullptr);
+  secred::backward_eliminate(out.solmap, p, &out.bwd_deps);
+}
+
+// Write the final master basis (one integral per line, as in masters_sector).  It is
+// known as soon as the learn pass has run, so it lands before the reconstruction —
+// which can be the longest phase of the run.
+void write_masters_final(const std::string &path,
+                         const std::vector<RawIntegral> &all_integrals,
+                         const std::vector<unsigned> &masters) {
+  std::vector<RawIntegral> basis;
+  basis.reserve(masters.size());
+  for (unsigned m : masters)
+    basis.push_back(all_integrals[m]);
+  if (!secred::write_masters_file(path, basis)) {
+    std::cerr << "finiteflow global reduction: cannot write " << path << "\n";
+    return;
+  }
+  std::cout << "  " << secred::kFlowTag << " masters_final: " << basis.size()
+            << " masters written to " << path << "\n";
 }
 
 } // namespace
@@ -231,15 +281,15 @@ GlobalReductionResult reduce_global_finiteflow(
     const std::vector<RawIntegral> &targets,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    unsigned nthreads) {
+    const std::string &masters_final_path, unsigned nthreads) {
   GlobalReductionResult res;
   namespace ff = fflow;
 
   const unsigned nvars = all_integrals.size();
   const auto t0 = std::chrono::steady_clock::now();
-  std::cout << "[global finiteflow] reading spill file, building system...\n";
+  std::cout << "\n  " << secred::kFlowTag << " reading spill file, building system...\n";
 
-  // 1) Read the spill file → vector<Eq>（降序 (id, num/den) 稠密向量）。
+  // 1) Read the spill file into vector<Eq> (descending (id, num/den)).
   std::vector<secred::Eq> system;
   bool parse_failed = false;
   {
@@ -296,9 +346,9 @@ GlobalReductionResult reduce_global_finiteflow(
   }
 
   const auto t1 = std::chrono::steady_clock::now();
-  std::cout << "[global finiteflow] system built: " << neqs << " equations x "
+  std::cout << "  " << secred::kFlowTag << " system built: " << neqs << " equations x "
             << nvars << " variables ("
-            << format_duration(std::chrono::duration<double>(t1 - t0).count())
+            << secred::format_duration(std::chrono::duration<double>(t1 - t0).count())
             << ")\n";
 
   // 2) Target ids.
@@ -314,10 +364,11 @@ GlobalReductionResult reduce_global_finiteflow(
     return res;
   }
 
-  // 3) Learn（一次）：在学习素数上做前向消元 → 主积分 + 结构 + 依赖（供 mark-and-sweep）。
+  // 3) Learn once at the learn prime: forward elimination -> masters + structure +
+  // dependencies (for mark-and-sweep).
   const uint64_t learn_prime = ff::BIG_UINT_PRIMES[0];
   std::unordered_map<uint32_t, secred::ResEq> learn_solmap;
-  std::unordered_map<uint32_t, uint32_t> eq_index; // pivot -> 原始方程下标
+  std::unordered_map<uint32_t, uint32_t> eq_index; // pivot -> raw equation index
   std::unordered_map<uint32_t, std::vector<uint32_t>> fwd_deps, bwd_deps;
   double learn_s = 0.0;
   {
@@ -341,24 +392,24 @@ GlobalReductionResult reduce_global_finiteflow(
     learn_s = std::chrono::duration<double>(t_learn1 - t_learn0).count();
   }
 
-  // 主积分 = 各目标约化式右侧积分的并集（约化已递归到底，右侧即主积分）。
-  // 不能取「0..nvars-1 中未被解出的 id」：那会把不出现在任何约化式右侧的
-  // 孤立变量也算作主积分。
+  // Masters = union of the integrals on the right-hand sides of the target reductions
+  // (the reduction is fully recursive, so a right-hand side is exactly masters).
+  // Not "ids in 0..nvars-1 never solved": that would count isolated variables as masters.
   std::set<unsigned> needed_masters;
   for (unsigned id : target_ids) {
     auto it = learn_solmap.find(id);
     if (it == learn_solmap.end())
-      continue; // 目标本身是主积分（无约化式）
+      continue; // target is itself a master (no reduction)
     const secred::ResEq &red = it->second;
     for (size_t k = 1; k < red.size(); ++k)
       needed_masters.insert(red[k].first);
   }
-  // 主积分按 id 降序（最复杂在前），与原 FiniteFlow 路径 needed_indepvars() 的
-  // 顺序一致（升序列 = 降序 id）。
+  // Masters in descending id, matching the order of the original FiniteFlow path's
+  // needed_indepvars() (ascending column = descending id).
   std::vector<unsigned> masters(needed_masters.rbegin(), needed_masters.rend());
   const unsigned nnindeps = masters.size();
 
-  // 可约目标（在 learn_solmap 中），按用户目标顺序。
+  // Reducible targets (present in learn_solmap), in the caller's target order.
   std::vector<unsigned> dep_targets;
   for (unsigned id : target_ids)
     if (learn_solmap.find(id) != learn_solmap.end())
@@ -369,8 +420,9 @@ GlobalReductionResult reduce_global_finiteflow(
   for (unsigned j = 0; j < nnindeps; ++j)
     master_index[masters[j]] = j;
 
-  // Mark-and-sweep：从目标出发，沿前向/后向依赖闭包，找出重建所需的原始方程下标。
-  // （pyred 用 insertions 数据库 + m_content 做同样的事；此处直接用记录好的依赖。）
+  // Mark-and-sweep from the targets along the forward / backward dependency closure,
+  // yielding the raw equations reconstruction needs.  (ffred does the same with an
+  // insertions database plus m_content; here the recorded dependencies are used directly.)
   auto sweep = [&](bool with_bwd) {
     std::unordered_set<uint32_t> s(dep_targets.begin(), dep_targets.end());
     std::vector<uint32_t> stack(dep_targets.begin(), dep_targets.end());
@@ -392,21 +444,10 @@ GlobalReductionResult reduce_global_finiteflow(
     }
     return s;
   };
-  std::unordered_set<uint32_t> needed = sweep(true);
+  std::unordered_set<uint32_t> needed = sweep(true); // fallback closure: forward and backward
   const std::unordered_set<uint32_t> needed_fwd = sweep(false);
-  std::size_t n_bwd_pivots = 0, n_bwd_entries = 0;
-  for (const auto &kv : bwd_deps) {
-    ++n_bwd_pivots;
-    n_bwd_entries += kv.second.size();
-  }
-  std::size_t n_derived = 0; // 派生积分：注册该 pivot 的方程原始 front > pivot
-  for (const auto &kv : eq_index) {
-    uint32_t w = kv.first, i = kv.second;
-    if (i < system.size() && !system[i].empty() && system[i].front().first > w)
-      ++n_derived;
-  }
 
-  // 小系统诊断：打印完整约化过程，便于与 Kira 对比发现问题。
+  // Small-system diagnostic: print the whole reduction to compare against Kira.
   if (neqs <= 1000) {
     std::cerr << "\n===== RAW equations (" << neqs << ") =====\n";
     for (std::size_t i = 0; i < system.size(); ++i) {
@@ -456,49 +497,38 @@ GlobalReductionResult reduce_global_finiteflow(
       std::cerr << "]\n";
     }
   }
+  // Equation selection: forward closure plus numeric sufficiency repair, falling back to
+  // the forward-and-backward closure when the repair does not converge.
   std::vector<uint32_t> needed_eq_idx;
-  needed_eq_idx.reserve(needed.size());
-  for (uint32_t w : needed) {
-    auto it = eq_index.find(w);
-    if (it != eq_index.end())
-      needed_eq_idx.push_back(it->second);
-  }
-  std::sort(needed_eq_idx.begin(), needed_eq_idx.end());
-
-  res.selected_equations = static_cast<std::uint64_t>(learn_solmap.size());
-  res.raw_equations = neqs;
-
-  std::cout << "[global finiteflow] learn done: " << res.selected_equations
-            << " independent equations, " << nnindeps << " masters ("
-            << format_duration(learn_s) << ")\n"
-            << "[global finiteflow] mark-and-sweep: " << needed_eq_idx.size()
-            << " needed equations of " << neqs << " (" << std::fixed
-            << std::setprecision(1)
-            << (neqs ? 100.0 * needed_eq_idx.size() / neqs : 0.0)
-            << " %; fwd-only " << needed_fwd.size() << "; bwd " << n_bwd_pivots
-            << " pivots / " << n_bwd_entries << " deps; derived " << n_derived
-            << ")\n";
-
-  // Consolidated Reduction Statistics.
+  std::vector<uint32_t> bwd_chain; // lazy chain: reconstruction rebuilds only this, not every reduction
+  bool use_forward = false;
   {
-    unsigned total = narrowing_success + narrowing_fail;
-    double ratio = total ? 100.0 * static_cast<double>(narrowing_success) / total
-                         : 0.0;
-    std::cout << "\n----------------- Reduction Statistics ------------------\n"
-              << "  Probe narrowing:  " << narrowing_success << "/" << narrowing_fail
-              << "/" << total << " (" << std::fixed << std::setprecision(1)
-              << ratio << " %)\n"
-              << "  Raw equations:    " << raw_equations_total << "\n"
-              << "  Global equations: " << global_equations_count << "\n"
-              << "  Final equations:  " << res.selected_equations << "\n"
-              << "  Masters:          " << nnindeps << "\n"
-              << "---------------------------------------------------------\n";
+    auto solve_at_learn = [&](const std::vector<uint32_t> &idx,
+                              secred::SubSolve &sub) {
+      secred::solve_subset(system, idx, learn_prime, sub, false, true);
+    };
+    GlobalSelection gsel =
+        select_global_forward(eq_index, fwd_deps, learn_solmap, dep_targets,
+                              master_index, solve_at_learn);
+    if (gsel.fallback) {
+      std::cerr << "finiteflow global reduction: forward selection did not "
+                   "converge, falling back to the legacy closure\n";
+    } else {
+      use_forward = true;
+      needed_eq_idx = std::move(gsel.needed_eq_idx);
+      bwd_chain = std::move(gsel.bwd_chain);
+    }
   }
-
-  // 惰性回代链：目标 + 沿 bwd 依赖闭包的派生积分。重建时只还原这条链（而非全部约化式），
-  // 与 Kira 的 backsubs（~0.1s）一致。
-  std::vector<uint32_t> bwd_chain;
-  {
+  if (!use_forward) {
+    needed_eq_idx.reserve(needed.size());
+    for (uint32_t w : needed) {
+      auto it = eq_index.find(w);
+      if (it != eq_index.end())
+        needed_eq_idx.push_back(it->second);
+    }
+    std::sort(needed_eq_idx.begin(), needed_eq_idx.end());
+    // Targets plus the derived integrals in the backward dependency closure, matching
+    // Kira's backsubs (~0.1 s).
     std::unordered_set<uint32_t> chain_set(dep_targets.begin(), dep_targets.end());
     std::vector<uint32_t> stack(dep_targets.begin(), dep_targets.end());
     while (!stack.empty()) {
@@ -514,15 +544,41 @@ GlobalReductionResult reduce_global_finiteflow(
     std::sort(bwd_chain.begin(), bwd_chain.end());
   }
 
-  // 4) Reconstruct：逐素数前向消元 + CRT。
+  res.selected_equations = static_cast<std::uint64_t>(learn_solmap.size());
+  res.raw_equations = neqs;
+
+  {
+    secred::LearnSummary ls;
+    ls.independent_equations = res.selected_equations;
+    ls.masters = nnindeps;
+    ls.seconds = learn_s;
+    std::cout << "\n" << secred::format_learn_summary(ls);
+  }
+
+  write_masters_final(masters_final_path, all_integrals, masters);
+
+  // Consolidated Reduction Statistics.  "Final equations" is what the
+  // mark-and-sweep keeps: the equations each prime's elimination runs on.
+  {
+    secred::ReductionStats rs;
+    rs.narrowing_success = narrowing_success;
+    rs.narrowing_fail = narrowing_fail;
+    rs.raw_equations = raw_equations_total;
+    rs.global_equations = global_equations_count;
+    rs.final_equations = needed_eq_idx.size();
+    rs.masters = nnindeps;
+    std::cout << "\n" << secred::format_reduction_statistics(rs);
+  }
+
+  // 4) Reconstruct: per-prime forward elimination plus CRT.
   const unsigned max_primes = 200;
   std::unique_ptr<ff::MPRational[]> resmp(
       new ff::MPRational[(std::size_t)nndeps * nnindeps]);
   double elim_seconds = 0.0;
-  std::cout << "[global finiteflow] reconstruct (rational reconstruction, up to "
+  std::cout << "\n  " << secred::kFlowTag << " reconstruct (rational reconstruction, up to "
             << max_primes << " primes, " << nthreads << " threads)...\n";
   const auto t2 = std::chrono::steady_clock::now();
-  bool ok = reconstruct_pyred(system, needed_eq_idx, bwd_chain, dep_targets, masters,
+  bool ok = reconstruct_ffred(system, needed_eq_idx, bwd_chain, dep_targets, masters,
                               master_index, nthreads, max_primes, resmp.get(),
                               &elim_seconds);
   const auto t3 = std::chrono::steady_clock::now();
@@ -530,11 +586,11 @@ GlobalReductionResult reduce_global_finiteflow(
     std::cerr << "finiteflow global reduction: reconstruct failed\n";
     return res;
   }
-  std::cout << "[global finiteflow] reconstruct done ("
-            << format_duration(std::chrono::duration<double>(t3 - t2).count())
+  std::cout << "  " << secred::kFlowTag << " reconstruct done ("
+            << secred::format_duration(std::chrono::duration<double>(t3 - t2).count())
             << ")\n";
 
-  // 5) Assemble the output（主积分 + 各目标约化）。
+  // 5) Assemble the output (masters plus each target's reduction).
   for (unsigned j = 0; j < nnindeps; ++j)
     res.masters.push_back(all_integrals[masters[j]]);
 
@@ -549,7 +605,7 @@ GlobalReductionResult reduce_global_finiteflow(
       continue;
     auto dit = dep_index.find(it->second);
     if (dit == dep_index.end())
-      continue; // 目标本身是主积分 → 无约化项
+      continue; // the target is a master -> nothing to reduce
     unsigned i = dit->second;
     for (unsigned j = 0; j < nnindeps; ++j) {
       ff::MPRational c = resmp[(std::size_t)i * nnindeps + j];
@@ -561,61 +617,40 @@ GlobalReductionResult reduce_global_finiteflow(
     }
   }
 
-  std::cout << "[timing] global learn: " << format_duration(learn_s)
-            << ", reconstruction: "
-            << format_duration(std::chrono::duration<double>(t3 - t2).count())
-            << "\n";
+  // The phase split is reported by the end-of-run Timing Statistics block, which
+  // family.cpp prints once the whole run — including the file writes — is done.
+  res.phase_split = true;
+  res.learn_seconds = learn_s;
+  res.reconstruction_seconds =
+      std::chrono::duration<double>(t3 - t2).count();
 
   res.ok = true;
   return res;
 }
 
 // ---------------------------------------------------------------------------
-// 符号 FiniteFlow 全局约化（系数为 GiNaC 多项式，消元用 pyred，重建用
-// FiniteFlow 的多变量有理函数重建）。
+// Symbolic FiniteFlow global reduction (GiNaC polynomial coefficients, ffred elimination,
+// FiniteFlow multivariate rational-function reconstruction).
 // ---------------------------------------------------------------------------
 
 namespace {
 
-// 符号系数：symbols 上的多项式（有理系数）。消元时在采样点代入符号值得到
-// 有理数，再模 p。
-struct SymCoeff {
-  GiNaC::ex poly;
-};
-using SymEq = std::vector<std::pair<uint32_t, SymCoeff>>;
+// The precompiled coefficient machinery lives in sym_coeff.h so the tests can drive
+// it directly; this file only feeds it the parsed system and evaluates equations.
+using secred::eval_sym_coeff_mod;
+using secred::fill_powers;
+using secred::make_powers;
+using secred::make_sym_coeff;
+using secred::sym_max_exps;
+using secred::SymEq;
 
-// cl_I 模 p 归约到 uint64（结果 ∈ [0,p)）。
-uint64_t cl_I_mod_u64(const cln::cl_I &x, uint64_t p) {
-  cln::cl_I r = cln::mod(x, cln::cl_I(p));
-  if (cln::minusp(r))
-    r += cln::cl_I(p);
-  return static_cast<uint64_t>(cln::cl_I_to_ulong(r));
-}
-
-// 在采样点（subs）求符号系数并模 p 归约。系数是多项式，代入整数采样值后是
-// 有理数 numeric；numer()/denom() 给整数分子分母。den ≡ 0 (mod p) 时返回 0
-// （与数值路径 rat_mod_u64 一致：标准 IBP 系数分母远小于素数，不会发生）。
-uint64_t eval_sym_coeff_mod(const SymCoeff &c, const GiNaC::exmap &subs,
-                            uint64_t p) {
-  GiNaC::ex val = c.poly.subs(subs);
-  if (!is_a<GiNaC::numeric>(val))
-    return 0;
-  const GiNaC::numeric &nv = GiNaC::ex_to<GiNaC::numeric>(val);
-  cln::cl_I num = cln::the<cln::cl_I>(nv.numer().to_cl_N());
-  cln::cl_I den = cln::the<cln::cl_I>(nv.denom().to_cl_N());
-  uint64_t n = cl_I_mod_u64(num, p);
-  uint64_t d = cl_I_mod_u64(den, p);
-  if (d == 0)
-    return 0;
-  uint64_t inv = secred::mod_inverse_u64(d, p);
-  return static_cast<uint64_t>((static_cast<__int128>(n) * inv) % p);
-}
-
-// 在采样点（subs）把一组符号方程模 p 归约成 ResEq 系统。
-void eval_sym_eqs_mod(const std::vector<SymEq> &system,
+// Reduce a set of symbolic equations to a ResEq system mod p at the sample point.
+// False when the coefficient tables were not reduced for `p`.
+bool eval_sym_eqs_mod(const std::vector<SymEq> &system,
                       const std::vector<uint32_t> &eq_idx,
-                      const GiNaC::exmap &subs, uint64_t p,
-                      std::vector<secred::ResEq> &res_eqs,
+                      const GiNaC::exmap &subs,
+                      const std::vector<std::vector<uint64_t>> &powers,
+                      uint64_t p, std::vector<secred::ResEq> &res_eqs,
                       std::vector<uint32_t> &sys_idx) {
   res_eqs.clear();
   sys_idx.clear();
@@ -626,7 +661,9 @@ void eval_sym_eqs_mod(const std::vector<SymEq> &system,
     secred::ResEq re;
     re.reserve(eq.size());
     for (const auto &[id, c] : eq) {
-      uint64_t v = eval_sym_coeff_mod(c, subs, p);
+      uint64_t v = 0;
+      if (!eval_sym_coeff_mod(c, subs, powers, p, v))
+        return false;
       if (v)
         re.emplace_back(id, v);
     }
@@ -635,13 +672,29 @@ void eval_sym_eqs_mod(const std::vector<SymEq> &system,
       sys_idx.push_back(i);
     }
   }
+  return true;
 }
 
-// 供 FiniteFlow 重建驱动的自定义算法：采样点代入符号值 → 模 p 系数 → pyred
-// 前向+回代 → 输出目标×主积分系数。
-class SymbolicPyRedAlgorithm : public fflow::Algorithm {
+// Per-thread scratch for one sample point.  FiniteFlow hands the `AlgorithmData*` its
+// caller was given straight back to every `Algorithm::evaluate`, so the buffers a
+// sample point needs are owned per thread instead of by the algorithm: that is what
+// lets the sample points be evaluated concurrently.  The coefficient tables are *not*
+// here — they belong to the system, which is reduced once per prime before any
+// evaluation starts and only read from then on.
+struct SymbolicFFScratch : public fflow::AlgorithmData {
+  std::vector<std::vector<uint64_t>> powers; // powers[i][k] = x_i^k at this point
+  std::vector<secred::ResEq> res_eqs;
+  std::vector<uint32_t> sys_idx;
+  std::unordered_map<uint32_t, secred::ResEq> solmap;
+  bool sized = false;
+};
+
+// Custom algorithm driving FiniteFlow's reconstruction: substitute the sample point,
+// reduce mod p, run ffred forward and backward elimination, and emit the target x
+// master coefficients.
+class SymbolicFFRedAlgorithm : public fflow::Algorithm {
 public:
-  SymbolicPyRedAlgorithm(std::vector<SymEq> system,
+  SymbolicFFRedAlgorithm(std::vector<SymEq> system,
                          std::vector<uint32_t> eq_idx,
                          std::vector<uint32_t> bwd_chain,
                          std::vector<unsigned> dep_targets,
@@ -653,43 +706,112 @@ public:
         symbols_(std::move(symbols)) {
     nparsin.push_back(static_cast<unsigned>(symbols_.size()));
     nparsout = static_cast<unsigned>(dep_targets_.size() * nnindeps_);
+
+    // Highest power of each symbol used anywhere in the precompiled coefficients:
+    // sizing the per-point power table once keeps the evaluation loop free of
+    // recomputation.
+    const unsigned nvars = symbols_.size();
+    mx_ = sym_max_exps(system_, nvars);
+    all_precompiled_ = true;
+    for (const SymEq &eq : system_)
+      for (const auto &pr : eq)
+        if (!pr.second.precompiled)
+          all_precompiled_ = false;
   }
 
+  // Reduce every coefficient of the system mod p.  FiniteFlow evaluates one prime at a
+  // time, and the table holds a single prime, so this runs between evaluation phases
+  // and never while a thread is evaluating.  Parallel over the equations: the tables
+  // hang off the equations, so there is nothing to contend for.
+  void reduce_for_prime(uint64_t p, unsigned nthreads) {
+    parallel_for(nthreads, system_.size(), [&](std::size_t i) {
+      for (auto &pr : system_[i]) {
+        if (!pr.second.precompiled)
+          continue;
+        secred::reduce_sym_poly(pr.second.num, p);
+        secred::reduce_sym_poly(pr.second.den, p);
+      }
+    });
+  }
+
+  std::size_t n_equations() const { return system_.size(); }
+
   fflow::Ret evaluate(fflow::Context *, fflow::AlgInput xin[], fflow::Mod mod,
-                      fflow::AlgorithmData *,
+                      fflow::AlgorithmData *data,
                       fflow::UInt xout[]) const override {
+    if (data)
+      return evaluate_with(static_cast<SymbolicFFScratch *>(data), xin, mod, xout);
+    // The degree-estimation phases call FiniteFlow without an AlgorithmData of their
+    // own; they run on the algorithm's scratch, serialised so that a caller mixing
+    // both styles still sees one sample point at a time.
+    std::lock_guard<std::mutex> lock(fallback_mutex_);
+    return evaluate_with(&fallback_scratch_, xin, mod, xout);
+  }
+
+private:
+  fflow::Ret evaluate_with(SymbolicFFScratch *scratch, fflow::AlgInput xin[],
+                           fflow::Mod mod, fflow::UInt xout[]) const {
     const uint64_t p = mod.n();
     const fflow::UInt *x = xin[0];
     const unsigned nvars = symbols_.size();
 
-    // 每采样点构建一次替换表 symbol -> 整数采样值。
+    if (!scratch->sized) {
+      scratch->powers.assign(nvars, std::vector<uint64_t>(1, 1));
+      for (unsigned i = 0; i < nvars; ++i)
+        scratch->powers[i].resize(mx_[i] + 1);
+      scratch->sized = true;
+    }
+
+    // Powers of the sample values, shared by every coefficient at this point.
+    fill_powers(scratch->powers, x, p);
+
+    // The GiNaC substitution table is only needed for coefficients that could not be
+    // precompiled.
     GiNaC::exmap subs;
-    for (unsigned i = 0; i < nvars; ++i)
-      subs[symbols_[i]] = GiNaC::numeric(x[i]);
+    if (!all_precompiled_)
+      for (unsigned i = 0; i < nvars; ++i)
+        subs[symbols_[i]] = GiNaC::numeric(x[i]);
 
-    eval_sym_eqs_mod(system_, eq_idx_, subs, p, res_eqs_, sys_idx_);
+    if (!eval_sym_eqs_mod(system_, eq_idx_, subs, scratch->powers, p,
+                          scratch->res_eqs, scratch->sys_idx)) {
+      std::cerr << "finiteflow symbolic global reduction: coefficients were not "
+                   "reduced for prime "
+                << p << "; aborting instead of evaluating the wrong modulus\n";
+      return fflow::FAILED;
+    }
 
-    solmap_.clear();
-    secred::forward_eliminate(res_eqs_, sys_idx_, p, solmap_, nullptr, nullptr);
-    secred::backward_eliminate(solmap_, p, nullptr, &bwd_chain_);
+    scratch->solmap.clear();
+    secred::forward_eliminate(scratch->res_eqs, scratch->sys_idx, p,
+                              scratch->solmap, nullptr, nullptr);
+    secred::backward_eliminate(scratch->solmap, p, nullptr, &bwd_chain_);
 
     const unsigned nndeps = dep_targets_.size();
     std::fill(xout, xout + nndeps * nnindeps_, fflow::UInt(0));
     for (unsigned i = 0; i < nndeps; ++i) {
-      auto it = solmap_.find(dep_targets_[i]);
-      if (it == solmap_.end())
+      auto it = scratch->solmap.find(dep_targets_[i]);
+      if (it == scratch->solmap.end())
         continue;
       const secred::ResEq &red = it->second;
       for (size_t k = 1; k < red.size(); ++k) {
         auto mit = master_index_.find(red[k].first);
         if (mit != master_index_.end())
           xout[i * nnindeps_ + mit->second] = red[k].second;
+        else {
+          // Hard check (as in the numeric path): a non-master on a right-hand side means
+          // the selection is stale at this sample point and prime, so the output would
+          // miss a term.  Return FAILED to abort the reconstruction rather than emit a
+          // truncated reduction.
+          std::cerr << "finiteflow symbolic global reduction: target "
+                    << dep_targets_[i] << " reduces to integral " << red[k].first
+                    << ", which is not a master (equation selection is stale); "
+                       "aborting instead of emitting a truncated reduction\n";
+          return fflow::FAILED;
+        }
       }
     }
     return fflow::SUCCESS;
   }
 
-private:
   std::vector<SymEq> system_;
   std::vector<uint32_t> eq_idx_;
   std::vector<uint32_t> bwd_chain_;
@@ -698,10 +820,13 @@ private:
   unsigned nnindeps_;
   std::vector<GiNaC::ex> symbols_;
 
-  // 单线程复用缓冲（重建在单线程内逐个采样点求值）。
-  mutable std::vector<secred::ResEq> res_eqs_;
-  mutable std::vector<uint32_t> sys_idx_;
-  mutable std::unordered_map<uint32_t, secred::ResEq> solmap_;
+  // Highest power each symbol carries, used to size every thread's power table.
+  std::vector<unsigned> mx_;
+  bool all_precompiled_ = true;
+
+  // Scratch for the FiniteFlow calls that pass no AlgorithmData.
+  mutable SymbolicFFScratch fallback_scratch_;
+  mutable std::mutex fallback_mutex_;
 };
 
 } // namespace
@@ -714,25 +839,30 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::vector<GiNaC::possymbol> &symbols,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    unsigned nthreads) {
+    const std::string &masters_final_path, unsigned nthreads) {
   GlobalReductionResult res;
   namespace ff = fflow;
 
-  (void)nthreads; // 重建目前单线程（可后续按输出系数并行化）
+  if (nthreads == 0)
+    nthreads = 1;
 
   const unsigned nvars = all_integrals.size();
   const unsigned nparams = symbols.size();
   const auto t0 = std::chrono::steady_clock::now();
-  std::cout << "[global finiteflow] reading spill file, building symbolic "
+  std::cout << "\n  " << secred::kFlowTag << " reading spill file, building symbolic "
                "system...\n";
 
-  // 符号表（name -> symbol），解析系数串。
+  // Symbol table (name -> symbol) for parsing coefficient strings, and the
+  // name -> parameter-index map the coefficient precompiler works from.
   GiNaC::symtab symtab;
-  for (const auto &s : symbols)
-    symtab[s.get_name()] = s;
+  std::unordered_map<std::string, unsigned> sym_index;
+  for (unsigned i = 0; i < nparams; ++i) {
+    symtab[symbols[i].get_name()] = symbols[i];
+    sym_index[symbols[i].get_name()] = i;
+  }
   GiNaC::parser parser(symtab);
 
-  // 1) 读 spill 文件 → vector<SymEq>（降序 (id, 符号多项式)）。
+  // 1) Read the spill file into vector<SymEq> (descending (id, symbolic polynomial)).
   std::vector<SymEq> system;
   bool parse_failed = false;
   {
@@ -750,7 +880,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
         ex = ex.expand();
         if (ex.is_zero())
           continue;
-        e.push_back({id, SymCoeff{std::move(ex)}});
+        e.push_back({id, make_sym_coeff(ex, sym_index)});
       }
       system.push_back(std::move(e));
       eq.clear();
@@ -789,10 +919,10 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     return res;
   }
   const auto t1 = std::chrono::steady_clock::now();
-  std::cout << "[global finiteflow] symbolic system built: " << neqs
+  std::cout << "  " << secred::kFlowTag << " symbolic system built: " << neqs
             << " equations x " << nvars << " variables, " << nparams
             << " parameters ("
-            << format_duration(std::chrono::duration<double>(t1 - t0).count())
+            << secred::format_duration(std::chrono::duration<double>(t1 - t0).count())
             << ")\n";
 
   // 2) Target ids.
@@ -808,7 +938,8 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     return res;
   }
 
-  // 3) Learn：在一个通用采样点、学习素数上做前向+回代 → 主积分 + 结构 + 依赖。
+  // 3) Learn at a generic sample point and the learn prime: forward and backward
+  // elimination -> masters + structure + dependencies.
   const uint64_t learn_prime = ff::BIG_UINT_PRIMES[0];
   std::mt19937_64 rng(0x9E3779B97F4A7C15ULL);
   std::vector<ff::UInt> learn_pt(nparams);
@@ -817,6 +948,8 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   GiNaC::exmap learn_subs;
   for (unsigned i = 0; i < nparams; ++i)
     learn_subs[GiNaC::ex(symbols[i])] = GiNaC::numeric(learn_pt[i]);
+  const std::vector<std::vector<uint64_t>> learn_powers =
+      make_powers(system, learn_pt.data(), nparams, learn_prime);
 
   std::vector<secred::ResEq> learn_res_eqs;
   std::vector<uint32_t> learn_sys_idx;
@@ -824,8 +957,13 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     std::vector<uint32_t> all_idx(neqs);
     for (unsigned i = 0; i < neqs; ++i)
       all_idx[i] = i;
-    eval_sym_eqs_mod(system, all_idx, learn_subs, learn_prime, learn_res_eqs,
-                     learn_sys_idx);
+    secred::reduce_sym_system(system, learn_prime);
+    if (!eval_sym_eqs_mod(system, all_idx, learn_subs, learn_powers, learn_prime,
+                          learn_res_eqs, learn_sys_idx)) {
+      std::cerr << "finiteflow symbolic global reduction: coefficients were not "
+                   "reduced for the learn prime\n";
+      return res;
+    }
   }
 
   std::unordered_map<uint32_t, secred::ResEq> learn_solmap;
@@ -841,7 +979,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     learn_s = std::chrono::duration<double>(t_learn1 - t_learn0).count();
   }
 
-  // 主积分 = 各目标约化式右侧积分并集。
+  // Masters = union of the right-hand sides of the target reductions.
   std::set<unsigned> needed_masters;
   for (unsigned id : target_ids) {
     auto it = learn_solmap.find(id);
@@ -864,7 +1002,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   for (unsigned j = 0; j < nnindeps; ++j)
     master_index[masters[j]] = j;
 
-  // Mark-and-sweep：从目标出发沿前向/后向依赖闭包找所需原始方程。
+  // Mark-and-sweep from the targets along the forward / backward dependency closure.
   auto sweep = [&](bool with_bwd) {
     std::unordered_set<uint32_t> s(dep_targets.begin(), dep_targets.end());
     std::vector<uint32_t> stack(dep_targets.begin(), dep_targets.end());
@@ -886,43 +1024,42 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     }
     return s;
   };
-  std::unordered_set<uint32_t> needed = sweep(true);
+  std::unordered_set<uint32_t> needed = sweep(true); // fallback closure: forward and backward
   std::vector<uint32_t> needed_eq_idx;
-  needed_eq_idx.reserve(needed.size());
-  for (uint32_t w : needed) {
-    auto it = eq_index.find(w);
-    if (it != eq_index.end())
-      needed_eq_idx.push_back(it->second);
-  }
-  std::sort(needed_eq_idx.begin(), needed_eq_idx.end());
-
-  res.selected_equations = static_cast<std::uint64_t>(learn_solmap.size());
-  res.raw_equations = neqs;
-
-  std::cout << "[global finiteflow] learn done: " << res.selected_equations
-            << " independent equations, " << nnindeps << " masters ("
-            << format_duration(learn_s) << "); mark-and-sweep kept "
-            << needed_eq_idx.size() << " of " << neqs << " equations\n";
-
-  // Consolidated Reduction Statistics（与数值路径一致）。
-  {
-    unsigned total = narrowing_success + narrowing_fail;
-    double ratio = total ? 100.0 * static_cast<double>(narrowing_success) / total
-                         : 0.0;
-    std::cout << "\n----------------- Reduction Statistics ------------------\n"
-              << "  Probe narrowing:  " << narrowing_success << "/" << narrowing_fail
-              << "/" << total << " (" << std::fixed << std::setprecision(1)
-              << ratio << " %)\n"
-              << "  Raw equations:    " << raw_equations_total << "\n"
-              << "  Global equations: " << global_equations_count << "\n"
-              << "  Final equations:  " << res.selected_equations << "\n"
-              << "  Masters:          " << nnindeps << "\n"
-              << "---------------------------------------------------------\n";
-  }
-
-  // 惰性回代链（目标 + 沿 bwd 依赖闭包的派生积分）。
   std::vector<uint32_t> bwd_chain;
+  bool use_forward = false;
   {
+    // The repair loop re-solves the subsystem at the learn sample point (same prime and
+    // same symbolic values as learn).
+    auto solve_at_learn = [&](const std::vector<uint32_t> &idx,
+                              secred::SubSolve &sub) {
+      std::vector<secred::ResEq> res_eqs;
+      std::vector<uint32_t> sys_idx;
+      eval_sym_eqs_mod(system, idx, learn_subs, learn_powers, learn_prime,
+                       res_eqs, sys_idx);
+      solve_res_eqs(res_eqs, sys_idx, learn_prime, sub);
+    };
+    GlobalSelection gsel =
+        select_global_forward(eq_index, fwd_deps, learn_solmap, dep_targets,
+                              master_index, solve_at_learn);
+    if (gsel.fallback) {
+      std::cerr << "finiteflow symbolic global reduction: forward selection did "
+                   "not converge, falling back to the legacy closure\n";
+    } else {
+      use_forward = true;
+      needed_eq_idx = std::move(gsel.needed_eq_idx);
+      bwd_chain = std::move(gsel.bwd_chain);
+    }
+  }
+  if (!use_forward) {
+    needed_eq_idx.reserve(needed.size());
+    for (uint32_t w : needed) {
+      auto it = eq_index.find(w);
+      if (it != eq_index.end())
+        needed_eq_idx.push_back(it->second);
+    }
+    std::sort(needed_eq_idx.begin(), needed_eq_idx.end());
+    // Lazy chain (targets plus the derived integrals in the backward dependency closure).
     std::unordered_set<uint32_t> chain_set(dep_targets.begin(),
                                            dep_targets.end());
     std::vector<uint32_t> stack(dep_targets.begin(), dep_targets.end());
@@ -939,27 +1076,54 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     std::sort(bwd_chain.begin(), bwd_chain.end());
   }
 
-  // 4) 构造算法 + FiniteFlow 多变量有理函数重建。
+  res.selected_equations = static_cast<std::uint64_t>(learn_solmap.size());
+  res.raw_equations = neqs;
+
+  {
+    secred::LearnSummary ls;
+    ls.independent_equations = res.selected_equations;
+    ls.masters = nnindeps;
+    ls.seconds = learn_s;
+    std::cout << "\n" << secred::format_learn_summary(ls);
+  }
+
+  write_masters_final(masters_final_path, all_integrals, masters);
+
+  // Consolidated Reduction Statistics (as in the numeric path): "Final
+  // equations" is what the mark-and-sweep keeps, i.e. what the reconstruction
+  // actually runs on.
+  {
+    secred::ReductionStats rs;
+    rs.narrowing_success = narrowing_success;
+    rs.narrowing_fail = narrowing_fail;
+    rs.raw_equations = raw_equations_total;
+    rs.global_equations = global_equations_count;
+    rs.final_equations = needed_eq_idx.size();
+    rs.masters = nnindeps;
+    std::cout << "\n" << secred::format_reduction_statistics(rs);
+  }
+
+  // 4) Build the algorithm and run FiniteFlow's multivariate rational reconstruction.
   std::vector<GiNaC::ex> symbol_ex;
   symbol_ex.reserve(nparams);
   for (const auto &s : symbols)
     symbol_ex.push_back(GiNaC::ex(s));
 
-  SymbolicPyRedAlgorithm alg(std::move(system), std::move(needed_eq_idx),
+  SymbolicFFRedAlgorithm alg(std::move(system), std::move(needed_eq_idx),
                              std::move(bwd_chain), dep_targets,
                              std::move(master_index), nnindeps,
                              std::move(symbol_ex));
 
   const unsigned nparsout = alg.nparsout;
-  std::cout << "[global finiteflow] reconstruct (rational-function, "
+  std::cout << "\n  " << secred::kFlowTag << " reconstruct (rational-function, "
             << nparsout << " outputs = " << nndeps << " targets x " << nnindeps
             << " masters)...\n";
 
   ff::ReconstructionOptions opt;
-  opt.max_primes = 5; // 系数重建 CRT 素数上限
+  opt.max_primes = 5; // CRT prime cap for the coefficient reconstruction
 
-  // 默认 shift（同 FiniteFlow interface 的 set_default_shift），避免多变量
-  // 有理函数在无 shift 的默认采样点触发 BAD_SHIFT。
+  // A default shift (as FiniteFlow's interface set_default_shift does) keeps a multivariate
+  // rational function from hitting BAD_SHIFT at the unshifted default sample points.
   std::unique_ptr<ff::UInt[]> shift(new ff::UInt[nparams]);
   {
     ff::Mod smod(ff::BIG_UINT_PRIMES[opt.start_mod]);
@@ -973,6 +1137,11 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
       new ff::RatFunVarDegrees[nparsout]);
   for (unsigned i = 0; i < nparsout; ++i)
     vdegs[i].resize(nparams);
+
+  // The degree estimation evaluates the system at `opt.start_mod` alone, and the
+  // evaluation reads the reduced coefficient tables, so reduce them for that prime
+  // first.  This also covers the var-degree pass below, which uses the same prime.
+  alg.reduce_for_prime(ff::BIG_UINT_PRIMES[opt.start_mod], nthreads);
 
   ff::Ret ret = ff::algorithm_get_degrees(alg, nullptr, nullptr, shift.get(),
                                           opt, numdeg.get(), dendeg.get());
@@ -999,35 +1168,133 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   sfun.append_to_vector(sample_points);
   ff::sort_by_mod(sample_points.data(),
                   sample_points.data() + sample_points.size(), nparams);
-  std::cout << "[global finiteflow] " << sample_points.size()
-            << " sample points to evaluate\n";
+  std::cout << "  " << secred::kFlowTag << " " << sample_points.size()
+            << " sample points to evaluate\n\n";
 
   ff::UIntCache cache;
   cache.init(nparams + 1);
   const auto t2 = std::chrono::steady_clock::now();
-  ff::evaluate_and_cache_samples(alg, nullptr, nullptr, sample_points.data(),
-                                 sample_points.data() + sample_points.size(),
-                                 cache);
+  {
+    // One cache and one scratch per thread; FiniteFlow's `merge_caches` folds the
+    // per-thread caches back into `cache` at the end.  The sample points are
+    // modulus-sorted, so one prime is a contiguous run: the coefficient tables are
+    // reduced for that run's prime (in parallel over the system) and the run is then
+    // evaluated in parallel.  Reducing per run rather than for every prime up front
+    // keeps one coefficient table in memory instead of one per prime.
+    secred::ProgressBar bar(std::string("  ") + secred::kFlowTag +
+                                " evaluating samples",
+                            sample_points.size(), secred::stdout_is_tty());
+    std::cout << bar.update(0) << std::flush;
+
+    std::vector<std::unique_ptr<ff::UIntCache>> part_caches(nthreads);
+    std::vector<std::unique_ptr<SymbolicFFScratch>> part_scratch(nthreads);
+    for (unsigned t = 0; t < nthreads; ++t) {
+      part_caches[t].reset(new ff::UIntCache);
+      part_caches[t]->init(nparams + 1);
+      part_scratch[t].reset(new SymbolicFFScratch);
+    }
+
+    std::atomic<std::size_t> done{0};
+    std::mutex done_mutex;
+    std::condition_variable done_cv;
+    std::vector<std::thread> workers;
+    const std::size_t npts = sample_points.size();
+    std::size_t run_begin = 0;
+    while (run_begin < npts) {
+      const uint64_t p = sample_points[run_begin].get()[nparams];
+      std::size_t run_end = run_begin + 1;
+      while (run_end < npts && sample_points[run_end].get()[nparams] == p)
+        ++run_end;
+
+      alg.reduce_for_prime(p, nthreads);
+
+      const std::size_t cnt = run_end - run_begin;
+      const unsigned nt =
+          static_cast<unsigned>(std::min<std::size_t>(nthreads, cnt));
+      workers.clear();
+      for (unsigned t = 0; t < nt; ++t) {
+        const std::size_t begin = run_begin + cnt * t / nt;
+        const std::size_t end = run_begin + cnt * (t + 1) / nt;
+        if (begin >= end)
+          continue;
+        workers.emplace_back([&, t, begin, end]() {
+          // A refused point is cached with `xout[0] = FAILED` by FiniteFlow itself, and
+          // `SampledRatFun::evaluate` turns that into a failed reconstruction, so a
+          // worker's failure needs no reporting here.
+          ff::evaluate_and_cache_samples(alg, part_scratch[t].get(), nullptr,
+                                         sample_points.data() + begin,
+                                         sample_points.data() + end,
+                                         *part_caches[t]);
+          {
+            std::lock_guard<std::mutex> lock(done_mutex);
+            done.fetch_add(end - begin, std::memory_order_relaxed);
+          }
+          done_cv.notify_one();
+        });
+      }
+      // The main thread reports progress while the workers evaluate.  The wait wakes on
+      // every completed worker, so joining costs nothing beyond the last one, and the
+      // bar throttles its own output.
+      {
+        std::unique_lock<std::mutex> lock(done_mutex);
+        while (done.load(std::memory_order_relaxed) < run_end) {
+          done_cv.wait_for(lock, std::chrono::milliseconds(100));
+          std::cout << bar.update(done.load(std::memory_order_relaxed)) << std::flush;
+        }
+      }
+      for (auto &w : workers)
+        w.join();
+      std::cout << bar.update(done.load(std::memory_order_relaxed)) << std::flush;
+      run_begin = run_end;
+    }
+
+    std::vector<std::unique_ptr<ff::UIntCache>> filled;
+    for (unsigned t = 0; t < nthreads; ++t)
+      if (part_caches[t] && part_caches[t]->size())
+        filled.push_back(std::move(part_caches[t]));
+    if (!filled.empty())
+      cache.merge_caches(filled.data(), filled.size());
+
+    std::cout << bar.finish() << std::flush;
+  }
   const auto t3 = std::chrono::steady_clock::now();
-  std::cout << "[global finiteflow] evaluated " << cache.size()
+  std::cout << "  " << secred::kFlowTag << " evaluated " << cache.size()
             << " sample points ("
-            << format_duration(std::chrono::duration<double>(t3 - t2).count())
+            << secred::format_duration(std::chrono::duration<double>(t3 - t2).count())
             << ")\n";
 
   std::unique_ptr<ff::MPReconstructedRatFun[]> recf(
       new ff::MPReconstructedRatFun[nparsout]);
-  for (unsigned idx = 0; idx < nparsout; ++idx) {
-    ret = ff::algorithm_reconstruct(cache, nparams, nparsout, idx, shift.get(),
+  {
+    // Each output is reconstructed on its own from the shared, read-only cache, so the
+    // loop over the outputs is split across threads.  The first failure stops the
+    // others: the run is abandoned either way.
+    std::atomic<unsigned> failure{nparsout};
+    std::atomic<unsigned> failure_ret{0};
+    std::mutex err_mutex;
+    parallel_for(nthreads, nparsout, [&](unsigned idx) {
+      if (failure.load(std::memory_order_relaxed) != nparsout)
+        return;
+      const ff::Ret r =
+          ff::algorithm_reconstruct(cache, nparams, nparsout, idx, shift.get(),
                                     opt, vdegs.get(), numdeg.get(), dendeg.get(),
                                     recf[idx]);
-    if (ret != ff::SUCCESS) {
+      if (r == ff::SUCCESS)
+        return;
+      std::lock_guard<std::mutex> lock(err_mutex);
+      if (failure.load() == nparsout) {
+        failure.store(idx);
+        failure_ret.store(r);
+      }
+    });
+    if (failure.load() != nparsout) {
       std::cerr << "finiteflow symbolic: reconstruction failed for output "
-                << idx << " (ret " << ret << ")\n";
+                << failure.load() << " (ret " << failure_ret.load() << ")\n";
       return res;
     }
   }
 
-  // 5) 组装输出。
+  // 5) Assemble the output.
   std::vector<std::string> varnames(nparams);
   for (unsigned i = 0; i < nparams; ++i)
     varnames[i] = symbols[i].get_name();
@@ -1046,21 +1313,23 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
       continue;
     auto dit = dep_index.find(it->second);
     if (dit == dep_index.end())
-      continue; // 目标本身是主积分
+      continue; // the target is itself a master
     unsigned i = dit->second;
     for (unsigned j = 0; j < nnindeps; ++j) {
       const ff::MPReconstructedRatFun &r = recf[(std::size_t)i * nnindeps + j];
       if (r.numerator().size() == 0)
-        continue; // 零系数
+        continue; // zero coefficient
       res.reductions.emplace_back(all_integrals[masters[j]],
                                   r.to_str(varnames.data()));
     }
   }
 
-  std::cout << "[timing] symbolic global learn: " << format_duration(learn_s)
-            << ", reconstruction: "
-            << format_duration(std::chrono::duration<double>(t3 - t2).count())
-            << "\n";
+  // As in the numeric path, the split is reported by the end-of-run Timing
+  // Statistics block.
+  res.phase_split = true;
+  res.learn_seconds = learn_s;
+  res.reconstruction_seconds =
+      std::chrono::duration<double>(t3 - t2).count();
 
   res.ok = true;
   return res;

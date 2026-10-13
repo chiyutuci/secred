@@ -27,7 +27,7 @@ public:
     s._id     = id;
     s._nprops = nprops;
     s._lines  = lines;
-    s._bound  = SeedBound::initial(BoundaryMode::Box, depth, rank);
+    s._bound  = SeedBound::initial(depth, rank);
     s._trivialsectors = trivials;
     return s;
   }
@@ -38,8 +38,8 @@ public:
   }
 
   // Proxy for the private static comparator.
-  static bool compare_complexity(const RawIntegral &a, const RawIntegral &b) {
-    return Sector::_compare_complexity(a, b);
+  static bool compare_balance(const RawIntegral &a, const RawIntegral &b) {
+    return Sector::_compare_balance(a, b);
   }
 
   // Proxy for the private subsector column ordering.
@@ -89,31 +89,12 @@ TEST(sectorconfig_defaults) {
   REQUIRE(cfg.cache_dir      == "cache");
   REQUIRE(cfg.subsector_filter_n == 1u);
   REQUIRE(cfg.ordering_mode == OrderingMode::Balance);
-  // 默认必须保持历史边界规则：depth / rank 两个独立的盒子边界。
-  REQUIRE(cfg.boundary_mode == BoundaryMode::Box);
-  // 默认必须保持历史行为：分 sector 阶段走 FiniteFlow 的 SparseLinearSolver。
-  REQUIRE(cfg.sector_elimination == SectorElimination::Fflow);
-}
-
-TEST(sectorconfig_sector_elimination_configurable) {
-  SectorConfig cfg;
-  cfg.sector_elimination = SectorElimination::Pyred;
-  REQUIRE(cfg.sector_elimination == SectorElimination::Pyred);
-  REQUIRE(cfg.sector_elimination != SectorElimination::Fflow);
 }
 
 TEST(sectorconfig_subsector_filter_n_configurable) {
   SectorConfig cfg;
   cfg.subsector_filter_n = 2;
   REQUIRE(cfg.subsector_filter_n == 2u);
-}
-
-TEST(sectorconfig_boundary_mode_configurable) {
-  SectorConfig cfg;
-  cfg.boundary_mode = BoundaryMode::Total;
-  REQUIRE(cfg.boundary_mode == BoundaryMode::Total);
-  // 必须是新键才改变行为：默认值仍是 Box。
-  REQUIRE(SectorConfig{}.boundary_mode == BoundaryMode::Box);
 }
 
 TEST(sectorconfig_custom_values) {
@@ -124,11 +105,11 @@ TEST(sectorconfig_custom_values) {
   REQUIRE(cfg.ordering_mode == OrderingMode::Normal);
 }
 
-TEST(sectorconfig_ordering_mode_complexity_configurable) {
+TEST(sectorconfig_ordering_mode_configurable) {
   SectorConfig cfg;
-  cfg.ordering_mode = OrderingMode::Complexity;
-  REQUIRE(cfg.ordering_mode == OrderingMode::Complexity);
-  // 必须是新键才改变行为：默认值仍是 Balance。
+  cfg.ordering_mode = OrderingMode::Normal;
+  REQUIRE(cfg.ordering_mode == OrderingMode::Normal);
+  // Setting the key is what changes the behaviour: the default stays Balance.
   REQUIRE(SectorConfig{}.ordering_mode == OrderingMode::Balance);
 }
 
@@ -759,12 +740,10 @@ TEST(select_dum_eq_three_equations_middle_wins) {
 
 TEST(ordering_mode_enum_values) {
   REQUIRE(OrderingMode::Normal != OrderingMode::Balance);
-  REQUIRE(OrderingMode::Balance != OrderingMode::Complexity);
-  REQUIRE(OrderingMode::Normal != OrderingMode::Complexity);
 }
 
 // ---------------------------------------------------------------------------
-// RawIntegral::maxpos / maxneg — the two fine keys of OrderingMode::Complexity
+// RawIntegral::maxpos / maxneg — the two fine keys of OrderingMode::Balance
 // ---------------------------------------------------------------------------
 
 TEST(raw_integral_maxpos_returns_largest_denominator_power) {
@@ -790,24 +769,24 @@ TEST(raw_integral_maxnum_key_is_negated_maxneg) {
 }
 
 // ---------------------------------------------------------------------------
-// _compare_complexity — key priority
+// _compare_balance — key priority
 // ---------------------------------------------------------------------------
 
-TEST(compare_complexity_total_power_is_first_key) {
+TEST(compare_balance_total_power_is_first_key) {
   // [1,-3]: depth 1, rank 3 → total 4.  [2,0]: depth 2, rank 0 → total 2.
   // The total power decides before depth, so the shallower-but-longer integral
   // is NOT the smaller one here.
-  REQUIRE(SectorTestHelper::compare_complexity(RI({2, 0}), RI({1, -3})));
-  REQUIRE(!SectorTestHelper::compare_complexity(RI({1, -3}), RI({2, 0})));
+  REQUIRE(SectorTestHelper::compare_balance(RI({2, 0}), RI({1, -3})));
+  REQUIRE(!SectorTestHelper::compare_balance(RI({1, -3}), RI({2, 0})));
 }
 
-TEST(compare_complexity_depth_breaks_total_power_ties) {
+TEST(compare_balance_depth_breaks_total_power_ties) {
   // [3,0] and [1,-2] both have total power 3; the smaller depth wins.
-  REQUIRE(SectorTestHelper::compare_complexity(RI({1, -2}), RI({3, 0})));
-  REQUIRE(!SectorTestHelper::compare_complexity(RI({3, 0}), RI({1, -2})));
+  REQUIRE(SectorTestHelper::compare_balance(RI({1, -2}), RI({3, 0})));
+  REQUIRE(!SectorTestHelper::compare_balance(RI({3, 0}), RI({1, -2})));
 }
 
-TEST(compare_complexity_rank_never_decides) {
+TEST(compare_balance_rank_never_decides) {
   // rank = total - depth, so two integrals that tie on the first two keys
   // necessarily tie on rank as well: the third key can never break a tie.  This
   // pair ties on all three (total 3, depth 2, rank 1) and is decided by the
@@ -817,26 +796,26 @@ TEST(compare_complexity_rank_never_decides) {
   REQUIRE(a.depth() + a.rank() == b.depth() + b.rank());
   REQUIRE(a.depth() == b.depth());
   REQUIRE(a.rank() == b.rank());
-  REQUIRE(SectorTestHelper::compare_complexity(b, a));
+  REQUIRE(SectorTestHelper::compare_balance(b, a));
 }
 
-TEST(compare_complexity_max_denominator_is_fourth_key) {
+TEST(compare_balance_max_denominator_is_fourth_key) {
   // [2,-1,0] and [1,1,-1] both have depth 2, rank 1, total 3; the one whose
   // largest denominator power is smaller comes first.
-  REQUIRE(SectorTestHelper::compare_complexity(RI({1, 1, -1}), RI({2, -1, 0})));
-  REQUIRE(!SectorTestHelper::compare_complexity(RI({2, -1, 0}), RI({1, 1, -1})));
+  REQUIRE(SectorTestHelper::compare_balance(RI({1, 1, -1}), RI({2, -1, 0})));
+  REQUIRE(!SectorTestHelper::compare_balance(RI({2, -1, 0}), RI({1, 1, -1})));
 }
 
-TEST(compare_complexity_max_numerator_is_last_key) {
+TEST(compare_balance_max_numerator_is_last_key) {
   // [2,-3,0,0] and [2,-1,-1,-1]: depth 2, rank 3, total 5, max denominator 2 —
   // they differ only in the largest numerator power (3 vs 1).
-  REQUIRE(SectorTestHelper::compare_complexity(RI({2, -1, -1, -1}),
+  REQUIRE(SectorTestHelper::compare_balance(RI({2, -1, -1, -1}),
                                                RI({2, -3, 0, 0})));
-  REQUIRE(!SectorTestHelper::compare_complexity(RI({2, -3, 0, 0}),
+  REQUIRE(!SectorTestHelper::compare_balance(RI({2, -3, 0, 0}),
                                                 RI({2, -1, -1, -1})));
 }
 
-TEST(compare_complexity_denominator_key_outranks_numerator_key) {
+TEST(compare_balance_denominator_key_outranks_numerator_key) {
   // The two keys above are tested in isolation; this pair pins down their
   // RELATIVE priority — the two keys point opposite ways, so a comparator that
   // consulted the numerator power before the denominator power would order this
@@ -851,51 +830,51 @@ TEST(compare_complexity_denominator_key_outranks_numerator_key) {
   REQUIRE(a.maxpos() == 2 && b.maxpos() == 1);
   REQUIRE(-a.maxneg() == 1 && -b.maxneg() == 2);
   // denominator power decides first → the smaller one (b) comes first
-  REQUIRE(SectorTestHelper::compare_complexity(b, a));
-  REQUIRE(!SectorTestHelper::compare_complexity(a, b));
+  REQUIRE(SectorTestHelper::compare_balance(b, a));
+  REQUIRE(!SectorTestHelper::compare_balance(a, b));
 }
 
-TEST(compare_complexity_is_strict_weak_ordering_on_ties) {
+TEST(compare_balance_is_strict_weak_ordering_on_ties) {
   // Two distinct integrals with identical keys: neither is less than the other.
   RawIntegral a = RI({1, 1, -1, 0});
   RawIntegral b = RI({1, 1, 0, -1});
-  REQUIRE(!SectorTestHelper::compare_complexity(a, b));
-  REQUIRE(!SectorTestHelper::compare_complexity(b, a));
-  REQUIRE(!SectorTestHelper::compare_complexity(a, a));
+  REQUIRE(!SectorTestHelper::compare_balance(a, b));
+  REQUIRE(!SectorTestHelper::compare_balance(b, a));
+  REQUIRE(!SectorTestHelper::compare_balance(a, a));
 }
 
 // ---------------------------------------------------------------------------
 // _order_subintegrals — the subsector column order
 // ---------------------------------------------------------------------------
 
-TEST(order_subintegrals_complexity_puts_largest_key_in_smallest_column) {
+TEST(order_subintegrals_balance_puts_largest_key_in_smallest_column) {
   // Column nvars+j: index 0 gets the smallest subsector column, so the vector
   // must come back in DESCENDING key order.
   std::vector<RawIntegral> in = {RI({2, -1, 0}), RI({1, 0, 0}), RI({1, 1, -1})};
-  auto out = SectorTestHelper::order_subintegrals(in, OrderingMode::Complexity);
+  auto out = SectorTestHelper::order_subintegrals(in, OrderingMode::Balance);
   REQUIRE(out.size() == 3u);
   REQUIRE(out[0] == RI({2, -1, 0}));   // total 3, depth 2, max pos 2
   REQUIRE(out[1] == RI({1, 1, -1}));   // total 3, depth 2, max pos 1
   REQUIRE(out[2] == RI({1, 0, 0}));    // total 1
 }
 
-TEST(order_subintegrals_non_complexity_modes_keep_canonical_order) {
-  // Balance and Normal order subsector integrals by the canonical per-index
-  // comparator — the new key must not leak into them.
+TEST(order_subintegrals_normal_keeps_canonical_order) {
+  // Normal orders subsector integrals by the canonical per-index comparator —
+  // the balance key must not leak into it.
   std::vector<RawIntegral> in = {RI({2, -1, 0}), RI({1, 0, 0}), RI({1, 1, -1})};
   auto bal = SectorTestHelper::order_subintegrals(in, OrderingMode::Balance);
   auto nor = SectorTestHelper::order_subintegrals(in, OrderingMode::Normal);
-  // canonical: depth ASC, rank ASC, then sector ASC → [1,0,0], [2,-1,0], [1,1,-1]
-  REQUIRE(bal[0] == RI({1, 1, -1}));
-  REQUIRE(bal[1] == RI({2, -1, 0}));
-  REQUIRE(bal[2] == RI({1, 0, 0}));
-  REQUIRE(nor == bal);
-  // ... and it differs from the Complexity order on this very input.
-  auto cmp = SectorTestHelper::order_subintegrals(in, OrderingMode::Complexity);
-  REQUIRE(bal != cmp);
+  // canonical: depth ASC, rank ASC, then sector ASC → no reverse of that sort
+  // is applied for Normal, so the vector comes back most-complex-first as
+  // [1,1,-1], [2,-1,0], [1,0,0].
+  REQUIRE(nor[0] == RI({1, 1, -1}));
+  REQUIRE(nor[1] == RI({2, -1, 0}));
+  REQUIRE(nor[2] == RI({1, 0, 0}));
+  // ... and the balance order differs from it on this very input.
+  REQUIRE(bal != nor);
 }
 
-TEST(order_subintegrals_complexity_ties_mirror_input_order) {
+TEST(order_subintegrals_balance_ties_mirror_input_order) {
   // Every one of the 24 integrals is a permutation of the same multiset, so all
   // five keys are identical for all of them: the stable sort must keep the
   // incoming order, and the final reverse must therefore mirror it exactly.
@@ -915,10 +894,10 @@ TEST(order_subintegrals_complexity_ties_mirror_input_order) {
     REQUIRE(x.rank() == 8u);
     REQUIRE(x.maxpos() == 4);
     REQUIRE(-x.maxneg() == 4);
-    REQUIRE(!SectorTestHelper::compare_complexity(x, in[0]));
-    REQUIRE(!SectorTestHelper::compare_complexity(in[0], x));
+    REQUIRE(!SectorTestHelper::compare_balance(x, in[0]));
+    REQUIRE(!SectorTestHelper::compare_balance(in[0], x));
   }
-  auto out = SectorTestHelper::order_subintegrals(in, OrderingMode::Complexity);
+  auto out = SectorTestHelper::order_subintegrals(in, OrderingMode::Balance);
   REQUIRE(out.size() == in.size());
   for (unsigned i = 0; i < in.size(); ++i)
     REQUIRE(out[i] == in[in.size() - 1 - i]);
@@ -941,14 +920,14 @@ TEST(seeds_normal_mode_preserves_generation_order) {
   REQUIRE(seeds[0][1] == 0);
 }
 
-// Complexity mode: seeds ordered by (depth+rank ASC, depth ASC, rank ASC,
+// Balance mode: seeds ordered by (depth+rank ASC, depth ASC, rank ASC,
 // max_denominator ASC, max_numerator ASC).
-TEST(seeds_complexity_mode_total_power_first) {
+TEST(seeds_balance_mode_total_power_first) {
   // One active line, one zero line, box depth 3 rank 2 → 9 seeds whose keys
-  // differ enough to separate this mode from both Normal and Balance.
+  // differ enough to separate this mode from Normal.
   std::vector<bool> lines = {true, false};
   Sector s = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
-  SectorTestHelper::generate_seeds(s, OrderingMode::Complexity);
+  SectorTestHelper::generate_seeds(s, OrderingMode::Balance);
   const auto &seeds = SectorTestHelper::seeds(s);
   REQUIRE(seeds.size() == 9u);
   // total power 1 → [1,0]; total 2 → [1,-1] (depth 1) before [2,0] (depth 2);
@@ -969,31 +948,25 @@ TEST(seeds_complexity_mode_total_power_first) {
     REQUIRE(w.at(seeds[i]) == i);
 }
 
-TEST(seeds_complexity_mode_differs_from_normal_and_balance) {
-  // On this one-line sector Normal and Balance coincide: the generation order is
-  // already (excess depth, rank)-major, and within a fixed excess depth and rank
-  // the largest active power is constant, so Balance's third key never fires.
-  // Complexity interleaves the two axes by their sum instead, so [2,0] (total 2)
-  // overtakes [1,-2] (total 3).
+TEST(seeds_balance_mode_differs_from_normal) {
+  // On this one-line sector the generation order is already (excess depth,
+  // rank)-major, so Normal's [1,-2] (total 3) sits ahead of [2,0] (total 2);
+  // Balance interleaves the two axes by their sum and swaps the two.
   std::vector<bool> lines = {true, false};
   Sector sn = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
   Sector sb = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
-  Sector sc = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
   SectorTestHelper::generate_seeds(sn, OrderingMode::Normal);
   SectorTestHelper::generate_seeds(sb, OrderingMode::Balance);
-  SectorTestHelper::generate_seeds(sc, OrderingMode::Complexity);
   const auto &n = SectorTestHelper::seeds(sn);
   const auto &b = SectorTestHelper::seeds(sb);
-  const auto &c = SectorTestHelper::seeds(sc);
-  REQUIRE(n == b);
   REQUIRE(n[2] == RI({1, -2}));
-  REQUIRE(c[2] == RI({2, 0}));
-  REQUIRE(c != n);
-  REQUIRE(c != b);
+  REQUIRE(b[2] == RI({2, 0}));
+  REQUIRE(b != n);
 }
 
-// Balance mode: seeds ordered by (excess_depth ASC, rank ASC, max_power ASC).
-TEST(seeds_balance_mode_excess_depth_first) {
+TEST(seeds_balance_mode_keeps_the_simplest_seed_first) {
+  // A two-line sector: the simplest seed is the base integral [1,1] (total 2),
+  // which the balance key puts first.
   std::vector<bool> lines = {true, true};
   Sector s = SectorTestHelper::make_sector(3, 2, lines, 3, 1);
   SectorTestHelper::generate_seeds(s, OrderingMode::Balance);
@@ -1186,80 +1159,52 @@ TEST(initial_seed_bounds_excess_depth_is_zero_only_for_base_layer_box) {
 }
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// SeedBound — the seed-boundary rule behind settings.boundary_mode
+// SeedBound — the seed-boundary rule: a depth/rank box with a total-power cap
 // ---------------------------------------------------------------------------
 
-TEST(seedbound_box_is_the_legacy_rule) {
-  // Box mode: two independent strict bounds, exactly as before the option
-  // existed (limit is Total-only and stays 0 here).  RI({+d, -r}) is depth d,
-  // rank r.
-  SeedBound b = SeedBound::initial(BoundaryMode::Box, 5, 4);
-  REQUIRE(b.mode  == BoundaryMode::Box);
+TEST(seedbound_initial_builds_the_box_and_the_cap) {
+  // initial() takes the box from initial_seed_bounds and puts the cap at the top
+  // of the box's total-power range (limit == depth + rank), so the strict total
+  // comparison cuts nothing the two hard caps do not already cut.
+  // RI({+d, -r}) is depth d, rank r.
+  SeedBound b = SeedBound::initial(5, 4);
   REQUIRE(b.depth == 5u);
   REQUIRE(b.rank  == 4u);
-  REQUIRE(b.limit == 0u);            // not used in Box mode
-  REQUIRE(b.boundary() == 5u);       // the depth bound is the boundary here
-  REQUIRE(b.quantity(RI({3, -2})) == 3u);
-  REQUIRE(b.admits(RI({4, -3})));
+  REQUIRE(b.limit == 9u);            // = depth + rank
+  REQUIRE(b.boundary() == 9u);
+  REQUIRE(b.quantity(RI({3, -2})) == 5u);   // depth + rank, not depth
+  REQUIRE(b.seed_top() == 7);        // the box corner depth + rank - 2
+  REQUIRE(b.admits(RI({4, -3})));    // total 7, the box corner itself
   REQUIRE(!b.admits(RI({5, -3})));   // depth cap
   REQUIRE(!b.admits(RI({3, -4})));   // rank cap
-  REQUIRE(b.exceeded(RI({5, 0})));
+  REQUIRE(b.exceeded(RI({5, 0})));   // past the depth cap
   REQUIRE(!b.exceeded(RI({4, 0})));
-  // The criterion is one-sided and depth-only here: a seed the rank cap refuses
-  // but whose depth is inside the box is NOT reported, because the Box-mode repair
-  // grows the depth bound and would not admit it.  Those are the wide, shallow
-  // "outer" integrals a sector hands on as masters.
-  REQUIRE(!b.exceeded(RI({4, -4})));
-  REQUIRE(!b.admits(RI({4, -4})));
+  REQUIRE(b.exceeded(RI({4, -4})));  // total 8, past the box top
 }
 
-TEST(seedbound_box_admits_matches_the_literal_old_expression) {
-  // Box mode must be provably the old conjunction, over a grid of integrals.
-  SeedBound b = SeedBound::initial(BoundaryMode::Box, 4, 3);
+TEST(seedbound_admission_is_the_box_cut_by_the_cap) {
+  // Over a grid: a seed is admitted iff both hard caps pass and its total power
+  // stays under the cap.  With the cap at depth + rank the third clause never
+  // binds, so the admitted set is the box alone.
+  SeedBound b = SeedBound::initial(4, 3);
   for (unsigned d = 0; d <= 6; ++d)
     for (unsigned r = 0; r <= 5; ++r)
-      REQUIRE(b.admits(RI({(int)d, -(int)r})) == (d < 4u && r < 3u));
+      REQUIRE(b.admits(RI({(int)d, -(int)r})) == (d < 4u && r < 3u && d + r < 7u));
+  // ... and the clause does bite once the cap is lowered into the box.
+  SeedBound cut = b;
+  cut.limit = 4;
+  REQUIRE(!cut.admits(RI({3, -1})));   // total 4, at the cap
+  REQUIRE(cut.admits(RI({2, -1})));    // total 3, under it
 }
 
-TEST(seedbound_box_filter_is_the_legacy_rule) {
-  // The subsector filter drops an integral whose depth is more than n below the
-  // boundary -- the shallow ones -- and keeps the ones at or past boundary - n.
-  // Box mode must be the literal historical `depth < depthBound - n` over a
-  // grid: inverting the comparison silently rebuilds every sector's system
-  // (the smoke test moved from 480/128 to 1167/377 equations when it happened).
-  SeedBound b = SeedBound::initial(BoundaryMode::Box, 4, 3);
-  for (unsigned d = 0; d <= 6; ++d)
-    for (unsigned n = 0; n <= 5; ++n)
-      REQUIRE(b.filter_drops(RI({(int)d, 0}), n) == ((int)d < 4 - (int)n));
-}
-
-TEST(seedbound_filter_direction_is_boundary_relative) {
-  // Depth 1 / rank 1, n = 1: the boundary is 2, so only depth >= 1 survives --
-  // the integral below it is dropped, the one on the boundary is kept.
-  SeedBound b = SeedBound::initial(BoundaryMode::Box, 2, 2);
-  REQUIRE(b.filter_drops(RI({0, -1}), 1));
-  REQUIRE(!b.filter_drops(RI({1, 0}), 1));
-  REQUIRE(!b.filter_drops(RI({3, 0}), 1));
-  // n = 0 drops nothing at or above the boundary but everything below it.
-  REQUIRE(!b.filter_drops(RI({2, 0}), 0));
-  REQUIRE(b.filter_drops(RI({1, 0}), 0));
-  // The subtraction is signed (the old code cast both operands too): a boundary
-  // below n must not wrap around into "drop everything" -- with n past the
-  // boundary nothing is far enough below it to be dropped.
-  SeedBound tiny = SeedBound::initial(BoundaryMode::Box, 1, 1);
-  REQUIRE(!tiny.filter_drops(RI({0, 0}), 3));
-  REQUIRE(!tiny.filter_drops(RI({5, 0}), 3));
-}
-
-TEST(seedbound_total_filter_counts_from_the_seed_box_top) {
-  // Total mode: box (6, 5) at its initial cap (11 = depth + rank) admits seeds up
-  // to total power 9 -- the box corner -- so the filter's reference is 9, not the
-  // cap 11.  At n = 1 it keeps the top layer of what the seeds can generate
-  // (total power >= 9); at n = 0 it keeps nothing at all, because no subsector
-  // integral a seed generates reaches past that layer.  An integral below the top
-  // layer is dropped even though its depth is large.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);
+TEST(seedbound_filter_counts_from_the_seed_box_top) {
+  // Box (6, 5) at its initial cap (11 = depth + rank) admits seeds up to total
+  // power 9 -- the box corner -- so the filter's reference is 9, not the cap 11.
+  // At n = 1 it keeps the top layer of what the seeds can generate (total power
+  // >= 9); at n = 0 it keeps nothing at all, because no subsector integral a seed
+  // generates reaches past that layer.  An integral below the top layer is dropped
+  // even though its depth is large.
+  SeedBound b = SeedBound::initial(6, 5);
   REQUIRE(b.boundary() == 11u);
   REQUIRE(b.seed_top() == 9);
   REQUIRE(!b.filter_drops(RI({5, -5}), 1));   // total 10, past the top layer
@@ -1276,9 +1221,9 @@ TEST(seedbound_total_filter_counts_from_the_seed_box_top) {
   // end) -- nothing generates such an integral here, but the rule is one-sided.
   REQUIRE(!b.filter_drops(RI({5, -5}), 0));   // total 10
   REQUIRE(!b.filter_drops(RI({6, -5}), 0));   // total 11
-  // The subtraction is signed here too: a reference below n must not wrap around
-  // into "drop everything" (Box mode's guard, in the total-power quantity).
-  SeedBound tiny = SeedBound::initial(BoundaryMode::Total, 1, 0);
+  // The subtraction is signed: a reference below n must not wrap around into
+  // "drop everything" -- with n past the reference nothing is far enough below it.
+  SeedBound tiny = SeedBound::initial(1, 0);
   REQUIRE(tiny.boundary() == 1u);
   REQUIRE(!tiny.filter_drops(RI({0, 0}), 3));
   REQUIRE(!tiny.filter_drops(RI({5, 0}), 3));
@@ -1286,11 +1231,11 @@ TEST(seedbound_total_filter_counts_from_the_seed_box_top) {
 
 TEST(seedbound_filter_reference_is_the_seed_box_not_the_cap) {
   // The filter counts layers from the admitted seeds, not from the cap: a cap
-  // biting into the box (the corner-cut generation) lowers the reference to the
-  // corner it leaves, so n = 1 there reads exactly like n = 2 does from the box top
-  // the cap originally sat above.  The +1 cap, which bites the corner exactly,
-  // still leaves the top layer where the box put it.
-  SeedBound top = SeedBound::initial(BoundaryMode::Total, 6, 5);  // cap 11
+  // biting into the box lowers the reference to the corner it leaves, so n = 1
+  // there reads exactly like n = 2 does from the box top the cap originally sat
+  // above.  The +1 cap, which bites the corner exactly, still leaves the top layer
+  // where the box put it.
+  SeedBound top = SeedBound::initial(6, 5);  // cap 11
   REQUIRE(top.seed_top() == 9);
   SeedBound cut = top;
   cut.limit = 9;                           // depth + rank - 2: cuts the corner
@@ -1304,8 +1249,8 @@ TEST(seedbound_filter_reference_is_the_seed_box_not_the_cap) {
     REQUIRE(plus1.filter_drops(depthOnly, 1) == top.filter_drops(depthOnly, 1));
   }
   // A widening instead raises the reference by one layer -- it grows the box, and
-  // in Total mode the cap rides at its top -- so n keeps its meaning as a distance
-  // below the top: n = 1 keeps the top layer wherever the top now is.
+  // the cap rides at its top -- so n keeps its meaning as a distance below the
+  // top: n = 1 keeps the top layer wherever the top now is.
   SeedBound widened = top;
   widened.widen_depth();                   // box (7, 5), cap 12
   REQUIRE(widened.seed_top() == top.seed_top() + 1);
@@ -1313,35 +1258,15 @@ TEST(seedbound_filter_reference_is_the_seed_box_not_the_cap) {
     REQUIRE(widened.filter_drops(RI({t, 0}), 1) == (t < widened.seed_top()));
 }
 
-TEST(seedbound_total_admission_equals_box_admission) {
-  // The deepest seed the hard caps admit is (depth - 1, rank - 1) = (5, 4),
-  // total 9, and the strict total comparison needs the cap above it, so that
-  // seed is admitted and the cap cuts nothing.  Total-mode admission must
-  // therefore equal Box-mode admission over every integral.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);
-  SeedBound box = SeedBound::initial(BoundaryMode::Box, 6, 5);
-  REQUIRE(b.depth == 6u);    // deepest admitted seed depth 5, strict bound
-  REQUIRE(b.rank  == 5u);    // deepest admitted seed rank 4, strict bound
-  REQUIRE(b.limit == 11u);   // = depth + rank, the top of the box's total-power range
-  REQUIRE(b.quantity(RI({3, -2})) == 5u);   // depth + rank, not depth
-  REQUIRE(b.admits(RI({5, -3})));           // total 8, inside
-  REQUIRE(b.admits(RI({5, -4})));           // total 9 = the deepest admitted seed
-  REQUIRE(!b.exceeded(RI({5, -4})));        // and not "outside" either
-  for (unsigned d = 0; d <= 8; ++d)
-    for (unsigned r = 0; r <= 7; ++r)
-      REQUIRE(b.admits(RI({(int)d, -(int)r})) ==
-              box.admits(RI({(int)d, -(int)r})));
-}
-
-TEST(seedbound_total_probe_criterion_is_the_box_top) {
+TEST(seedbound_probe_criterion_is_the_box_top) {
   // The probe's "outside" test reads the seed box, in total power.  Starting at
   // the cap initial() builds (limit == depth + rank) the seeds past the box top
   // (total 9 for a box (6, 5)) are exactly the ones the hard caps reject: the two
-  // shells at total 10 and the corner at 11.  The pre-fix criterion compared
-  // against the cap (11) instead, which only the corner reaches -- so a sector
-  // whose reduction needed one of the shells kept it as a master with no report.
-  // refusal() says which cap refuses each of them, and the widening admits it.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);
+  // shells at total 10 and the corner at 11.  Comparing against the cap (11)
+  // instead would only ever report the corner -- a sector whose reduction needed
+  // one of the shells would keep it as a master with no report.  refusal() says
+  // which cap refuses each of them, and the widening admits it.
+  SeedBound b = SeedBound::initial(6, 5);
   REQUIRE(b.seed_top() == 9);
   REQUIRE(!b.exceeded(RI({5, -4})));  // total 9, deepest seed the caps admit
   REQUIRE(b.exceeded(RI({5, -5})));   // total 10, box shell (rank)
@@ -1358,13 +1283,13 @@ TEST(seedbound_total_probe_criterion_is_the_box_top) {
   REQUIRE(b.admits(RI({6, -5})));
 }
 
-TEST(seedbound_total_keeps_the_caps_hard) {
+TEST(seedbound_keeps_the_caps_hard) {
   // Widening one hard bound never lets an integral out of the box through the
   // other: (3, 5) has total 8, passes the cap comfortably and is refused by the
-  // rank cap, and a depth widening -- the only repair a Total-mode depth refusal
-  // asks for -- leaves that refusal standing.  (The probe reads this: the seed is
-  // inside the box top, so it is not reported at all.)
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);
+  // rank cap, and a depth widening -- the repair a depth refusal asks for --
+  // leaves that refusal standing.  (The probe reads this: the seed is inside the
+  // box top, so it is not reported at all.)
+  SeedBound b = SeedBound::initial(6, 5);
   REQUIRE(b.quantity(RI({3, -5})) == 8u);
   REQUIRE(!b.exceeded(RI({3, -5})));
   REQUIRE(!b.admits(RI({3, -5})));
@@ -1374,45 +1299,35 @@ TEST(seedbound_total_keeps_the_caps_hard) {
   REQUIRE(b.admits(RI({6, 0})));    // while the widened depth admits this one
 }
 
-TEST(seedbound_widen_undoes_the_narrowing_only) {
-  // Box: the widening raises the depth bound (the historical repair) and thereby
-  // admits the layer just outside it, leaving the rank bound alone.
-  SeedBound box = SeedBound::initial(BoundaryMode::Box, 5, 4);
-  REQUIRE(!box.admits(RI({5, -3})));
-  box.widen_depth();
-  REQUIRE(box.depth == 6u);
-  REQUIRE(box.rank  == 4u);
-  REQUIRE(box.admits(RI({5, -3})));
-
-  // Total: the same widening, with the cap riding at the top of the box, so the
-  // admitted set stays exactly the Box-mode one and the cap keeps admitting
-  // nothing the hard caps reject.
-  SeedBound tot = SeedBound::initial(BoundaryMode::Total, 6, 5);
-  tot.widen_depth();
-  REQUIRE(tot.depth == 7u);
-  REQUIRE(tot.rank  == 5u);
-  REQUIRE(tot.limit == 12u);          // = depth + rank: the top of the new box
-  SeedBound boxSame = SeedBound::initial(BoundaryMode::Box, 7, 5);
+TEST(seedbound_widen_admits_one_more_layer) {
+  // The widening raises the depth bound and carries the cap to the top of the new
+  // box, so the admitted set grows by exactly the layer just outside the old box.
+  SeedBound b = SeedBound::initial(6, 5);
+  REQUIRE(!b.admits(RI({6, -4})));
+  b.widen_depth();
+  REQUIRE(b.depth == 7u);
+  REQUIRE(b.rank  == 5u);
+  REQUIRE(b.limit == 12u);          // = depth + rank: the top of the new box
+  REQUIRE(b.admits(RI({6, -4})));
   for (unsigned d = 0; d <= 8; ++d)
     for (unsigned r = 0; r <= 7; ++r)
-      REQUIRE(tot.admits(RI({(int)d, -(int)r})) ==
-              boxSame.admits(RI({(int)d, -(int)r})));
-  tot.widen_rank();
-  REQUIRE(tot.rank  == 6u);
-  REQUIRE(tot.limit == 13u);          // and the cap follows it up
+      REQUIRE(b.admits(RI({(int)d, -(int)r})) == (d < 7u && r < 5u));
+  b.widen_rank();
+  REQUIRE(b.rank  == 6u);
+  REQUIRE(b.limit == 13u);          // and the cap follows it up
 }
 
 TEST(seedbound_widens_the_box_a_master_sits_above) {
   // The failure the criterion exists for, on the case that reported it: box.yaml's
-  // sector12 under boundary_mode: total with subsector_filter_n: 0.  Its targets
-  // [0, 0, 1, 2] and [0, 0, 2, 1] give a box of depth 3, rank 1 -- the sector's four
-  // propagators are two lines, so popcount(0b1100) = 2 and the deepest target
-  // (depth 3) asks for one layer above itself -- and the master the reduction was
-  // left with is [0, 0, 1, 2], depth 3, rank 0, total 3.  The box top is 2, so the
-  // pre-fix criterion (against the cap, 4) never fired and the sector kept the
-  // master.  The probe reports it now, and one widening admits it: box (4, 1), cap
-  // 5, seeds up to total 3.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 3, 1);
+  // sector12 with subsector_filter_n: 0.  Its targets [0, 0, 1, 2] and
+  // [0, 0, 2, 1] give a box of depth 3, rank 1 -- the sector's four propagators are
+  // two lines, so popcount(0b1100) = 2 and the deepest target (depth 3) asks for one
+  // layer above itself -- and the master the reduction was left with is
+  // [0, 0, 1, 2], depth 3, rank 0, total 3.  The box top is 2, so a criterion
+  // against the cap (4) never fires and the sector keeps the master.  The probe
+  // reports it now, and one widening admits it: box (4, 1), cap 5, seeds up to
+  // total 3.
+  SeedBound b = SeedBound::initial(3, 1);
   REQUIRE(b.limit == 4u);
   REQUIRE(b.seed_top() == 2);
   RawIntegral master = RI({0, 0, 1, 2});
@@ -1428,18 +1343,16 @@ TEST(seedbound_widens_the_box_a_master_sits_above) {
   REQUIRE(b.admits(master));
 }
 
-TEST(seedbound_total_deep_low_rank_seed_is_reported) {
+TEST(seedbound_deep_low_rank_seed_is_reported) {
   // The second half of the criterion, on the case that reported it: F234's sector
-  // 246 under boundary_mode: total.  Its seed box is (7, 5), so the initial cap is
-  // 12 and seed_top() is 10 -- a high rank figure lifts the box top three layers
-  // above the depth cap -- and the seed the reduction was left with is
-  // [0,1,2,0,1,1,1,1,0]: depth 7, rank 0, total 7.  admits() refuses it on the
-  // depth (7 >= 7), so it generates no equation and stays a master, while the
-  // total-power half of the criterion stays silent (7 is not past 10).  Box mode,
-  // which counts the depth alone, reported that seed and widened; Total mode did
-  // not, and kept the master -- the +1 the global master list showed against box
-  // mode (375 against 374, sector 246 the only sector that differed).
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 7, 5);
+  // 246.  Its seed box is (7, 5), so the initial cap is 12 and seed_top() is 10 --
+  // a high rank figure lifts the box top three layers above the depth cap -- and the
+  // seed the reduction was left with is [0,1,2,0,1,1,1,1,0]: depth 7, rank 0,
+  // total 7.  admits() refuses it on the depth (7 >= 7), so it generates no
+  // equation and stays a master, while the total-power half of the criterion stays
+  // silent (7 is not past 10).  Counting the depth alone instead would have
+  // reported that seed and widened.
+  SeedBound b = SeedBound::initial(7, 5);
   REQUIRE(b.limit == 12u);
   REQUIRE(b.seed_top() == 10);
   RawIntegral master = RI({0, 1, 2, 0, 1, 1, 1, 1, 0});
@@ -1465,7 +1378,7 @@ TEST(seedbound_total_deep_low_rank_seed_is_reported) {
   // (depth + rank = 12) and the new corner (7, 4) has total 11, so the deepened box
   // admits exactly what the carrying repair would -- the two differ only from the
   // second layer on, where the corner reaches the cap.
-  SeedBound rect = SeedBound::initial(BoundaryMode::Total, 7, 5);
+  SeedBound rect = SeedBound::initial(7, 5);
   rect.widen_depth();                   // the carrying repair, for comparison
   REQUIRE(rect.limit == 13u);
   REQUIRE(rect.seed_top() == 11);       // the same reference, from the box top
@@ -1486,12 +1399,12 @@ TEST(seedbound_total_deep_low_rank_seed_is_reported) {
   REQUIRE(rect.admits(RI({8, -4})));
 }
 
-TEST(seedbound_total_past_top_still_carries_the_cap) {
+TEST(seedbound_past_top_still_carries_the_cap) {
   // A report the *box top* makes asks for the rectangle (bit 4): the depth
-  // widening carries the cap, so the admitted set stays the Box-mode one.  Both
-  // halves can fire for the same seed, and then the box top wins -- nothing about
-  // a seed past the top is fixed by deepening the box alone.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 7, 5);
+  // widening carries the cap.  Both halves can fire for the same seed, and then
+  // the box top wins -- nothing about a seed past the top is fixed by deepening
+  // the box alone.
+  SeedBound b = SeedBound::initial(7, 5);
   RawIntegral rankShell = RI({6, -5});  // depth 6, rank 5, total 11 > top 10
   REQUIRE(b.quantity(rankShell) == 11u);
   REQUIRE(b.past_top(rankShell));
@@ -1510,97 +1423,80 @@ TEST(seedbound_total_past_top_still_carries_the_cap) {
   // same: the two repairs first differ only at the layer where the box corner
   // reaches the cap (see the test above).  The box top at 12 also lifts, since the
   // largest total power the hard caps admit is now 11.
-  SeedBound deep = SeedBound::initial(BoundaryMode::Total, 7, 5);
+  SeedBound deep = SeedBound::initial(7, 5);
   deep.widen_depth(/*carry_cap=*/false);
   REQUIRE(deep.limit == 12u);
   REQUIRE(deep.admits(deepBoth));
 }
 
-TEST(seedbound_box_mode_ignores_the_depth_cap_half) {
-  // In Box mode quantity *is* the depth and seed_top() is depth - 1, so
-  // past_depth_cap() is exactly past_top(): the new half adds nothing and Box
-  // mode's criterion -- and therefore its seed box, its equations and its global
-  // master basis -- is unchanged by it.
-  SeedBound b = SeedBound::initial(BoundaryMode::Box, 5, 4);
-  for (int d = 0; d <= 8; ++d)
-    for (int r = 0; r <= 7; ++r) {
-      RawIntegral i = RI({d, -r});
-      REQUIRE(b.past_depth_cap(i) == b.past_top(i));
-      REQUIRE(b.exceeded(i) == b.past_top(i));
-    }
-}
-
-TEST(seedbound_total_degenerate_box_is_harmless) {
+TEST(seedbound_degenerate_box_is_harmless) {
   // The smallest box initial_seed_bounds can return: the cap is depth + rank, a
   // plain sum, so it cannot underflow, and a degenerate box admits nothing
   // anyway (one of the two hard caps is always 0).
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 1, 0);
+  SeedBound b = SeedBound::initial(1, 0);
   REQUIRE(b.limit == 1u);
   REQUIRE(!b.admits(RI({0, 0, 0})));
-  SeedBound c = SeedBound::initial(BoundaryMode::Total, 0, 0);
+  SeedBound c = SeedBound::initial(0, 0);
   REQUIRE(c.limit == 0u);
   REQUIRE(!c.admits(RI({0, 0, 0})));
 }
 
-TEST(generate_seeds_is_independent_of_boundary_mode) {
-  // Seeds are generated over the whole box under either mode; only admission
-  // and the filter read the total cap, so switching mode cannot change nvars.
-  Sector box = SectorTestHelper::make_sector(3, 2, {true, true}, 3, 2);
-  Sector tot = SectorTestHelper::make_sector(3, 2, {true, true}, 3, 2);
-  SectorTestHelper::set_boundary(
-      tot, SeedBound::initial(BoundaryMode::Total, 3, 2));
-  SectorTestHelper::generate_seeds(box, OrderingMode::Balance);
-  SectorTestHelper::generate_seeds(tot, OrderingMode::Balance);
-  REQUIRE(!SectorTestHelper::seeds(box).empty());
-  REQUIRE(SectorTestHelper::seeds(box) == SectorTestHelper::seeds(tot));
-  REQUIRE(SectorTestHelper::weights(box) == SectorTestHelper::weights(tot));
+TEST(generate_seeds_covers_the_whole_box) {
+  // Seeds are generated over the whole box; only admission and the filter read the
+  // total cap, so the cap cannot change nvars.
+  Sector s = SectorTestHelper::make_sector(3, 2, {true, true}, 3, 2);
+  SectorTestHelper::generate_seeds(s, OrderingMode::Balance);
+  const auto &seeds = SectorTestHelper::seeds(s);
+  REQUIRE(!seeds.empty());
+  for (const auto &seed : seeds)
+    REQUIRE(seed.depth() - std::popcount(3u) < 3u);
+  REQUIRE(SectorTestHelper::weights(s).size() == seeds.size());
 }
 
 // ---------------------------------------------------------------------------
 // format_seed_box_line — the seeds a sector was reduced with, and the seeds the
-// probe pass started from
+// first pass started from
 // ---------------------------------------------------------------------------
 
-TEST(seed_box_line_reports_probe_start_when_raised) {
+TEST(seed_box_line_reports_the_start_when_raised) {
   // id 0b111 (three lines): reduced with a boundary of depth 5, whose deepest seed
-  // has depth 4 (one inside the bound); the probe started from a boundary of depth
-  // 4, i.e. seeds of depth 3, and raised the bound once.
-  REQUIRE(format_seed_box_line(0b111, SeedBound::initial(BoundaryMode::Box, 5, 4),
-                               SeedBound::initial(BoundaryMode::Box, 4, 4)) ==
-          " depth: 4 rank: 3  probe start: depth: 3 rank: 3");
+  // has depth 4 (one inside the bound); the run started from a boundary of depth 4,
+  // i.e. seeds of depth 3, and raised the bound once.
+  REQUIRE(format_seed_box_line(0b111, SeedBound::initial(5, 4),
+                               SeedBound::initial(4, 4)) ==
+          " depth: 4 rank: 3 total: 7  start: depth: 3 rank: 3 total: 6");
 }
 
-TEST(seed_box_line_repeats_start_when_probe_did_not_raise) {
-  REQUIRE(format_seed_box_line(0b101, SeedBound::initial(BoundaryMode::Box, 3, 2),
-                               SeedBound::initial(BoundaryMode::Box, 3, 2)) ==
-          " depth: 2 rank: 1  probe start: depth: 2 rank: 1");
+TEST(seed_box_line_repeats_the_start_when_nothing_was_raised) {
+  REQUIRE(format_seed_box_line(0b101, SeedBound::initial(3, 2),
+                               SeedBound::initial(3, 2)) ==
+          " depth: 2 rank: 1 total: 3  start: depth: 2 rank: 1 total: 3");
 }
 
 TEST(seed_box_line_prints_the_seed_bounds_for_a_base_layer_box) {
   // A box of exactly the sector's base layer (depth == popcount(id), the smallest
   // initial_seed_bounds can return) admits no seed at all -- the removal of the
   // `_depth = popcount(id) + 1` floor made this reachable, and the bound it hands
-  // the probe is the one the probe has to raise.  The three figures are the seeds'
-  // bounds, one step inside the boundary, so they still describe the box (depth 2
-  // for a boundary of depth 3); that this box admits none of its own base-layer
-  // integrals is what the probe reports and repairs.
-  REQUIRE(format_seed_box_line(0b1011, SeedBound::initial(BoundaryMode::Box, 3, 2),
-                               SeedBound::initial(BoundaryMode::Box, 3, 2)) ==
-          " depth: 2 rank: 1  probe start: depth: 2 rank: 1");
+  // the run is the one the first pass has to raise.  The three figures are the
+  // seeds' bounds, one step inside the boundary, so they still describe the box
+  // (depth 2 for a boundary of depth 3); that this box admits none of its own
+  // base-layer integrals is what the pass reports and repairs.
+  REQUIRE(format_seed_box_line(0b1011, SeedBound::initial(3, 2),
+                               SeedBound::initial(3, 2)) ==
+          " depth: 2 rank: 1 total: 3  start: depth: 2 rank: 1 total: 3");
 }
 
-TEST(seed_box_line_total_mode_adds_the_total_power) {
-  // Total mode: the line gains the seeds' largest total power.  Box (5, 4) puts
-  // the cap at 9, above the seed box, so the figure is the box corner 7 (= 5 + 4
-  // - 2).  A widening grows the box by one layer and carries the cap with it, so
-  // every figure of the leading triple is one past the probe's start -- which is
-  // how a log shows that the probe had to enlarge the box.
-  SeedBound widened    = SeedBound::initial(BoundaryMode::Total, 5, 4);
-  SeedBound probeStart = widened;
+TEST(seed_box_line_shows_the_widening) {
+  // Box (5, 4) puts the cap at 9, above the seed box, so the total-power figure is
+  // the box corner 7 (= 5 + 4 - 2).  A widening grows the box by one layer and
+  // carries the cap with it, so every figure of the leading triple is one past the
+  // start's -- which is how a log shows that the pass had to enlarge the box.
+  SeedBound widened    = SeedBound::initial(5, 4);
+  SeedBound start = widened;
   widened.widen_depth();                     // box (6, 4), cap 10
   REQUIRE(widened.limit == 10u);
-  REQUIRE(format_seed_box_line(0b111, widened, probeStart) ==
-          " depth: 5 rank: 3 total: 8  probe start: depth: 4 rank: 3 total: 7");
+  REQUIRE(format_seed_box_line(0b111, widened, start) ==
+          " depth: 5 rank: 3 total: 8  start: depth: 4 rank: 3 total: 7");
 }
 
 TEST(seed_box_line_reports_the_extents_of_the_admitted_seeds) {
@@ -1627,13 +1523,13 @@ TEST(seed_box_line_reports_the_extents_of_the_admitted_seeds) {
           }
     return e;
   };
-  SeedBound top = SeedBound::initial(BoundaryMode::Total, 5, 4);  // limit 9
+  SeedBound top = SeedBound::initial(5, 4);  // limit 9
   SeedBound cut = top;
   cut.limit = 6;  // bites: no admitted seed may reach total 6
   REQUIRE((extents(top) == Extents{4, 3, 7}));
   REQUIRE((extents(cut) == Extents{4, 2, 5}));
   REQUIRE(format_seed_box_line(id, top, cut) ==
-          " depth: 4 rank: 3 total: 7  probe start: depth: 4 rank: 2 total: 5");
+          " depth: 4 rank: 3 total: 7  start: depth: 4 rank: 2 total: 5");
 }
 
 TEST(seed_box_line_reads_off_the_seed_box_one_layer_inside_the_boundary) {
@@ -1642,46 +1538,25 @@ TEST(seed_box_line_reads_off_the_seed_box_one_layer_inside_the_boundary) {
   // depth 4, rank 1, total power 5 -- one step inside the boundary in each hard
   // figure, and one below the box corner (depth 4, rank 1) in total power.  The
   // line therefore reads the seeds, not the boundary it came from.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 5, 2);
+  SeedBound b = SeedBound::initial(5, 2);
   REQUIRE(b.limit == 7u);
   REQUIRE(format_seed_box_line(0b0011, b, b) ==
-          " depth: 4 rank: 1 total: 5  probe start: depth: 4 rank: 1 total: 5");
+          " depth: 4 rank: 1 total: 5  start: depth: 4 rank: 1 total: 5");
   // The depth figure is absolute -- the target [3, 1, -1, 0] of this sector has
   // depth 4, and depth 4 is what the line reports, not its 2 above the base layer.
   REQUIRE(RI({3, 1, -1, 0}).depth() == 4u);
 }
 
-TEST(seed_box_line_box_mode_reports_no_total) {
-  // Box mode must not grow the line: its log is unchanged by the new option.
-  SeedBound b = SeedBound::initial(BoundaryMode::Box, 5, 4);
-  REQUIRE(format_seed_box_line(0b111, b, b).find("total") == std::string::npos);
-}
-
 // ---------------------------------------------------------------------------
-// Stage S: applying one pass's report to the seed box (SeedBound::widen_for).
+// Applying one pass's report to the seed box (SeedBound::widen_for).
 // run_reduce_ff_n hands each pass's refusal bits to this single entry point, so
 // the widening policy lives here rather than inline in the driver's loops.
 // ---------------------------------------------------------------------------
 
-TEST(widen_for_box_mode_ignores_the_cap_bit) {
-  // Box mode has no cap for bit 4 to carry and never calls widen_rank (refusal()
-  // returns bit 1 alone there), so a report of 1 and one of 5 must land the same.
-  SeedBound a = SeedBound::initial(BoundaryMode::Box, 5, 4);
-  SeedBound b = a;
-  a.widen_for(1);
-  b.widen_for(5);  // bits 1|4
-  REQUIRE(a.depth == 6u && a.rank == 4u && a.limit == 0u);
-  REQUIRE(b.depth == 6u && b.rank == 4u && b.limit == 0u);
-  REQUIRE(a.seed_top() == 5);
-  REQUIRE(b.seed_top() == 5);
-  b.widen_for(2);
-  REQUIRE(b.depth == 6u && b.rank == 5u);  // bit 2 widens the rank, nothing else
-}
-
-TEST(widen_for_total_mode_carries_the_cap_for_a_box_top_report) {
+TEST(widen_for_carries_the_cap_for_a_box_top_report) {
   // bit 4 set: the report came from past_top(), so the depth widening moves the box
   // and the cap rides at the top of the new one -- seed_top() rises exactly one layer.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);  // limit 11, top 9
+  SeedBound b = SeedBound::initial(6, 5);  // limit 11, top 9
   REQUIRE(b.limit == 11u);
   REQUIRE(b.seed_top() == 9);
   b.widen_for(5);  // bits 1|4
@@ -1690,11 +1565,11 @@ TEST(widen_for_total_mode_carries_the_cap_for_a_box_top_report) {
   REQUIRE(b.seed_top() == 10);
 }
 
-TEST(widen_for_total_mode_depth_cap_alone_leaves_the_cap_where_it_is) {
+TEST(widen_for_depth_cap_alone_leaves_the_cap_where_it_is) {
   // bit 4 clear: the depth hard cap reported on its own, so nothing about the total
   // power was wrong -- the box deepens and keeps its ceiling.  seed_top() still rises
   // one layer, because the biggest admitted corner moved.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);  // limit 11, top 9
+  SeedBound b = SeedBound::initial(6, 5);  // limit 11, top 9
   b.widen_for(1);
   REQUIRE(b.depth == 7u && b.rank == 5u);
   REQUIRE(b.limit == 11u);
@@ -1702,13 +1577,13 @@ TEST(widen_for_total_mode_depth_cap_alone_leaves_the_cap_where_it_is) {
 }
 
 TEST(widen_for_rank_bit_always_carries_the_cap_and_both_bits_apply) {
-  SeedBound r = SeedBound::initial(BoundaryMode::Total, 6, 5);
+  SeedBound r = SeedBound::initial(6, 5);
   r.widen_for(2);
   REQUIRE(r.depth == 6u && r.rank == 6u);
   REQUIRE(r.limit == 12u);  // widen_rank's max(11, 6 + 6)
   REQUIRE(r.seed_top() == 10);
 
-  SeedBound both = SeedBound::initial(BoundaryMode::Total, 6, 5);
+  SeedBound both = SeedBound::initial(6, 5);
   both.widen_for(3);  // bits 1|2, no bit 4
   REQUIRE(both.depth == 7u && both.rank == 6u);
   REQUIRE(both.limit == 13u);  // the rank widening's max(11, 7 + 6) wins
@@ -1718,7 +1593,7 @@ TEST(widen_for_rank_bit_always_carries_the_cap_and_both_bits_apply) {
 TEST(widen_for_a_lone_repair_hint_widens_nothing) {
   // Bit 4 is the caller's cap-policy hint, never a report on its own (a seed that
   // reports it also pins a hard cap), so widen_for(4) must be a no-op.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);
+  SeedBound b = SeedBound::initial(6, 5);
   b.widen_for(4);
   REQUIRE(b.depth == 6u && b.rank == 5u && b.limit == 11u);
   REQUIRE(b.seed_top() == 9);
@@ -1727,7 +1602,7 @@ TEST(widen_for_a_lone_repair_hint_widens_nothing) {
 TEST(widen_for_applied_twice_matches_two_widenings) {
   // The driver applies the reports of consecutive rounds in sequence; a sector that
   // widens twice runs with a box two layers deeper and its top two layers higher.
-  SeedBound b = SeedBound::initial(BoundaryMode::Total, 6, 5);
+  SeedBound b = SeedBound::initial(6, 5);
   b.widen_for(5);
   b.widen_for(5);
   REQUIRE(b.depth == 8u && b.rank == 5u);

@@ -2,6 +2,8 @@
 
 #include <sys/resource.h>
 #include <sys/sysinfo.h>
+#include <cctype>
+#include <optional>
 #include <string>
 
 std::vector<GiNaC::symbol> generate_symbols(const std::string &pre,
@@ -71,4 +73,97 @@ std::uint64_t process_used_memory() {
   if (getrusage(RUSAGE_SELF, &ru) == 0)
     return (std::uint64_t)ru.ru_maxrss * 1024;
   return 0;
+}
+
+std::uint64_t process_peak_memory() {
+  // Resident high-water mark (VmHWM), in kB, from /proc/self/status.
+  std::ifstream in("/proc/self/status");
+  if (in.is_open()) {
+    std::string key;
+    std::uint64_t kb;
+    while (in >> key) {
+      if (key == "VmHWM:") {
+        in >> kb;
+        return kb * 1024;
+      }
+    }
+  }
+  // Fallback: same getrusage figure process_used_memory falls back to.
+  struct rusage ru;
+  if (getrusage(RUSAGE_SELF, &ru) == 0)
+    return (std::uint64_t)ru.ru_maxrss * 1024;
+  return 0;
+}
+
+std::uint64_t child_peak_memory() {
+  // RUSAGE_CHILDREN: the largest high-water mark among the children already
+  // reaped, which for SecRed is the global kira run.  The kernel has folded
+  // kira's own waited-for descendants into it, so the figure covers everything
+  // the solver ran (its FireFly phase included).
+  struct rusage ru;
+  if (getrusage(RUSAGE_CHILDREN, &ru) == 0)
+    return (std::uint64_t)ru.ru_maxrss * 1024;
+  return 0;
+}
+
+namespace {
+
+// Drop the ANSI colour escapes kira writes to its log, so that the digits of an
+// escape sequence (the "0" of "\x1b[0m") cannot be read as a count.
+std::string strip_ansi_escapes(const std::string &text) {
+  std::string out;
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (static_cast<unsigned char>(text[i]) != 0x1b) {
+      out.push_back(text[i]);
+      continue;
+    }
+    ++i;
+    if (i < text.size() && text[i] == '[') {
+      while (i + 1 < text.size() &&
+             !(text[i + 1] >= '@' && text[i + 1] <= '~'))
+        ++i;
+      ++i;  // the final byte of the sequence
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+std::optional<std::uint64_t> parse_selected_equations(const std::string &text) {
+  static const std::string kTag = "Number of selected equations to reduce:";
+  const std::string clean = strip_ansi_escapes(text);
+
+  std::optional<std::uint64_t> count;
+  std::size_t pos = 0;
+  while ((pos = clean.find(kTag, pos)) != std::string::npos) {
+    // The count sits on the tag's own line; a tag with no number on it (a
+    // truncated log) is skipped rather than satisfied from a later line.
+    std::size_t end = clean.find('\n', pos + kTag.size());
+    if (end == std::string::npos)
+      end = clean.size();
+    std::size_t i = pos + kTag.size();
+    while (i < end && !std::isdigit(static_cast<unsigned char>(clean[i])))
+      ++i;
+    if (i < end) {
+      std::uint64_t value = 0;
+      while (i < end && std::isdigit(static_cast<unsigned char>(clean[i]))) {
+        value = value * 10 + static_cast<std::uint64_t>(clean[i] - '0');
+        ++i;
+      }
+      count = value;  // the last selection wins
+    }
+    pos += kTag.size();
+  }
+  return count;
+}
+
+std::optional<std::uint64_t> selected_equations_from_log(const std::string &path) {
+  std::ifstream in(path);
+  if (!in.is_open())
+    return std::nullopt;
+  std::ostringstream buf;
+  buf << in.rdbuf();
+  return parse_selected_equations(buf.str());
 }
