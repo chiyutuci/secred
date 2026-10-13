@@ -17,6 +17,7 @@ set(TEST_SOURCES
     test_sector_engine.cpp
     test_forward_selector.cpp
     test_global_order.cpp
+    test_spill_reader.cpp
     test_sym_coeff.cpp
     test_row_coeff.cpp
     test_progress_bar.cpp
@@ -34,6 +35,7 @@ set(SECRED_CORE_SOURCES
     ${CMAKE_SOURCE_DIR}/src/numeric_solver_mod.cpp
     ${CMAKE_SOURCE_DIR}/src/ffred_solver.cpp
     ${CMAKE_SOURCE_DIR}/src/sector.cpp
+    ${CMAKE_SOURCE_DIR}/src/spill_reader.cpp
     ${CMAKE_SOURCE_DIR}/src/symmetry.cpp
     ${CMAKE_SOURCE_DIR}/src/utils.cpp
 )

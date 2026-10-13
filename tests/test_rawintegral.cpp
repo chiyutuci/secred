@@ -49,6 +49,36 @@ TEST(rawintegral_from_vector_bool) {
   REQUIRE(ri[3] == 0);
 }
 
+// Constructors must never write past indices_[31].  A 33-element input used to write
+// indices_[32], which is nprops_ itself, so the integral silently became 3 propagators
+// wide; anything longer overwrote whatever followed the object.
+TEST(rawintegral_vector_int_is_capped_at_max_props) {
+  std::vector<int> v(33, 1);
+  v[31] = 2;
+  RawIntegral ri(v);
+  REQUIRE(ri.size() == RawIntegral::MAX_PROPS);
+  REQUIRE(ri[0] == 1);
+  REQUIRE(ri[31] == 2);
+}
+
+TEST(rawintegral_vector_bool_is_capped_at_max_props) {
+  std::vector<bool> lines(33, true);
+  RawIntegral ri(lines);
+  REQUIRE(ri.size() == RawIntegral::MAX_PROPS);
+  REQUIRE(ri[31] == 1);
+}
+
+TEST(rawintegral_n_value_is_capped_at_max_props) {
+  RawIntegral ri(33u, 1);
+  REQUIRE(ri.size() == RawIntegral::MAX_PROPS);
+  REQUIRE(ri[31] == 1);
+}
+
+TEST(rawintegral_n_zeros_is_capped_at_max_props) {
+  RawIntegral ri(33u);
+  REQUIRE(ri.size() == RawIntegral::MAX_PROPS);
+}
+
 TEST(rawintegral_mutable_index) {
   RawIntegral ri(3, 0);
   ri[1] = 5;

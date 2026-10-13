@@ -46,25 +46,25 @@ public:
 
   RawIntegral() : nprops_(0) {}
 
-  explicit RawIntegral(unsigned n) : nprops_(n) {}
+  explicit RawIntegral(unsigned n) : nprops_(cap(n)) {}
 
-  explicit RawIntegral(unsigned n, int i) : nprops_(n) {
-    for (unsigned k = 0; k < n; ++k)
+  explicit RawIntegral(unsigned n, int i) : nprops_(cap(n)) {
+    for (unsigned k = 0; k < nprops_; ++k)
       indices_[k] = (int8_t)i;
   }
 
-  explicit RawIntegral(const std::vector<bool> &lines) : nprops_(lines.size()) {
-    for (unsigned i = 0; i < lines.size(); ++i)
+  explicit RawIntegral(const std::vector<bool> &lines) : nprops_(cap(lines.size())) {
+    for (unsigned i = 0; i < nprops_; ++i)
       indices_[i] = lines[i] ? 1 : 0;
   }
 
-  explicit RawIntegral(const std::vector<int> &v) : nprops_(v.size()) {
-    for (unsigned i = 0; i < v.size(); ++i)
+  explicit RawIntegral(const std::vector<int> &v) : nprops_(cap(v.size())) {
+    for (unsigned i = 0; i < nprops_; ++i)
       indices_[i] = (int8_t)v[i];
   }
 
-  explicit RawIntegral(std::vector<int> &&v) : nprops_(v.size()) {
-    for (unsigned i = 0; i < v.size(); ++i)
+  explicit RawIntegral(std::vector<int> &&v) : nprops_(cap(v.size())) {
+    for (unsigned i = 0; i < nprops_; ++i)
       indices_[i] = (int8_t)v[i];
   }
 
@@ -190,6 +190,12 @@ public:
   friend class std::hash<RawIntegral>;
 
 private:
+  // The storage holds MAX_PROPS indices; a longer input is truncated rather than
+  // written past the end (the old loops wrote indices_[32], i.e. nprops_ itself).
+  static unsigned cap(std::size_t n) {
+    return n > MAX_PROPS ? MAX_PROPS : static_cast<unsigned>(n);
+  }
+
   std::array<int8_t, MAX_PROPS> indices_{};
   uint8_t nprops_ = 0;
 };
