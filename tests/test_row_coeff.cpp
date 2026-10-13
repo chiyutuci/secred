@@ -48,22 +48,25 @@ static std::string printed(const secred::RowNum &num, std::uint32_t q,
   return out;
 }
 
+// A parser over these very symbols: GiNaC 1.8 does not intern symbols, so one
+// built from fresh `GiNaC::symbol("d")` objects would return expressions that do
+// not cancel against the file-scope `d` above.
+static GiNaC::parser box_parser() {
+  GiNaC::symtab st;
+  st["d"] = d;
+  st["s"] = s;
+  st["t"] = t;
+  st["m"] = m;
+  return GiNaC::parser(st);
+}
+
 // The expectation is built as a GiNaC expression, never as a string, so a typo
 // in the corpus cannot hide behind the parser.
 static void require_prints_to(const secred::RowNum &num, std::uint32_t q,
                               std::initializer_list<std::pair<unsigned, unsigned>> mono,
                               const GiNaC::ex &want) {
   const std::string got = printed(num, q, mono);
-  // GiNaC 1.8 does not intern symbols: a fresh `GiNaC::symbol("d")` is a
-  // *different* symbol from the `d` above, and `3*d - 3*d'` does not cancel.
-  // The parser has to be handed these very objects, as test_symmetry.cpp does
-  // with Family::symtab.
-  GiNaC::symtab st;
-  st["d"] = d;
-  st["s"] = s;
-  st["t"] = t;
-  st["m"] = m;
-  GiNaC::parser par(st);
+  GiNaC::parser par = box_parser();
   GiNaC::ex back;
   bool parsed = true;
   std::string why;
@@ -119,4 +122,173 @@ TEST(row_coeff_printer_drops_a_fully_cancelled_monomial) {
 TEST(row_coeff_printer_prints_a_signed_sum) {
   require_prints_to({term(1, {{0, 1}}), term(-5)}, 1, {}, d - 5);
   require_prints_to({term(-1, {{0, 1}}), term(-5)}, 1, {}, -d - 5);
+}
+
+// ---------------------------------------------------------------------------
+// The precompiler and the evaluator (Task 2).
+// ---------------------------------------------------------------------------
+
+// One generator's rows: each item is an index delta (ignored here, its length is
+// what the evaluator reads the seed against) and the row's coefficients.
+// RawIntegral and IBPProtoM are global-namespace types (sector.h); only the
+// names this plan adds to row_coeff.h live in namespace secred.
+static IBPProtoM rows_of(const std::vector<std::vector<GiNaC::ex>> &rows) {
+  IBPProtoM items;
+  for (const std::vector<GiNaC::ex> &row : rows)
+    items.emplace_back(RawIntegral(std::vector<int>(row.size() - 1, 0)), row);
+  return items;
+}
+
+// The evaluation is the settling round's arithmetic -- sum_p row[p]*seed[p] +
+// row.back(), over the row's common denominator -- so it is compared against
+// GiNaC's own computation, on rows that mix integers, fractions and symbols and
+// on seeds that scale them positively, negatively and not at all.
+TEST(row_coeff_evaluation_matches_ginac) {
+  const std::vector<GiNaC::ex> row = {-5 + d, GiNaC::ex(-9) / 2, 3 * d + 1,
+                                      (d - 2) / (2 * m * m)};
+  secred::RowTable table;
+  table.add(0, rows_of({row}));
+  REQUIRE(table.rows[0][0].precompiled);
+
+  GiNaC::parser par = box_parser();
+
+  const int seeds[9][3] = {{0, 0, 0},  {1, 0, 0},  {0, 1, 0}, {2, 1, 0}, {1, 1, 1},
+                           {-1, 1, 0}, {2, 0, 1},  {-2, -1, 0}, {3, 2, 1}};
+  for (const auto &sv : seeds) {
+    const RawIntegral seed(std::vector<int>(sv, sv + 3));
+    std::string got;
+    const secred::RowEval st_r = table.eval(0, 0, seed, got);
+    GiNaC::ex want;
+    for (unsigned p = 0; p < 3; ++p)
+      want += row[p] * seed[p];
+    want += row.back();
+    want = want.expand();
+    if (st_r == secred::RowEval::Zero) {
+      REQUIRE(want.is_zero());
+      continue;
+    }
+    REQUIRE(st_r == secred::RowEval::Ok);
+    REQUIRE_MSG((par(got) - want).expand().is_zero(),
+                "seed evaluated to '" + got + "', expected '" + ex_text(want) + "'");
+  }
+}
+
+// The shapes the precompiler must refuse: a symbolic denominator that is not a
+// monomial, a non-integer coefficient, a half-integer exponent -- and one that
+// is representable per coefficient but whose row lcm would overflow the term
+// exponents, which must fall back rather than wrap.
+TEST(row_coeff_falls_back_on_shapes_it_cannot_represent) {
+  secred::RowTable table;
+  table.add(0, rows_of({{1 / (1 + d), GiNaC::ex(2), GiNaC::ex(0)}}));
+  table.add(1, rows_of({{GiNaC::sqrt(GiNaC::ex(2)), GiNaC::ex(2), GiNaC::ex(0)}}));
+  table.add(2, rows_of({{GiNaC::pow(d, GiNaC::ex(1) / 2), GiNaC::ex(2), GiNaC::ex(0)}}));
+  // `d^255` alone is representable, and `1/d^200` alone is representable, but
+  // over their row's lcm the first needs `d^455`, past the term's uint8_t
+  // exponent.  The row must fall back, not wrap.
+  table.add(3, rows_of({{GiNaC::pow(d, 255), GiNaC::ex(1) / GiNaC::pow(d, 200),
+                         GiNaC::ex(0)}}));
+  for (unsigned i = 0; i < 4; ++i) {
+    REQUIRE(!table.rows[i][0].precompiled);
+    std::string got;
+    REQUIRE(table.eval(i, 0, RawIntegral(std::vector<int>({1, 1})), got) ==
+            secred::RowEval::NotPrecompiled);
+  }
+  REQUIRE_EQ(table.fast_rows, 0u);
+  REQUIRE_EQ(table.slow_rows, 4u);
+}
+
+// The row's common denominator is the lcm of its coefficients' own monomials, so
+// a coefficient whose denominator is shallower is *lifted*: a term that lacks
+// the symbol altogether -- a constant term is the plainest case -- has to gain
+// an entry, or the coefficient silently comes out too small by that power.
+// `1/m^2` beside `d/m^4` must stay `1/m^2`, not become `1/m^4`.
+TEST(row_coeff_lifts_a_term_that_lacks_a_symbol_of_the_row_lcm) {
+  const std::vector<GiNaC::ex> row = {GiNaC::ex(1) / GiNaC::pow(m, 2),
+                                      d / GiNaC::pow(m, 4), GiNaC::ex(0)};
+  secred::RowTable table;
+  table.add(0, rows_of({row}));
+  REQUIRE(table.rows[0][0].precompiled);
+
+  GiNaC::parser par = box_parser();
+  const int seeds[4][2] = {{1, 0}, {0, 1}, {1, 1}, {-1, 2}};
+  for (const auto &sv : seeds) {
+    const RawIntegral seed(std::vector<int>(sv, sv + 2));
+    std::string got;
+    REQUIRE(table.eval(0, 0, seed, got) == secred::RowEval::Ok);
+    const GiNaC::ex want = (row[0] * seed[0] + row[1] * seed[1] + row.back()).expand();
+    REQUIRE_MSG((par(got) - want).expand().is_zero(),
+                "seed evaluated to '" + got + "', expected '" + ex_text(want) + "'");
+  }
+}
+
+// A coefficient that cancels exactly is reported as such, not printed: the
+// global system must not gain a column from a phantom integral.
+TEST(row_coeff_reports_a_vanishing_coefficient) {
+  secred::RowTable table;
+  table.add(0, rows_of({{d, -d, GiNaC::ex(0), GiNaC::ex(0)}}));
+  REQUIRE(table.rows[0][0].precompiled);
+  std::string got;
+  REQUIRE(table.eval(0, 0, RawIntegral(std::vector<int>({1, 1, 0})), got) ==
+          secred::RowEval::Zero);
+  REQUIRE(table.eval(0, 0, RawIntegral(std::vector<int>({1, 0, 0})), got) ==
+          secred::RowEval::Ok);
+  REQUIRE(!got.empty() && got != "0");
+}
+
+// The lazy build: a generator's rows are precompiled the first time one of its
+// equations is used, all of its items together, and the counters say how many.
+TEST(row_table_builds_one_generator_at_a_time_and_counts) {
+  secred::RowTable table;
+  REQUIRE(!table.contains(0));
+  table.add(0, rows_of({{d + 1, GiNaC::ex(2), GiNaC::ex(0)},
+                        {1 / (1 + m), GiNaC::ex(2), GiNaC::ex(0)}}));
+  REQUIRE(table.contains(0));
+  REQUIRE(!table.contains(1));
+  REQUIRE_EQ(table.fast_rows, 1u);
+  REQUIRE_EQ(table.slow_rows, 1u);
+  REQUIRE_EQ(table.names.size(), 2u);
+  REQUIRE_EQ(table.index.at("d"), 0u);
+  REQUIRE_EQ(table.index.at("m"), 1u);
+  REQUIRE(table.rows[0][0].precompiled);
+  REQUIRE(!table.rows[0][1].precompiled);
+  // An item index that was never added is a miss, not a crash.
+  std::string got;
+  REQUIRE(table.eval(0, 2, RawIntegral(std::vector<int>({1, 1})), got) ==
+          secred::RowEval::NotPrecompiled);
+  REQUIRE(table.eval(1, 0, RawIntegral(std::vector<int>({1, 1})), got) ==
+          secred::RowEval::NotPrecompiled);
+}
+
+// A seed whose length does not match the row cannot be evaluated: the row is
+// only valid for the nprops its coefficients were built for.
+TEST(row_coeff_refuses_a_seed_of_the_wrong_length) {
+  secred::RowTable table;
+  table.add(0, rows_of({{d, GiNaC::ex(1), GiNaC::ex(1)}}));
+  std::string got;
+  REQUIRE(table.eval(0, 0, RawIntegral(std::vector<int>({1, 1, 1})), got) ==
+          secred::RowEval::NotPrecompiled);
+}
+
+// The flat term list: equal monomials sum, cancellations and zero terms go.
+TEST(row_coeff_merges_equal_monomials_and_drops_zeros) {
+  secred::RowNum terms = {term(1, {{0, 1}}), term(2, {{1, 1}}), term(-1, {{0, 1}}),
+                          term(3)};
+  secred::row_merge_terms(terms);
+  REQUIRE_EQ(terms.size(), 2u);
+  REQUIRE(terms[0].vars.empty());  // the constant sorts first
+  REQUIRE(terms[0].coef == cln::cl_I(3));
+  REQUIRE_EQ(terms[1].vars.size(), 1u);
+  REQUIRE_EQ(unsigned(terms[1].vars[0].first), 1u);
+  REQUIRE(terms[1].coef == cln::cl_I(2));
+  // Nothing merged and nothing dropped: every survivor stays where it already
+  // is, so the compaction must not move a term onto itself -- and the standard
+  // library leaves a self-move-assigned vector empty, which would read as the
+  // monomial having vanished.
+  secred::RowNum compact = {term(5, {{0, 1}}), term(2, {{1, 2}})};
+  secred::row_merge_terms(compact);
+  REQUIRE_EQ(compact.size(), 2u);
+  REQUIRE_EQ(compact[0].vars.size(), 1u);
+  REQUIRE_EQ(unsigned(compact[0].vars[0].second), 1u);
+  REQUIRE_EQ(compact[1].vars.size(), 1u);
+  REQUIRE_EQ(unsigned(compact[1].vars[0].second), 2u);
 }

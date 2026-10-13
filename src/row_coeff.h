@@ -226,4 +226,222 @@ inline void print_row_poly(const RowNum &num, std::uint32_t q, const RowVars &mo
   }
 }
 
+// Append `power * poly` to `acc`, each term's monomial unchanged: the seed's
+// power is a plain integer scale, so a negative one just flips signs and the
+// coefficient is a signed `cl_I`, never an unsigned count.
+inline void row_add_scaled(RowNum &acc, const SymPoly &poly, int power) {
+  if (power == 0 || poly.terms.empty())
+    return;
+  const cln::cl_I scale(static_cast<long>(power));
+  acc.reserve(acc.size() + poly.terms.size());
+  for (const SymTerm &t : poly.terms) {
+    RowTerm rt;
+    rt.coef = t.coef * scale;
+    rt.vars.reserve(t.vars.size());
+    for (const auto &ve : t.vars)
+      rt.vars.emplace_back(ve.first, static_cast<unsigned>(ve.second));
+    acc.push_back(std::move(rt));
+  }
+}
+
+// Sum equal monomials and drop what cancels.  The sort is total, so the result
+// is deterministic, and stable, so the surviving terms read in the order the
+// row's coefficients contributed them.
+inline void row_merge_terms(RowNum &v) {
+  std::stable_sort(v.begin(), v.end(), [](const RowTerm &a, const RowTerm &b) {
+    return row_vars_less(a.vars, b.vars);
+  });
+  std::size_t out = 0;
+  for (std::size_t i = 0; i < v.size();) {
+    std::size_t j = i + 1;
+    while (j < v.size() && !row_vars_less(v[i].vars, v[j].vars) &&
+           !row_vars_less(v[j].vars, v[i].vars)) {
+      v[i].coef += v[j].coef;
+      ++j;
+    }
+    if (!cln::zerop(v[i].coef)) {
+      // Only when something was dropped earlier: `v[out] = std::move(v[out])`
+      // is a self-move-assignment, and the standard library's containers leave
+      // the moved-from object empty, which would silently delete the monomial.
+      if (out != i)
+        v[out] = std::move(v[i]);
+      ++out;
+    }
+    i = j;
+  }
+  v.resize(out);
+}
+
+// A term's own exponent of `idx`, 0 when the term does not carry the symbol.
+// `SymTerm::vars` is a vector of (uint8_t, uint8_t) pairs, so the RowVars helper
+// above does not apply to it.
+inline unsigned sym_term_exp_of(const std::vector<std::pair<std::uint8_t, std::uint8_t>> &v,
+                                std::uint8_t idx) {
+  for (const auto &ve : v)
+    if (ve.first == idx)
+      return ve.second;
+  return 0;
+}
+
+// Precompile one row (`nprops` propagator coefficients and the constant, last).
+// False when a coefficient is outside the representable shape or a denominator
+// is not a positive integer times a monomial; the row then keeps the GiNaC path.
+// On success every coefficient carries the row's common `q` and `mono`, so the
+// evaluation is a signed integer sum with no per-seed lcm, and every term's
+// `vars` is sorted by index with no zero exponents.
+inline bool build_row_coeff(const std::vector<GiNaC::ex> &row,
+                            const std::unordered_map<std::string, unsigned> &sym_index,
+                            RowCoeff &out) {
+  constexpr std::uint64_t kMaxDen = 1u << 20;
+  out.precompiled = false;
+  out.c.clear();
+  out.c.reserve(row.size());
+
+  std::uint64_t q_lcm = 1;
+  RowVars mono;
+  for (const GiNaC::ex &e : row) {
+    const SymCoeff sc = make_sym_coeff(e.expand(), sym_index);
+    if (!sc.precompiled)
+      return false;
+    RowPoly c;
+    if (!sc.den.terms.empty()) {
+      const SymTerm &dn = sc.den.terms[0];
+      if (sc.den.terms.size() != 1 || !cln::plusp(dn.coef) ||
+          dn.coef > cln::cl_I(static_cast<unsigned long>(kMaxDen)))
+        return false; // a polynomial denominator, or not a small positive integer
+      c.q = static_cast<std::uint32_t>(cln::cl_I_to_ulong(dn.coef));
+      for (const auto &ve : dn.vars)
+        row_max_exp(mono, ve.first, static_cast<unsigned>(ve.second));
+      c.mono = mono;
+    }
+    const std::uint64_t g = std::gcd(q_lcm, static_cast<std::uint64_t>(c.q));
+    const std::uint64_t f = static_cast<std::uint64_t>(c.q) / g;
+    if (f > kMaxDen / q_lcm)
+      return false;
+    q_lcm *= f;
+    c.num = sc.num;
+    out.c.push_back(std::move(c));
+  }
+
+  // Second pass: put every coefficient over the row's lcm (q_lcm, mono), which
+  // means multiplying its numerator by `mono / own mono`.  A symbol the lcm
+  // carries and the term does not is exactly where that factor is not 1, so the
+  // term's monomial is rebuilt from the lcm rather than patched in place: a term
+  // with no entry for the symbol must gain one (a constant term of a coefficient
+  // whose own denominator is shallower is the common case), and one whose
+  // exponent cancels to zero must lose it.
+  for (RowPoly &c : out.c) {
+    const cln::cl_I scale(static_cast<unsigned long>(q_lcm / c.q));
+    SymPoly scaled;
+    scaled.terms.reserve(c.num.terms.size());
+    for (const SymTerm &t : c.num.terms) {
+      SymTerm s;
+      s.coef = t.coef * scale;
+      s.vars.reserve(t.vars.size() + mono.size());
+      for (const auto &ve : t.vars)
+        if (row_exp_of(mono, ve.first) == 0)
+          s.vars.push_back(ve); // untouched by the shift: not in the lcm
+      for (const RowExp &me : mono) {
+        const unsigned e = sym_term_exp_of(t.vars, me.first) + me.second -
+                           row_exp_of(c.mono, me.first);
+        if (e > 255)
+          return false; // would not survive the term's uint8_t exponent
+        if (e != 0)
+          s.vars.emplace_back(me.first, static_cast<std::uint8_t>(e));
+      }
+      std::sort(s.vars.begin(), s.vars.end(),
+                [](const auto &a, const auto &b) { return a.first < b.first; });
+      scaled.terms.push_back(std::move(s));
+    }
+    c.num = std::move(scaled);
+    c.q = static_cast<std::uint32_t>(q_lcm);
+    c.mono = mono;
+  }
+  out.precompiled = true;
+  return true;
+}
+
+// Evaluate one row for `seed`: sum_p seed[p]*c[p] + c.back() over the row's
+// common denominator.  `out` is cleared and then carries the coefficient text;
+// `names` is the table's symbol-index-to-name list.  A row that was not
+// precompiled, or a seed whose length is not the row's nprops, is reported as
+// NotPrecompiled and the caller takes the GiNaC path.
+inline RowEval eval_row_coeff(const RowCoeff &row, const RawIntegral &seed,
+                              const std::vector<std::string> &names, std::string &out) {
+  if (!row.precompiled || row.c.empty() || row.c.size() != seed.size() + 1)
+    return RowEval::NotPrecompiled;
+  RowNum acc;
+  for (unsigned p = 0; p + 1 < row.c.size(); ++p)
+    row_add_scaled(acc, row.c[p].num, seed[p]);
+  row_add_scaled(acc, row.c.back().num, 1);
+  row_merge_terms(acc);
+  if (acc.empty()) {
+    out = "0";
+    return RowEval::Zero;
+  }
+  out.clear();
+  print_row_poly(acc, row.c[0].q, row.c[0].mono, names, out);
+  return RowEval::Ok;
+}
+
+// The per-sector cache: the rows a sector's settling round actually uses, built
+// lazily.  One entry per IBP generator, holding one RowCoeff per item, because
+// an IBPProtoM bundles several global rows into one generator.  Owned by one
+// sector thread, so `add` needs no lock of its own -- but it is GiNaC work, so
+// the caller holds `ginac_mutex` around it (spec 4.3).
+struct RowTable {
+  std::vector<std::string> names;                  // symbol index -> name
+  std::unordered_map<std::string, unsigned> index; // name -> symbol index
+  std::vector<std::vector<RowCoeff>> rows;         // [ibp_idx][item]
+  unsigned fast_rows = 0;                          // item rows precompiled
+  unsigned slow_rows = 0;                          // item rows on the GiNaC path
+
+  bool contains(unsigned ibp_idx) const {
+    return ibp_idx < rows.size() && !rows[ibp_idx].empty();
+  }
+
+  void add(unsigned ibp_idx, const IBPProtoM &items);
+
+  RowEval eval(unsigned ibp_idx, unsigned item, const RawIntegral &seed,
+               std::string &out) const {
+    if (ibp_idx >= rows.size() || item >= rows[ibp_idx].size())
+      return RowEval::NotPrecompiled;
+    return eval_row_coeff(rows[ibp_idx][item], seed, names, out);
+  }
+};
+
+// Collect one expression's symbols into the table's name list, in the order they
+// are first seen.  GiNaC has no symbol-set query, so this walks the expression;
+// the order is the spelling order and is deterministic per table.  Defined here,
+// after RowTable, because its signature names the type.
+inline void collect_row_symbols(const GiNaC::ex &e, RowTable &table) {
+  if (GiNaC::is_a<GiNaC::symbol>(e)) {
+    const std::string n = GiNaC::ex_to<GiNaC::symbol>(e).get_name();
+    if (table.index.find(n) == table.index.end()) {
+      table.index[n] = static_cast<unsigned>(table.names.size());
+      table.names.push_back(n);
+    }
+    return;
+  }
+  for (std::size_t k = 0; k < e.nops(); ++k)
+    collect_row_symbols(e.op(k), table);
+}
+
+inline void RowTable::add(unsigned ibp_idx, const IBPProtoM &items) {
+  if (ibp_idx >= rows.size())
+    rows.resize(ibp_idx + 1);
+  if (!rows[ibp_idx].empty())
+    return; // already built
+  for (const auto &item : items)
+    for (const GiNaC::ex &e : item.second)
+      collect_row_symbols(e, *this);
+  rows[ibp_idx].resize(items.size());
+  for (unsigned i = 0; i < items.size(); ++i) {
+    if (build_row_coeff(items[i].second, index, rows[ibp_idx][i]))
+      ++fast_rows;
+    else
+      ++slow_rows;
+  }
+}
+
 } // namespace secred
