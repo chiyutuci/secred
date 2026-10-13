@@ -1,13 +1,18 @@
 // The scanner over the global stage's spill file: boundaries, the strict parsers and
 // their fallbacks, and (Task 2-3) the symbolic grammar.
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 #include "reference_spill_reader.h"
+#include "row_coeff.h"
 #include "spill_reader.h"
+#include "sym_coeff.h"
 #include "test_runner.h"
 
 using secred::Eq;
@@ -258,4 +263,158 @@ TEST(spill_numeric_matches_the_reference_reader) {
   REQUIRE_EQ(ours[2][1].second.num, int64_t(4));
   REQUIRE_EQ(ours[2][1].second.den, int64_t(6));
   REQUIRE_EQ(stats.skipped_unknown, std::uint64_t(1));
+}
+
+// --- the symbolic coefficient grammar (Review Focus 1) --------------------------
+
+namespace {
+
+// A small builder so an expectation reads like the polynomial it is: pol({{3,{{0,1}}},
+// {1,{}}}) is 3*d+1, and pol({{2,{}}}) is 2.
+secred::SymPoly pol(std::vector<std::pair<long, std::vector<std::pair<int, int>>>> terms) {
+  secred::SymPoly p;
+  for (const auto &t : terms) {
+    secred::SymTerm term;
+    term.coef = cln::cl_I(t.first);
+    for (const auto &v : t.second)
+      term.vars.emplace_back(static_cast<std::uint8_t>(v.first),
+                             static_cast<std::uint8_t>(v.second));
+    p.terms.push_back(std::move(term));
+  }
+  return p;
+}
+
+// Term-order-insensitive equality: the scanner builds its terms in printed order and
+// GiNaC builds them in its own, and neither order is part of the contract.  The same
+// goes for the variable list inside a term, which is a set of (index, exponent)
+// pairs -- `row_print_vars` emits it in stored order, the scanner in read order.
+std::string term_key(const secred::SymTerm &t) {
+  std::vector<std::string> vs;
+  for (const auto &v : t.vars)
+    vs.push_back(std::to_string(int(v.first)) + "^" + std::to_string(int(v.second)));
+  std::sort(vs.begin(), vs.end());
+  std::ostringstream os;
+  os << t.coef << '|';
+  for (const auto &v : vs)
+    os << v << '*';
+  return os.str();
+}
+
+bool sym_poly_equal(const secred::SymPoly &a, const secred::SymPoly &b) {
+  std::vector<std::string> ka, kb;
+  for (const auto &t : a.terms)
+    ka.push_back(term_key(t));
+  for (const auto &t : b.terms)
+    kb.push_back(term_key(t));
+  std::sort(ka.begin(), ka.end());
+  std::sort(kb.begin(), kb.end());
+  return ka == kb;
+}
+
+// Round-tripping through the *printer* is the grammar's definition: whatever
+// `print_row_poly` writes for (num, q, mono), the scanner must read back as (want_num,
+// want_den).  Every call site states both, so the expectation is written out rather
+// than derived by a second implementation of the same arithmetic.
+bool round_trip(const secred::RowNum &num, std::uint32_t q, const secred::RowVars &mono,
+                const std::vector<std::string> &names,
+                const std::unordered_map<std::string, unsigned> &sym_index,
+                const secred::SymPoly &want_num, const secred::SymPoly &want_den) {
+  std::string text;
+  secred::print_row_poly(num, q, mono, names, text);
+  secred::SymCoeff got;
+  if (!secred::parse_spill_coeff(text.data(), text.data() + text.size(), sym_index, got))
+    return false;
+  return got.precompiled && sym_poly_equal(got.num, want_num) &&
+         sym_poly_equal(got.den, want_den);
+}
+
+}  // namespace
+
+TEST(spill_coeff_factored_forms_round_trip) {
+  const std::vector<std::string> names = {"d", "s", "t", "m"};
+  const std::unordered_map<std::string, unsigned> sym_index = {
+      {"d", 0}, {"s", 1}, {"t", 2}, {"m", 3}};
+  // 3/2*d+1/2: the printer reduces each term's denominator by its own gcd, so the
+  // coefficient's denominator is their lcm (2 here) and the numerator is 3d+1.
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(3), {{0, 1}}}, {cln::cl_I(1), {}}}, 2, {},
+                     names, sym_index, pol({{3, {{0, 1}}}, {1, {}}}), pol({{2, {}}})));
+  // -9/2*d^2+3/2
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(-9), {{0, 2}}}, {cln::cl_I(3), {}}}, 2, {},
+                     names, sym_index, pol({{-9, {{0, 2}}}, {3, {}}}), pol({{2, {}}})));
+  // d (a unit coefficient is omitted), -d, -3*d, with no denominator at all
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {{0, 1}}}}, 1, {}, names, sym_index,
+                     pol({{1, {{0, 1}}}}), pol({})));
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(-1), {{0, 1}}}}, 1, {}, names, sym_index,
+                     pol({{-1, {{0, 1}}}}), pol({})));
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(-3), {{0, 1}}}}, 1, {}, names, sym_index,
+                     pol({{-3, {{0, 1}}}}), pol({})));
+  // a constant, and a bare 1
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(7), {}}}, 1, {}, names, sym_index,
+                     pol({{7, {}}}), pol({})));
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {}}}, 1, {}, names, sym_index,
+                     pol({{1, {}}}), pol({})));
+  // d^12 (a multi-digit exponent) and d^2*s^3
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {{0, 12}}}}, 1, {}, names, sym_index,
+                     pol({{1, {{0, 12}}}}), pol({})));
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {{0, 2}, {1, 3}}}}, 1, {}, names,
+                     sym_index, pol({{1, {{0, 2}, {1, 3}}}}), pol({})));
+  // the empty sum prints 0 (the caller drops such a coefficient, as GiNaC's is_zero did)
+  secred::SymCoeff zero;
+  const std::string ztext = "0";
+  REQUIRE(secred::parse_spill_coeff(ztext.data(), ztext.data() + 1, sym_index, zero));
+  REQUIRE(zero.precompiled);
+  REQUIRE(zero.num.terms.empty());
+}
+
+TEST(spill_coeff_paren_forms_round_trip) {
+  const std::vector<std::string> names = {"d", "s", "t", "m"};
+  const std::unordered_map<std::string, unsigned> sym_index = {
+      {"d", 0}, {"s", 1}, {"t", 2}, {"m", 3}};
+  // (d-2)/(2*m^2): the monomial does not divide every term, so the printer
+  // parenthesises the whole sum and prints q and the monomial outside.  The
+  // denominator is their product, one polynomial term -- GiNaC's denom() of the same
+  // text (probed with the reference reader), not two.
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {{0, 1}}}, {cln::cl_I(-2), {}}}, 2,
+                     {{3, 2}}, names, sym_index, pol({{1, {{0, 1}}}, {-2, {}}}),
+                     pol({{2, {{3, 2}}}})));
+  // (1)/(d)
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {}}}, 1, {{0, 1}}, names, sym_index,
+                     pol({{1, {}}}), pol({{1, {{0, 1}}}})));
+  // (2*d+4)/(2*m^2): numerator and denominator share the content 2, so the scanned
+  // coefficient is (d+2)/m^2 -- the same normalisation make_sym_coeff gives the text.
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(2), {{0, 1}}}, {cln::cl_I(4), {}}}, 2,
+                     {{3, 2}}, names, sym_index, pol({{1, {{0, 1}}}, {2, {}}}),
+                     pol({{1, {{3, 2}}}})));
+}
+
+// Review Focus 1: a symbol name that is a prefix of another must not be mis-read.
+TEST(spill_coeff_prefers_the_longest_symbol_name) {
+  const std::vector<std::string> names = {"d", "dd", "d1"};
+  const std::unordered_map<std::string, unsigned> sym_index = {
+      {"d", 0}, {"dd", 1}, {"d1", 2}, {"x3", 3}};
+  // dd^2+d*d1 -- `dd` and `d1` must each be one symbol, not `d` followed by a letter
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {{1, 2}}}, {cln::cl_I(1), {{0, 1}, {2, 1}}}},
+                     1, {}, names, sym_index, pol({{1, {{1, 2}}}, {1, {{0, 1}, {2, 1}}}}),
+                     pol({})));
+  // symbol 3 has no entry in `names`, so `row_print_vars` invents `x3`: the scanner
+  // reads whatever the printer wrote, looked up in `sym_index`
+  REQUIRE(round_trip(secred::RowNum{{cln::cl_I(1), {{3, 1}, {2, 1}}}}, 1, {}, names,
+                     sym_index, pol({{1, {{3, 1}, {2, 1}}}}), pol({})));
+}
+
+TEST(spill_coeff_refuses_text_outside_the_grammar) {
+  const std::unordered_map<std::string, unsigned> sym_index = {{"d", 0}, {"s", 1}};
+  const char *bad[] = {"",      "d/",     "/2",     "(d-2)/(",  "d^0",   "d^256",
+                       "2**d",   "d + 1",  "d+1-",   "x9",       "1/(d)", "d+1-d",
+                       "^2",     "(d)/(1", "d^^2",   "d-",       "-",     "(", ")"};
+  for (const char *t : bad) {
+    secred::SymCoeff c;
+    const std::size_t n = std::strlen(t);
+    REQUIRE_MSG(!secred::parse_spill_coeff(t, t + n, sym_index, c), t);
+  }
+  // `d*d` is not a spelling the printer emits (it writes d^2), so the strict parser
+  // refuses it rather than building a term GiNaC would have combined.
+  const char *dup = "d*d";
+  secred::SymCoeff c;
+  REQUIRE(!secred::parse_spill_coeff(dup, dup + 3, sym_index, c));
 }

@@ -303,7 +303,253 @@ struct DumSink {
   }
 };
 
+// ---------------------------------------------------------------------------
+// The coefficient grammar of `print_row_poly` (row_coeff.h:165-232).
+//
+//   factored:  t1[+-]t2...            each term  [n[/d]][*]name[^e][*name[^e]]*
+//   paren:     (t1[+-]t2...)/([q*]mono)          the numerator terms are integral
+//
+// The factored form reduces each term's denominator by its own gcd(a, den)
+// independently, so one polynomial's terms can carry different denominators
+// (`1/3*d+1/2`); the coefficient's denominator is their lcm, and both forms are then
+// reduced by the content gcd, which is what makes the result equal to the
+// numer()/denom() normalisation the slow path builds from the same text.
+// ---------------------------------------------------------------------------
+
+struct CoeffCursor {
+  const char *p;
+  const char *e;
+  bool at_end() const { return p == e; }
+  bool peek(char c) const { return p < e && *p == c; }
+  bool eat(char c) {
+    if (p < e && *p == c) {
+      ++p;
+      return true;
+    }
+    return false;
+  }
+};
+
+bool read_digits(CoeffCursor &c, std::uint64_t &v) {
+  if (c.p == c.e || *c.p < '0' || *c.p > '9')
+    return false;
+  v = 0;
+  const std::uint64_t limit = static_cast<std::uint64_t>(INT64_MAX);
+  while (c.p < c.e && *c.p >= '0' && *c.p <= '9') {
+    const std::uint64_t d = static_cast<std::uint64_t>(*c.p - '0');
+    if (v > (limit - d) / 10) // check before multiplying: no wrap-around
+      return false;
+    v = v * 10 + d;
+    ++c.p;
+  }
+  return true;
+}
+
+// `name[^e]` then `*name[^e]`...  The whole name must be in the symbol table: `d1` is
+// looked up as `d1`, never as `d` followed by a stray `1`.  A symbol repeated inside
+// one monomial is refused (`d*d` is not a spelling the printer emits -- it writes
+// `d^2` -- and GiNaC would have combined the two factors).
+bool parse_mono(CoeffCursor &c, const std::unordered_map<std::string, unsigned> &sym_index,
+                std::vector<std::pair<std::uint8_t, std::uint8_t>> &vars) {
+  while (true) {
+    const char *b = c.p;
+    if (c.p < c.e && (std::isalpha(static_cast<unsigned char>(*c.p)) || *c.p == '_')) {
+      ++c.p;
+      while (c.p < c.e &&
+             (std::isalnum(static_cast<unsigned char>(*c.p)) || *c.p == '_'))
+        ++c.p;
+    }
+    if (c.p == b)
+      return false;
+    // A std::string's small-string buffer holds the names the printer emits (d, msq,
+    // x12), so this lookup does not allocate.
+    auto it = sym_index.find(std::string(b, c.p));
+    if (it == sym_index.end() || it->second > 255)
+      return false;
+    std::uint64_t exp = 1;
+    if (c.eat('^')) {
+      if (!read_digits(c, exp) || exp == 0 || exp > 255)
+        return false;
+    }
+    const std::uint8_t idx = static_cast<std::uint8_t>(it->second);
+    for (const auto &v : vars)
+      if (v.first == idx)
+        return false;
+    vars.emplace_back(idx, static_cast<std::uint8_t>(exp));
+    if (!c.eat('*'))
+      return true;
+  }
+}
+
+// One term body: an integer coefficient with an optional denominator, an optional '*'
+// and an optional monomial.  `print_row_poly` omits a unit coefficient (`d`, `-d`), so
+// both parts are optional but not both at once.
+bool parse_term_body(CoeffCursor &c, const std::unordered_map<std::string, unsigned> &sym_index,
+                     std::int64_t &num, std::int64_t &den,
+                     std::vector<std::pair<std::uint8_t, std::uint8_t>> &vars) {
+  num = 1;
+  den = 1;
+  vars.clear();
+  if (c.p < c.e && *c.p >= '0' && *c.p <= '9') {
+    std::uint64_t n = 0;
+    if (!read_digits(c, n))
+      return false;
+    num = static_cast<std::int64_t>(n);
+    if (c.eat('/')) {
+      std::uint64_t d = 0;
+      if (!read_digits(c, d) || d == 0)
+        return false;
+      den = static_cast<std::int64_t>(d);
+    }
+    if (!c.eat('*'))
+      return true; // "<n>" or "<n>/<d>" alone: a constant term
+  }
+  return parse_mono(c, sym_index, vars);
+}
+
+struct ParsedTerm {
+  std::int64_t num = 1;
+  std::int64_t den = 1;
+  bool neg = false;
+  std::vector<std::pair<std::uint8_t, std::uint8_t>> vars;
+};
+
+// `in_paren` is the numerator of the paren form: the sum ends at the closing
+// parenthesis, which the caller consumes.
+bool parse_poly(CoeffCursor &c, const std::unordered_map<std::string, unsigned> &sym_index,
+                bool in_paren, std::vector<ParsedTerm> &terms) {
+  terms.clear();
+  bool neg = c.eat('-');
+  if (!neg)
+    c.eat('+');
+  while (true) {
+    ParsedTerm t;
+    t.neg = neg;
+    if (!parse_term_body(c, sym_index, t.num, t.den, t.vars))
+      return false;
+    terms.push_back(std::move(t));
+    if (c.at_end() || (in_paren && c.peek(')')))
+      break;
+    if (c.eat('+'))
+      neg = false;
+    else if (c.eat('-'))
+      neg = true;
+    else
+      return false;
+  }
+  // Two terms with the same monomial would be combined by GiNaC, and in the factored
+  // form they can carry different denominators; refuse instead of guessing (the caller
+  // falls back to the GiNaC parser, which combines them correctly).
+  for (std::size_t i = 0; i < terms.size(); ++i)
+    for (std::size_t j = i + 1; j < terms.size(); ++j)
+      if (terms[i].vars == terms[j].vars)
+        return false;
+  return !terms.empty();
+}
+
 } // namespace
+
+bool parse_spill_coeff(const char *b, const char *e,
+                       const std::unordered_map<std::string, unsigned> &sym_index,
+                       SymCoeff &out) {
+  out = SymCoeff{};
+  CoeffCursor c{b, e};
+  if (c.at_end())
+    return false;
+  std::vector<ParsedTerm> terms;
+  std::uint64_t q = 1;
+  std::vector<std::pair<std::uint8_t, std::uint8_t>> mono;
+  const bool paren = c.peek('(');
+  if (paren) {
+    ++c.p;
+    if (!parse_poly(c, sym_index, /*in_paren=*/true, terms))
+      return false;
+    if (!c.eat(')') || !c.eat('/') || !c.eat('(')) // the printer writes ")/("
+      return false;
+    if (c.p < c.e && *c.p >= '0' && *c.p <= '9') {
+      if (!read_digits(c, q) || q == 0 || q > 0x7fffffffULL)
+        return false;
+      if (!c.eat('*'))
+        return false;
+    }
+    if (!parse_mono(c, sym_index, mono))
+      return false;
+    if (!c.eat(')'))
+      return false;
+  } else {
+    if (!parse_poly(c, sym_index, /*in_paren=*/false, terms))
+      return false;
+  }
+  if (!c.at_end())
+    return false;
+
+  if (paren) {
+    // The numerator's terms are integral by construction (q and the monomial are
+    // printed around the parentheses).
+    for (const ParsedTerm &t : terms) {
+      if (t.den != 1)
+        return false;
+      out.num.terms.push_back(
+          SymTerm{cln::cl_I(t.neg ? -t.num : t.num), t.vars});
+    }
+    // The denominator is the product q*mono -- one polynomial term, which is what
+    // GiNaC's denom() makes of the same text (`(d-2)/(2*m^2)` -> `2*m^2`).
+    SymTerm den;
+    den.coef = cln::cl_I(static_cast<long>(q));
+    den.vars = mono;
+    out.den.terms.push_back(std::move(den));
+  } else {
+    // Common denominator: the lcm of the per-term denominators.
+    std::uint64_t l = 1;
+    for (const ParsedTerm &t : terms) {
+      const std::uint64_t d = static_cast<std::uint64_t>(t.den);
+      const std::uint64_t g = std::gcd(l, d);
+      if (l / g > 0x7fffffffULL / (d / g))
+        return false; // a denominator the int32 the printer uses cannot hold
+      l = (l / g) * d;
+    }
+    for (const ParsedTerm &t : terms) {
+      const std::int64_t scale = static_cast<std::int64_t>(l / static_cast<std::uint64_t>(t.den));
+      if (t.num > INT64_MAX / scale)
+        return false;
+      const std::int64_t v = t.num * scale;
+      out.num.terms.push_back(SymTerm{cln::cl_I(t.neg ? -v : v), t.vars});
+    }
+    if (l != 1)
+      out.den.terms.push_back(SymTerm{cln::cl_I(static_cast<long>(l)), {}});
+  }
+
+  // Content gcd: divide numerator and denominator by what they share, so a paren form
+  // the printer left unreduced (`(2*d+4)/(2*m^2)`) comes out as GiNaC's numer()/denom()
+  // would give it.  Only what the denominator carries can cancel -- with no denominator
+  // the numerator's content is untouched (`-3*d` stays `-3*d`, as GiNaC leaves it).
+  cln::cl_I g = 0;
+  if (!out.den.terms.empty()) {
+    for (const SymTerm &t : out.num.terms)
+      g = cln::gcd(g, t.coef);
+    for (const SymTerm &t : out.den.terms)
+      g = cln::gcd(g, t.coef);
+  }
+  if (g != 0 && g != 1) {
+    for (SymTerm &t : out.num.terms)
+      t.coef = cln::exquo(t.coef, g);
+    for (SymTerm &t : out.den.terms)
+      t.coef = cln::exquo(t.coef, g);
+  }
+  // GiNaC's `add` drops zero terms and the empty sum prints `0`: a zero coefficient
+  // must not survive into the table, and a zero sum carries no denominator.
+  out.num.terms.erase(std::remove_if(out.num.terms.begin(), out.num.terms.end(),
+                                     [](const SymTerm &t) { return cln::zerop(t.coef); }),
+                      out.num.terms.end());
+  if (out.num.terms.empty()) {
+    out.den.terms.clear();
+  } else if (out.den.terms.size() == 1 && out.den.terms[0].vars.empty() &&
+             out.den.terms[0].coef == 1) {
+    out.den.terms.clear(); // make_sym_coeff empties a denominator of 1
+  }
+  out.precompiled = true;
+  return true;
+}
 
 bool read_spill_numeric(const std::string &path,
                         const std::unordered_map<RawIntegral, unsigned> &integral_id,
