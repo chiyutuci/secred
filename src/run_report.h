@@ -254,9 +254,10 @@ struct LearnSummary {
   double seconds = 0.0;
 };
 
-inline std::string format_learn_summary(const LearnSummary &s) {
+inline std::string format_learn_summary(const LearnSummary &s,
+                                        const char *tag = kFlowTag) {
   std::ostringstream oss;
-  oss << "  " << kFlowTag << " learn done: " << s.independent_equations
+  oss << "  " << tag << " learn done: " << s.independent_equations
       << " independent equations, " << s.masters << " masters ("
       << format_duration(s.seconds) << ")\n";
   return oss.str();

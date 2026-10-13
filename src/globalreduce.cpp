@@ -49,9 +49,12 @@
 namespace {
 namespace ff = fflow;
 
-// The shared evaluation half lives in symbolic_ffred.h, which owns `parallel_for`;
-// this file feeds it the parsed system and drives the reconstruction.
+// The shared evaluation half lives in symbolic_ffred.h, which owns `parallel_for`, the
+// shared subset solve and the masters_final writer; this file feeds it the parsed
+// system and drives the reconstruction.
 using secred::parallel_for;
+using secred::solve_res_eqs;
+using secred::write_masters_final;
 
 // Multithreaded rational reconstruction with progress logging: per prime, ffred
 // forward elimination yields the target coefficients, then rat_rec and CRT run in
@@ -197,37 +200,6 @@ bool reconstruct_ffred(const std::vector<secred::Eq> &system,
   }
 
   return false;
-}
-
-// Forward elimination plus back substitution on an already reduced ResEq subset (used by
-// the symbolic path to evaluate at the learn point).
-void solve_res_eqs(std::vector<secred::ResEq> &res_eqs,
-                   std::vector<uint32_t> &sys_idx, uint64_t p,
-                   secred::SubSolve &out) {
-  out.solmap.clear();
-  out.eq_index.clear();
-  out.fwd_deps.clear();
-  out.bwd_deps.clear();
-  secred::forward_eliminate(res_eqs, sys_idx, p, out.solmap, nullptr, nullptr);
-  secred::backward_eliminate(out.solmap, p, &out.bwd_deps);
-}
-
-// Write the final master basis (one integral per line, as in masters_sector).  It is
-// known as soon as the learn pass has run, so it lands before the reconstruction —
-// which can be the longest phase of the run.
-void write_masters_final(const std::string &path,
-                         const std::vector<RawIntegral> &all_integrals,
-                         const std::vector<unsigned> &masters) {
-  std::vector<RawIntegral> basis;
-  basis.reserve(masters.size());
-  for (unsigned m : masters)
-    basis.push_back(all_integrals[m]);
-  if (!secred::write_masters_file(path, basis)) {
-    std::cerr << "finiteflow global reduction: cannot write " << path << "\n";
-    return;
-  }
-  std::cout << "  " << secred::kFlowTag << " masters_final: " << basis.size()
-            << " masters written to " << path << "\n";
 }
 
 } // namespace
@@ -709,170 +681,21 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     return res;
   }
 
-  // 3) Learn at a generic sample point and the learn prime: forward and backward
-  // elimination -> masters + structure + dependencies.
+  // 3) The learn both symbolic backends share: one fixed sample point, the elimination,
+  // the masters, the mark-and-sweep selection and both report blocks (symbolic_ffred.h).
   const uint64_t learn_prime = ff::BIG_UINT_PRIMES[0];
-  std::mt19937_64 rng(0x9E3779B97F4A7C15ULL);
-  std::vector<ff::UInt> learn_pt(nparams);
-  for (unsigned i = 0; i < nparams; ++i)
-    learn_pt[i] = rng() % learn_prime;
-  GiNaC::exmap learn_subs;
-  for (unsigned i = 0; i < nparams; ++i)
-    learn_subs[GiNaC::ex(symbols[i])] = GiNaC::numeric(learn_pt[i]);
-  const std::vector<std::vector<uint64_t>> learn_powers =
-      make_powers(system, learn_pt.data(), nparams, learn_prime);
-
-  std::vector<secred::ResEq> learn_res_eqs;
-  std::vector<uint32_t> learn_sys_idx;
-  {
-    std::vector<uint32_t> all_idx(neqs);
-    for (unsigned i = 0; i < neqs; ++i)
-      all_idx[i] = i;
-    secred::reduce_sym_system(system, learn_prime);
-    if (!eval_sym_eqs_mod(system, all_idx, learn_subs, learn_powers, learn_prime,
-                          learn_res_eqs, learn_sys_idx)) {
-      std::cerr << "finiteflow symbolic global reduction: coefficients were not "
-                   "reduced for the learn prime\n";
-      return res;
-    }
+  secred::SymbolicGlobalLearn learn = secred::symbolic_global_learn(
+      system, target_ids, all_integrals, symbols, learn_prime, masters_final_path,
+      secred::kFlowTag, narrowing_success, narrowing_fail, raw_equations_total,
+      global_equations_count);
+  if (!learn.ok) {
+    std::cerr << "finiteflow symbolic global reduction: " << learn.error << "\n";
+    return res;
   }
-
-  std::unordered_map<uint32_t, secred::ResEq> learn_solmap;
-  std::unordered_map<uint32_t, uint32_t> eq_index;
-  std::unordered_map<uint32_t, std::vector<uint32_t>> fwd_deps, bwd_deps;
-  double learn_s = 0.0;
-  {
-    auto t_learn0 = std::chrono::steady_clock::now();
-    secred::forward_eliminate(learn_res_eqs, learn_sys_idx, learn_prime,
-                              learn_solmap, &eq_index, &fwd_deps);
-    secred::backward_eliminate(learn_solmap, learn_prime, &bwd_deps);
-    auto t_learn1 = std::chrono::steady_clock::now();
-    learn_s = std::chrono::duration<double>(t_learn1 - t_learn0).count();
-  }
-
-  // Masters = union of the right-hand sides of the target reductions.
-  std::set<unsigned> needed_masters;
-  for (unsigned id : target_ids) {
-    auto it = learn_solmap.find(id);
-    if (it == learn_solmap.end())
-      continue;
-    const secred::ResEq &red = it->second;
-    for (size_t k = 1; k < red.size(); ++k)
-      needed_masters.insert(red[k].first);
-  }
-  std::vector<unsigned> masters(needed_masters.rbegin(), needed_masters.rend());
-  const unsigned nnindeps = masters.size();
-
-  std::vector<unsigned> dep_targets;
-  for (unsigned id : target_ids)
-    if (learn_solmap.find(id) != learn_solmap.end())
-      dep_targets.push_back(id);
-  const unsigned nndeps = dep_targets.size();
-
-  std::unordered_map<unsigned, unsigned> master_index;
-  for (unsigned j = 0; j < nnindeps; ++j)
-    master_index[masters[j]] = j;
-
-  // Mark-and-sweep from the targets along the forward / backward dependency closure.
-  auto sweep = [&](bool with_bwd) {
-    std::unordered_set<uint32_t> s(dep_targets.begin(), dep_targets.end());
-    std::vector<uint32_t> stack(dep_targets.begin(), dep_targets.end());
-    while (!stack.empty()) {
-      uint32_t w = stack.back();
-      stack.pop_back();
-      auto fit = fwd_deps.find(w);
-      if (fit != fwd_deps.end())
-        for (uint32_t u : fit->second)
-          if (s.insert(u).second)
-            stack.push_back(u);
-      if (with_bwd) {
-        auto bit = bwd_deps.find(w);
-        if (bit != bwd_deps.end())
-          for (uint32_t u : bit->second)
-            if (s.insert(u).second)
-              stack.push_back(u);
-      }
-    }
-    return s;
-  };
-  std::unordered_set<uint32_t> needed = sweep(true); // fallback closure: forward and backward
-  std::vector<uint32_t> needed_eq_idx;
-  std::vector<uint32_t> bwd_chain;
-  bool use_forward = false;
-  {
-    // The repair loop re-solves the subsystem at the learn sample point (same prime and
-    // same symbolic values as learn).
-    auto solve_at_learn = [&](const std::vector<uint32_t> &idx,
-                              secred::SubSolve &sub) {
-      std::vector<secred::ResEq> res_eqs;
-      std::vector<uint32_t> sys_idx;
-      eval_sym_eqs_mod(system, idx, learn_subs, learn_powers, learn_prime,
-                       res_eqs, sys_idx);
-      solve_res_eqs(res_eqs, sys_idx, learn_prime, sub);
-    };
-    GlobalSelection gsel =
-        select_global_forward(eq_index, fwd_deps, learn_solmap, dep_targets,
-                              master_index, solve_at_learn);
-    if (gsel.fallback) {
-      std::cerr << "finiteflow symbolic global reduction: forward selection did "
-                   "not converge, falling back to the legacy closure\n";
-    } else {
-      use_forward = true;
-      needed_eq_idx = std::move(gsel.needed_eq_idx);
-      bwd_chain = std::move(gsel.bwd_chain);
-    }
-  }
-  if (!use_forward) {
-    needed_eq_idx.reserve(needed.size());
-    for (uint32_t w : needed) {
-      auto it = eq_index.find(w);
-      if (it != eq_index.end())
-        needed_eq_idx.push_back(it->second);
-    }
-    std::sort(needed_eq_idx.begin(), needed_eq_idx.end());
-    // Lazy chain (targets plus the derived integrals in the backward dependency closure).
-    std::unordered_set<uint32_t> chain_set(dep_targets.begin(),
-                                           dep_targets.end());
-    std::vector<uint32_t> stack(dep_targets.begin(), dep_targets.end());
-    while (!stack.empty()) {
-      uint32_t w = stack.back();
-      stack.pop_back();
-      auto bit = bwd_deps.find(w);
-      if (bit != bwd_deps.end())
-        for (uint32_t u : bit->second)
-          if (chain_set.insert(u).second)
-            stack.push_back(u);
-    }
-    bwd_chain.assign(chain_set.begin(), chain_set.end());
-    std::sort(bwd_chain.begin(), bwd_chain.end());
-  }
-
-  res.selected_equations = static_cast<std::uint64_t>(learn_solmap.size());
+  res.selected_equations = learn.selected_equations;
   res.raw_equations = neqs;
-
-  {
-    secred::LearnSummary ls;
-    ls.independent_equations = res.selected_equations;
-    ls.masters = nnindeps;
-    ls.seconds = learn_s;
-    std::cout << "\n" << secred::format_learn_summary(ls);
-  }
-
-  write_masters_final(masters_final_path, all_integrals, masters);
-
-  // Consolidated Reduction Statistics (as in the numeric path): "Final
-  // equations" is what the mark-and-sweep keeps, i.e. what the reconstruction
-  // actually runs on.
-  {
-    secred::ReductionStats rs;
-    rs.narrowing_success = narrowing_success;
-    rs.narrowing_fail = narrowing_fail;
-    rs.raw_equations = raw_equations_total;
-    rs.global_equations = global_equations_count;
-    rs.final_equations = needed_eq_idx.size();
-    rs.masters = nnindeps;
-    std::cout << "\n" << secred::format_reduction_statistics(rs);
-  }
+  const unsigned nnindeps = learn.nnindeps;
+  const unsigned nndeps = learn.dep_targets.size();
 
   // 4) Build the algorithm and run FiniteFlow's multivariate rational reconstruction.
   std::vector<GiNaC::ex> symbol_ex;
@@ -880,9 +703,11 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   for (const auto &s : symbols)
     symbol_ex.push_back(GiNaC::ex(s));
 
-  SymbolicFFRedAlgorithm alg(std::move(system), std::move(needed_eq_idx),
-                             std::move(bwd_chain), dep_targets,
-                             std::move(master_index), nnindeps,
+  // `dep_targets` is copied, not moved: the output assembly below still needs it to map
+  // a target id to its row of the reconstructed matrix.
+  SymbolicFFRedAlgorithm alg(std::move(system), std::move(learn.needed_eq_idx),
+                             std::move(learn.bwd_chain), learn.dep_targets,
+                             std::move(learn.master_index), nnindeps,
                              std::move(symbol_ex));
 
   const unsigned nparsout = alg.nparsout;
@@ -1072,11 +897,11 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     varnames[i] = symbols[i].get_name();
 
   for (unsigned j = 0; j < nnindeps; ++j)
-    res.masters.push_back(all_integrals[masters[j]]);
+    res.masters.push_back(all_integrals[learn.masters[j]]);
 
   std::unordered_map<unsigned, unsigned> dep_index;
   for (unsigned i = 0; i < nndeps; ++i)
-    dep_index[dep_targets[i]] = i;
+    dep_index[learn.dep_targets[i]] = i;
 
   for (const auto &t : targets) {
     res.reductions.emplace_back(t, std::string("-1"));
@@ -1091,7 +916,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
       const ff::MPReconstructedRatFun &r = recf[(std::size_t)i * nnindeps + j];
       if (r.numerator().size() == 0)
         continue; // zero coefficient
-      res.reductions.emplace_back(all_integrals[masters[j]],
+      res.reductions.emplace_back(all_integrals[learn.masters[j]],
                                   r.to_str(varnames.data()));
     }
   }
@@ -1099,7 +924,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   // As in the numeric path, the split is reported by the end-of-run Timing
   // Statistics block.
   res.phase_split = true;
-  res.learn_seconds = learn_s;
+  res.learn_seconds = learn.learn_seconds;
   res.reconstruction_seconds =
       std::chrono::duration<double>(t3 - t2).count();
 

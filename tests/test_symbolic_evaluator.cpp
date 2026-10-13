@@ -1,9 +1,10 @@
-// The shared evaluator: the selection inputs, the point evaluation, and the counters
-// the FireFly backend reports.
+// The shared evaluator: the selection inputs, the point evaluation, the shared learn,
+// and the counters the FireFly backend reports.
 #include <cstdint>
 #include <unordered_map>
 #include <vector>
 
+#include "sector.h"       // RawIntegral, the integral type the learn indexes into
 #include "symbolic_ffred.h"
 #include "test_runner.h"
 
@@ -129,4 +130,48 @@ TEST(symbolic_evaluator_reports_a_non_master_rhs) {
           secred::SymbolicFFEvaluator::PointResult::NonMasterRhs);
   REQUIRE_EQ(scratch.fail_target, 3u);
   REQUIRE_EQ(scratch.fail_integral, 0u);
+}
+
+TEST(symbolic_global_learn_picks_the_same_selection_every_time) {
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"),
+                                                 GiNaC::possymbol("s")};
+  auto build = [&]() {
+    return std::vector<secred::SymEq>{
+        eq_of({{3, coeff("1", symbols)}, {1, coeff("(-2+d)/d", symbols)},
+               {2, coeff("1/d", symbols)}, {0, coeff("3", symbols)}}),
+        eq_of({{2, coeff("1", symbols)}, {0, coeff("(d-4)/s", symbols)}}),
+        eq_of({{1, coeff("1", symbols)}, {0, coeff("(2*d)/s", symbols)}})};
+  };
+  const std::vector<RawIntegral> integrals = {RawIntegral(std::vector<int>{0, 0}),
+                                              RawIntegral(std::vector<int>{1, 0}),
+                                              RawIntegral(std::vector<int>{0, 1}),
+                                              RawIntegral(std::vector<int>{1, 1})};
+  std::vector<secred::SymEq> a = build(), b = build();
+  const secred::SymbolicGlobalLearn la =
+      secred::symbolic_global_learn(a, {3}, integrals, symbols, 1125899906842597ULL,
+                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+  const secred::SymbolicGlobalLearn lb =
+      secred::symbolic_global_learn(b, {3}, integrals, symbols, 1125899906842597ULL,
+                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+  REQUIRE(la.ok);
+  REQUIRE_EQ(la.nnindeps, 1u);                        // one master: [0,0]
+  REQUIRE_EQ(la.dep_targets.size(), std::size_t(1));
+  REQUIRE_EQ(la.needed_eq_idx.size(), std::size_t(3));
+  REQUIRE_EQ(la.masters, lb.masters);                 // deterministic, no clock, no rng
+  REQUIRE_EQ(la.needed_eq_idx, lb.needed_eq_idx);
+  REQUIRE_EQ(la.bwd_chain, lb.bwd_chain);
+}
+
+TEST(symbolic_global_learn_reports_a_target_that_is_a_master) {
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d")};
+  std::vector<secred::SymEq> system = {eq_of({{1, coeff("1", symbols)},
+                                              {0, coeff("d", symbols)}})};
+  const std::vector<RawIntegral> integrals = {RawIntegral(std::vector<int>{0}),
+                                              RawIntegral(std::vector<int>{1})};
+  const secred::SymbolicGlobalLearn l =
+      secred::symbolic_global_learn(system, {0}, integrals, symbols, 1125899906842597ULL,
+                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+  REQUIRE(l.ok);
+  REQUIRE_EQ(l.dep_targets.size(), std::size_t(0));   // [0] never becomes a pivot
+  REQUIRE_EQ(l.nnindeps, 0u);
 }
