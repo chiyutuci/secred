@@ -236,12 +236,15 @@ make_powers(const std::vector<SymEq> &system, const fflow::UInt *x,
 
 // Evaluate a symbolic coefficient at the sample point and reduce mod p.  Numerator
 // and denominator are evaluated separately, so both sides are plain integers.
-// Writes 0 to `out` when the denominator vanishes mod p; standard IBP denominators
-// are far below the prime, so this does not arise.  False means the precompiled
-// tables were not reduced for `p` — see `reduce_sym_system`.
+// Writes 0 to `out` when the denominator vanishes mod p, setting `*zero_den` when the
+// caller passes it: such a coefficient is indistinguishable from a true zero in the
+// result, so the count is the only record that the point is not trustworthy; standard
+// IBP denominators are far below the prime, so this does not arise.  False means the
+// precompiled tables were not reduced for `p` — see `reduce_sym_system`.
 inline bool eval_sym_coeff_mod(
     const SymCoeff &c, const GiNaC::exmap &subs,
-    const std::vector<std::vector<uint64_t>> &powers, uint64_t p, uint64_t &out) {
+    const std::vector<std::vector<uint64_t>> &powers, uint64_t p, uint64_t &out,
+    bool *zero_den = nullptr) {
   if (c.precompiled) {
     uint64_t n = 0;
     if (!eval_sym_poly_mod(c.num, powers, p, n))
@@ -255,6 +258,8 @@ inline bool eval_sym_coeff_mod(
       return false;
     if (d == 0) {
       out = 0;
+      if (zero_den)
+        *zero_den = true;
       return true;
     }
     uint64_t inv = mod_inverse_u64(d, p);
@@ -290,10 +295,49 @@ inline bool eval_sym_coeff_mod(
   }
   if (d == 0) {
     out = 0;
+    if (zero_den)
+      *zero_den = true;
     return true;
   }
   uint64_t inv = mod_inverse_u64(d, p);
   out = static_cast<uint64_t>((static_cast<__int128>(n) * inv) % p);
+  return true;
+}
+
+// Evaluate `system` over the `eq_idx` subset at one sample point and prime.  False when
+// the coefficient tables have not been reduced for `p` (see reduce_sym_system); a
+// coefficient whose denominator vanishes mod p evaluates to 0, and `zero_dens` counts
+// those points (they are indistinguishable from a true zero in the result).
+inline bool eval_sym_eqs_mod(const std::vector<SymEq> &system,
+                             const std::vector<uint32_t> &eq_idx,
+                             const GiNaC::exmap &subs,
+                             const std::vector<std::vector<uint64_t>> &powers,
+                             uint64_t p, std::vector<ResEq> &res_eqs,
+                             std::vector<uint32_t> &sys_idx,
+                             std::uint64_t *zero_dens = nullptr) {
+  res_eqs.clear();
+  sys_idx.clear();
+  res_eqs.reserve(eq_idx.size());
+  sys_idx.reserve(eq_idx.size());
+  for (uint32_t i : eq_idx) {
+    const SymEq &eq = system[i];
+    ResEq re;
+    re.reserve(eq.size());
+    for (const auto &[id, c] : eq) {
+      uint64_t v = 0;
+      bool zd = false;
+      if (!eval_sym_coeff_mod(c, subs, powers, p, v, &zd))
+        return false;
+      if (zd && zero_dens)
+        *zero_dens += 1;
+      if (v)
+        re.emplace_back(id, v);
+    }
+    if (!re.empty()) {
+      res_eqs.push_back(std::move(re));
+      sys_idx.push_back(i);
+    }
+  }
   return true;
 }
 

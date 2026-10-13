@@ -40,6 +40,7 @@
 #include "progress_bar.h"
 #include "spill_reader.h"
 #include "sym_coeff.h"
+#include "symbolic_ffred.h"
 
 // ---------------------------------------------------------------------------
 // Pure-numeric FiniteFlow global reduction (no symbols, no Kira/FireFly, no "dum" variable)
@@ -48,29 +49,9 @@
 namespace {
 namespace ff = fflow;
 
-// Simple parallel for: [0,n) split statically over nthreads threads.
-template <typename F>
-void parallel_for(unsigned nthreads, std::size_t n, F f) {
-  if (nthreads <= 1 || n <= 1) {
-    for (std::size_t i = 0; i < n; ++i)
-      f(i);
-    return;
-  }
-  if (nthreads > n)
-    nthreads = static_cast<unsigned>(n);
-  std::vector<std::thread> threads;
-  threads.reserve(nthreads);
-  for (unsigned t = 0; t < nthreads; ++t) {
-    std::size_t beg = n * t / nthreads;
-    std::size_t end = n * (t + 1) / nthreads;
-    threads.emplace_back([&f, beg, end]() {
-      for (std::size_t i = beg; i < end; ++i)
-        f(i);
-    });
-  }
-  for (auto &th : threads)
-    th.join();
-}
+// The shared evaluation half lives in symbolic_ffred.h, which owns `parallel_for`;
+// this file feeds it the parsed system and drives the reconstruction.
+using secred::parallel_for;
 
 // Multithreaded rational reconstruction with progress logging: per prime, ffred
 // forward elimination yields the target coefficients, then rat_rec and CRT run in
@@ -581,60 +562,16 @@ namespace {
 // The precompiled coefficient machinery lives in sym_coeff.h so the tests can drive
 // it directly; this file only feeds it the parsed system and evaluates equations.
 using secred::eval_sym_coeff_mod;
+using secred::eval_sym_eqs_mod;
 using secred::fill_powers;
 using secred::make_powers;
 using secred::make_sym_coeff;
 using secred::sym_max_exps;
 using secred::SymEq;
 
-// Reduce a set of symbolic equations to a ResEq system mod p at the sample point.
-// False when the coefficient tables were not reduced for `p`.
-bool eval_sym_eqs_mod(const std::vector<SymEq> &system,
-                      const std::vector<uint32_t> &eq_idx,
-                      const GiNaC::exmap &subs,
-                      const std::vector<std::vector<uint64_t>> &powers,
-                      uint64_t p, std::vector<secred::ResEq> &res_eqs,
-                      std::vector<uint32_t> &sys_idx) {
-  res_eqs.clear();
-  sys_idx.clear();
-  res_eqs.reserve(eq_idx.size());
-  sys_idx.reserve(eq_idx.size());
-  for (uint32_t i : eq_idx) {
-    const SymEq &eq = system[i];
-    secred::ResEq re;
-    re.reserve(eq.size());
-    for (const auto &[id, c] : eq) {
-      uint64_t v = 0;
-      if (!eval_sym_coeff_mod(c, subs, powers, p, v))
-        return false;
-      if (v)
-        re.emplace_back(id, v);
-    }
-    if (!re.empty()) {
-      res_eqs.push_back(std::move(re));
-      sys_idx.push_back(i);
-    }
-  }
-  return true;
-}
-
-// Per-thread scratch for one sample point.  FiniteFlow hands the `AlgorithmData*` its
-// caller was given straight back to every `Algorithm::evaluate`, so the buffers a
-// sample point needs are owned per thread instead of by the algorithm: that is what
-// lets the sample points be evaluated concurrently.  The coefficient tables are *not*
-// here — they belong to the system, which is reduced once per prime before any
-// evaluation starts and only read from then on.
-struct SymbolicFFScratch : public fflow::AlgorithmData {
-  std::vector<std::vector<uint64_t>> powers; // powers[i][k] = x_i^k at this point
-  std::vector<secred::ResEq> res_eqs;
-  std::vector<uint32_t> sys_idx;
-  std::unordered_map<uint32_t, secred::ResEq> solmap;
-  bool sized = false;
-};
-
-// Custom algorithm driving FiniteFlow's reconstruction: substitute the sample point,
-// reduce mod p, run ffred forward and backward elimination, and emit the target x
-// master coefficients.
+// The FiniteFlow adapter: the shared evaluator behind fflow::Algorithm.  FiniteFlow
+// hands the `AlgorithmData*` its caller was given straight back to every evaluate, so
+// the per-thread scratch stays an fflow::AlgorithmData around the evaluator's scratch.
 class SymbolicFFRedAlgorithm : public fflow::Algorithm {
 public:
   SymbolicFFRedAlgorithm(std::vector<SymEq> system,
@@ -643,47 +580,31 @@ public:
                          std::vector<unsigned> dep_targets,
                          std::unordered_map<unsigned, unsigned> master_index,
                          unsigned nnindeps, std::vector<GiNaC::ex> symbols)
-      : system_(std::move(system)), eq_idx_(std::move(eq_idx)),
-        bwd_chain_(std::move(bwd_chain)), dep_targets_(std::move(dep_targets)),
-        master_index_(std::move(master_index)), nnindeps_(nnindeps),
-        symbols_(std::move(symbols)) {
-    nparsin.push_back(static_cast<unsigned>(symbols_.size()));
-    nparsout = static_cast<unsigned>(dep_targets_.size() * nnindeps_);
-
-    // Highest power of each symbol used anywhere in the precompiled coefficients:
-    // sizing the per-point power table once keeps the evaluation loop free of
-    // recomputation.
-    const unsigned nvars = symbols_.size();
-    mx_ = sym_max_exps(system_, nvars);
-    all_precompiled_ = true;
-    for (const SymEq &eq : system_)
-      for (const auto &pr : eq)
-        if (!pr.second.precompiled)
-          all_precompiled_ = false;
+      : ev_(std::move(system), std::move(eq_idx), std::move(bwd_chain),
+            std::move(dep_targets), std::move(master_index), nnindeps,
+            std::move(symbols)) {
+    nparsin.push_back(ev_.n_params());
+    nparsout = ev_.n_outputs();
   }
 
-  // Reduce every coefficient of the system mod p.  FiniteFlow evaluates one prime at a
-  // time, and the table holds a single prime, so this runs between evaluation phases
-  // and never while a thread is evaluating.  Parallel over the equations: the tables
-  // hang off the equations, so there is nothing to contend for.
-  void reduce_for_prime(uint64_t p, unsigned nthreads) {
-    parallel_for(nthreads, system_.size(), [&](std::size_t i) {
-      for (auto &pr : system_[i]) {
-        if (!pr.second.precompiled)
-          continue;
-        secred::reduce_sym_poly(pr.second.num, p);
-        secred::reduce_sym_poly(pr.second.den, p);
-      }
-    });
-  }
+  // Per-thread scratch for one sample point.  The buffers a sample point needs are
+  // owned per thread instead of by the algorithm: that is what lets the sample points
+  // be evaluated concurrently.  The coefficient tables are *not* here — they belong to
+  // the system, which is reduced once per prime before any evaluation starts and only
+  // read from then on.
+  struct FFScratch : public fflow::AlgorithmData {
+    secred::SymbolicFFEvaluator::Scratch scratch;
+  };
 
-  std::size_t n_equations() const { return system_.size(); }
+  void reduce_for_prime(uint64_t p, unsigned nthreads) { ev_.reduce_for_prime(p, nthreads); }
+
+  std::size_t n_equations() const { return ev_.n_equations(); }
 
   fflow::Ret evaluate(fflow::Context *, fflow::AlgInput xin[], fflow::Mod mod,
                       fflow::AlgorithmData *data,
                       fflow::UInt xout[]) const override {
     if (data)
-      return evaluate_with(static_cast<SymbolicFFScratch *>(data), xin, mod, xout);
+      return evaluate_with(static_cast<FFScratch *>(data), xin, mod, xout);
     // The degree-estimation phases call FiniteFlow without an AlgorithmData of their
     // own; they run on the algorithm's scratch, serialised so that a caller mixing
     // both styles still sees one sample point at a time.
@@ -692,83 +613,36 @@ public:
   }
 
 private:
-  fflow::Ret evaluate_with(SymbolicFFScratch *scratch, fflow::AlgInput xin[],
-                           fflow::Mod mod, fflow::UInt xout[]) const {
+  fflow::Ret evaluate_with(FFScratch *scratch, fflow::AlgInput xin[], fflow::Mod mod,
+                           fflow::UInt xout[]) const {
+    static_assert(sizeof(fflow::UInt) == sizeof(std::uint64_t));
     const uint64_t p = mod.n();
-    const fflow::UInt *x = xin[0];
-    const unsigned nvars = symbols_.size();
-
-    if (!scratch->sized) {
-      scratch->powers.assign(nvars, std::vector<uint64_t>(1, 1));
-      for (unsigned i = 0; i < nvars; ++i)
-        scratch->powers[i].resize(mx_[i] + 1);
-      scratch->sized = true;
-    }
-
-    // Powers of the sample values, shared by every coefficient at this point.
-    fill_powers(scratch->powers, x, p);
-
-    // The GiNaC substitution table is only needed for coefficients that could not be
-    // precompiled.
-    GiNaC::exmap subs;
-    if (!all_precompiled_)
-      for (unsigned i = 0; i < nvars; ++i)
-        subs[symbols_[i]] = GiNaC::numeric(x[i]);
-
-    if (!eval_sym_eqs_mod(system_, eq_idx_, subs, scratch->powers, p,
-                          scratch->res_eqs, scratch->sys_idx)) {
+    const std::uint64_t *x = xin[0];
+    const secred::SymbolicFFEvaluator::PointResult r =
+        ev_.evaluate_point(p, x, scratch->scratch, xout);
+    if (r == secred::SymbolicFFEvaluator::PointResult::Ok)
+      return fflow::SUCCESS;
+    if (r == secred::SymbolicFFEvaluator::PointResult::NotReduced) {
       std::cerr << "finiteflow symbolic global reduction: coefficients were not "
                    "reduced for prime "
                 << p << "; aborting instead of evaluating the wrong modulus\n";
-      return fflow::FAILED;
+    } else {
+      // Hard check (as in the numeric path): a non-master on a right-hand side means
+      // the selection is stale at this sample point and prime, so the output would
+      // miss a term.  Return FAILED to abort the reconstruction rather than emit a
+      // truncated reduction.
+      std::cerr << "finiteflow symbolic global reduction: target "
+                << scratch->scratch.fail_target << " reduces to integral "
+                << scratch->scratch.fail_integral
+                << ", which is not a master (equation selection is stale); "
+                   "aborting instead of emitting a truncated reduction\n";
     }
-
-    scratch->solmap.clear();
-    secred::forward_eliminate(scratch->res_eqs, scratch->sys_idx, p,
-                              scratch->solmap, nullptr, nullptr);
-    secred::backward_eliminate(scratch->solmap, p, nullptr, &bwd_chain_);
-
-    const unsigned nndeps = dep_targets_.size();
-    std::fill(xout, xout + nndeps * nnindeps_, fflow::UInt(0));
-    for (unsigned i = 0; i < nndeps; ++i) {
-      auto it = scratch->solmap.find(dep_targets_[i]);
-      if (it == scratch->solmap.end())
-        continue;
-      const secred::ResEq &red = it->second;
-      for (size_t k = 1; k < red.size(); ++k) {
-        auto mit = master_index_.find(red[k].first);
-        if (mit != master_index_.end())
-          xout[i * nnindeps_ + mit->second] = red[k].second;
-        else {
-          // Hard check (as in the numeric path): a non-master on a right-hand side means
-          // the selection is stale at this sample point and prime, so the output would
-          // miss a term.  Return FAILED to abort the reconstruction rather than emit a
-          // truncated reduction.
-          std::cerr << "finiteflow symbolic global reduction: target "
-                    << dep_targets_[i] << " reduces to integral " << red[k].first
-                    << ", which is not a master (equation selection is stale); "
-                       "aborting instead of emitting a truncated reduction\n";
-          return fflow::FAILED;
-        }
-      }
-    }
-    return fflow::SUCCESS;
+    return fflow::FAILED;
   }
 
-  std::vector<SymEq> system_;
-  std::vector<uint32_t> eq_idx_;
-  std::vector<uint32_t> bwd_chain_;
-  std::vector<unsigned> dep_targets_;
-  std::unordered_map<unsigned, unsigned> master_index_;
-  unsigned nnindeps_;
-  std::vector<GiNaC::ex> symbols_;
-
-  // Highest power each symbol carries, used to size every thread's power table.
-  std::vector<unsigned> mx_;
-  bool all_precompiled_ = true;
-
+  secred::SymbolicFFEvaluator ev_;
   // Scratch for the FiniteFlow calls that pass no AlgorithmData.
-  mutable SymbolicFFScratch fallback_scratch_;
+  mutable FFScratch fallback_scratch_;
   mutable std::mutex fallback_mutex_;
 };
 
@@ -1084,11 +958,12 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     std::cout << bar.update(0) << std::flush;
 
     std::vector<std::unique_ptr<ff::UIntCache>> part_caches(nthreads);
-    std::vector<std::unique_ptr<SymbolicFFScratch>> part_scratch(nthreads);
+    std::vector<std::unique_ptr<SymbolicFFRedAlgorithm::FFScratch>> part_scratch(
+        nthreads);
     for (unsigned t = 0; t < nthreads; ++t) {
       part_caches[t].reset(new ff::UIntCache);
       part_caches[t]->init(nparams + 1);
-      part_scratch[t].reset(new SymbolicFFScratch);
+      part_scratch[t].reset(new SymbolicFFRedAlgorithm::FFScratch);
     }
 
     std::atomic<std::size_t> done{0};

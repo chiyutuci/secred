@@ -19,6 +19,7 @@ set(TEST_SOURCES
     test_global_order.cpp
     test_spill_reader.cpp
     test_sym_coeff.cpp
+    test_symbolic_evaluator.cpp
     test_row_coeff.cpp
     test_progress_bar.cpp
     test_masters_file.cpp
