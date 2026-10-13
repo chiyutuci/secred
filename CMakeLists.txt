@@ -51,5 +51,13 @@ if (NOT FFLOW_LIBRARY)
 endif ()
 target_link_libraries(secred ${FFLOW_LIBRARY})
 
+#firefly library (the global_tool: firefly backend; FLINT/GMP/MPFR arrive transitively
+# through libfirefly/libfflow)
+find_library(FIREFLY_LIBRARY NAMES firefly PATHS /usr/local/lib)
+if (NOT FIREFLY_LIBRARY)
+    message(FATAL_ERROR "libfirefly not found (FireFly is required for global_tool: firefly)")
+endif ()
+target_link_libraries(secred ${FIREFLY_LIBRARY})
+
 # unit tests
 add_subdirectory(tests)

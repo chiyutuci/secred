@@ -25,6 +25,7 @@ set(TEST_SOURCES
     test_masters_file.cpp
     test_run_report.cpp
     test_utils.cpp
+    test_firefly_global.cpp
 )
 
 # Core secred source files needed by the tests (exclude main.cpp and secred.cpp).
@@ -58,6 +59,7 @@ target_link_libraries(secred_tests
     ${GINAC_LIBRARY}
     ${CLN_LIBRARY}
     ${FFLOW_LIBRARY}
+    ${FIREFLY_LIBRARY}
 )
 
 # Register with CTest so "cmake --build build --target test" works
