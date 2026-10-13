@@ -266,7 +266,7 @@ using GlobalEquation = std::vector<std::pair<RawIntegral, std::string>>;
 
 // Returns the index of the equation in the raw spill file whose leading term
 // (largest integral ID) is smallest, i.e. the equation with the simplest
-// leading term.  Used by _run_global_kira to pick the single equation into
+// leading term.  Used by _run_global_reduction to pick the single equation into
 // which the auxiliary 'dum' variable is injected so that kira accepts a
 // symbol-free rational system.  The scan is coefficient-free: it reads the
 // integrals only (spill_reader.h), so it never parses the coefficient text.
@@ -315,7 +315,7 @@ struct ReductionContext {
   // appended to a raw file (RawIntegral + coefficient text per line, blank line
   // between equations) instead of accumulating in RAM; only the distinct
   // integral set is kept resident, for global ID assignment in
-  // _run_global_kira.
+  // _run_global_reduction.
   std::string rawEquationsPath;
   std::unique_ptr<std::ofstream>
       rawEqOut; // append stream, guarded by globalEqMutex

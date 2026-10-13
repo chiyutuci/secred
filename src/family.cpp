@@ -98,11 +98,12 @@ void Family::run_reduce(Reduce &reduce) {
   _ibpM.shrink_to_fit();
   reduce._ctx.uptargets.clear();
 
-  // FiniteFlow global reduction: the probe-narrowing and final reduction
-  // statistics are consolidated into the Reduction Statistics block printed
-  // inside the in-process reducer (after learn, before reconstruction).
+  // In-process global reduction (FiniteFlow, or FireFly for a symbolic
+  // system): the probe-narrowing and final reduction statistics are
+  // consolidated into the Reduction Statistics block printed inside the
+  // in-process reducer (after learn, before reconstruction).
   const bool finiteflow_global =
-      _global_tool == "finiteflow" &&
+      (_global_tool == "finiteflow" || _global_tool == "firefly") &&
       reduce._ctx.globalEquationsCount.load() > 0;
 
   // Probe narrowing statistics are final once the sector phase completes. Write
@@ -155,7 +156,7 @@ void Family::run_reduce(Reduce &reduce) {
   const auto global_t0 = std::chrono::steady_clock::now();
   GlobalReductionResult globalResult;
   if (reduce._ctx.globalEquationsCount.load() > 0)
-    globalResult = _run_global_kira(reduce);
+    globalResult = _run_global_reduction(reduce);
   else {
     reduce._ctx.rawEqOut.reset();
     std::filesystem::remove(reduce._ctx.rawEquationsPath);
@@ -200,9 +201,8 @@ void Family::run_reduce(Reduce &reduce) {
   }
 
   // Print reduction statistics summary.  (Probe narrowing stats were already
-  // printed before the global Kira phase; the pure-numeric FiniteFlow path
-  // prints its consolidated Reduction Statistics inside
-  // reduce_global_finiteflow instead.)
+  // printed before the global reduction; the in-process paths print their
+  // consolidated Reduction Statistics inside the reducer itself instead.)
   if (!finiteflow_global) {
     const auto &ctx = reduce._ctx;
     std::vector<std::string> labels{"Master integrals",
@@ -380,7 +380,7 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
   pool.wait_for_tasks();
 }
 
-GlobalReductionResult Family::_run_global_kira(Reduce &reduce) const {
+GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
   auto &ctx = reduce._ctx;
 
   // Close the spill stream: all sectors have appended their equations.
@@ -410,25 +410,40 @@ GlobalReductionResult Family::_run_global_kira(Reduce &reduce) const {
   std::string global_path = _cache_dir + "/global";
   fs::create_directories(global_path + "/system");
 
-  // FiniteFlow option: reduce in-process (modular elimination + CRT for
-  // pure-numeric, rational-function reconstruction for symbolic), skipping the
-  // Kira subprocess (and the "dum" symbol workaround) entirely.
-  if (_global_tool == "finiteflow") {
+  // In-process global reduction, skipping the Kira subprocess (and the "dum"
+  // symbol workaround) entirely: modular elimination + CRT for a pure-numeric
+  // system, rational-function reconstruction for a symbolic one.  FireFly is
+  // the second reconstruction engine for the symbolic system (its black box
+  // expresses the coefficients as functions of the parameters, so it has no
+  // numeric counterpart); a numeric system under "firefly" uses the FiniteFlow
+  // numeric path.
+  if (_global_tool == "finiteflow" || _global_tool == "firefly") {
     GlobalReductionResult result;
     const std::string mastersFinalPath =
         _cache_dir + "/" + secred::kMastersFinalFile;
-    if (_symbols.empty())
+    if (_symbols.empty()) {
+      if (_global_tool == "firefly")
+        std::cout << "  " << secred::kFireFlyTag
+                  << " numeric system: reconstructing with the in-process numeric "
+                     "path\n";
       result = reduce_global_finiteflow(
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
           ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
           mastersFinalPath, _global_finiteflow_threads);
-    else
+    } else if (_global_tool == "firefly") {
+      result = secred::reduce_global_firefly_symbolic(
+          ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
+          _symbols, ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
+          ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
+          mastersFinalPath, _global_finiteflow_threads);
+    } else {
       result = reduce_global_finiteflow_symbolic(
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
           _symbols, ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
           mastersFinalPath, _global_finiteflow_threads);
+    }
     std::filesystem::remove(ctx.rawEquationsPath);
 
     fs::create_directories(global_path + "/results/Tuserweight");
@@ -731,9 +746,18 @@ Family::Family(const YAML::Node &config) {
     // memory_reserve: system memory (in GB) kept free during parallel sectors.
     if (s["memory_reserve"])
       _memory_reserve = (std::uint64_t)(s["memory_reserve"].as<double>() * 1024 * 1024 * 1024);
-    // global_tool: which tool performs the global reduction ("kira" or
-    // "finiteflow", default "kira").
-    if (s["global_tool"]) _global_tool = s["global_tool"].as<std::string>();
+    // global_tool: which tool performs the global reduction ("kira",
+    // "finiteflow" or "firefly", default "kira").  "firefly" reconstructs with
+    // FireFly's Reconstructor in-process, which needs a symbolic system; on a
+    // numeric system it falls back to the FiniteFlow numeric path.
+    if (s["global_tool"]) {
+      _global_tool = s["global_tool"].as<std::string>();
+      if (_global_tool != "kira" && _global_tool != "finiteflow" &&
+          _global_tool != "firefly")
+        throw std::runtime_error(
+            "global_tool must be 'kira', 'finiteflow' or 'firefly', got '" +
+            _global_tool + "'");
+    }
     // global_finiteflow_threads: threads for the FiniteFlow reconstruction.
     if (s["global_finiteflow_threads"])
       _global_finiteflow_threads = s["global_finiteflow_threads"].as<unsigned>();

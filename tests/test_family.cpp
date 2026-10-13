@@ -199,6 +199,30 @@ TEST(family_parse_global_tool_finiteflow) {
   REQUIRE(FamilyTestHelper::global_tool(f) == "finiteflow");
 }
 
+TEST(family_parse_global_tool_rejects_an_unknown_value) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_global_tool_unknown");
+  cfg["settings"]["global_tool"] = "fireflyy";
+  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
+}
+
+TEST(family_parse_global_tool_firefly) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_global_tool_firefly");
+  cfg["settings"]["global_tool"] = "firefly";
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::global_tool(f) == "firefly");
+}
+
+TEST(family_parse_global_tool_accepts_the_three_backends) {
+  for (const char *tool : {"kira", "finiteflow", "firefly"}) {
+    clear_symtab();
+    YAML::Node cfg = box_config(std::string("tc_global_tool_ok_") + tool);
+    cfg["settings"]["global_tool"] = tool;
+    REQUIRE_NOTHROW(Family(cfg));
+  }
+}
+
 TEST(family_parse_global_finiteflow_threads_default) {
   clear_symtab();
   YAML::Node cfg = box_config("tc_global_finiteflow_threads_default");

@@ -64,7 +64,7 @@ private:
   // in-process FiniteFlow reduction.  The returned result carries the
   // FiniteFlow phase split (both zero on the Kira path) into the run's
   // Timing Statistics block.
-  GlobalReductionResult _run_global_kira(Reduce &) const;
+  GlobalReductionResult _run_global_reduction(Reduce &) const;
 
 public:
   static GiNaC::symtab symtab;

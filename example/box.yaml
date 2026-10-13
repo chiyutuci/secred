@@ -28,6 +28,9 @@ settings:
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
   kira_parallel: 8            # Kira -p; Kira also starts this many Fermat instances at the end of the run
+  # global_tool: kira (default) | finiteflow | firefly picks the global reducer; on the
+  # in-process ones global_finiteflow_threads sets their reconstruction's thread count
+  # (for firefly, how many FireFly probes run at once).  This file uses the default.
   ordering_mode: balance      # integral ordering: normal (generation order) | balance (default;
                               # seeds, subsector columns and the global numbering all follow the
                               # balance key: total power, depth, rank, max denominator power,

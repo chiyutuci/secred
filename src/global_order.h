@@ -1,4 +1,4 @@
-// Integral numbering order of the global stage; family.cpp's _run_global_kira
+// Integral numbering order of the global stage; family.cpp's _run_global_reduction
 // orders the numbering table shared by the Kira and in-process global paths.
 // Both modes lead with popcount(sector) ASC and only differ inside a layer:
 // Normal uses depth ASC then rank ASC, Balance the five balance keys (total
