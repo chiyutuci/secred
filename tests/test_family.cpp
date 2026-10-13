@@ -1,5 +1,6 @@
 #include "test_runner.h"
 #include "family.h"
+#include "row_coeff.h"
 #include <filesystem>
 #include <sstream>
 
@@ -911,4 +912,64 @@ TEST(family_parse_subsector_depth_offset_is_gone) {
   cfg["settings"]["subsector_depth_offset"] = 3;
   Family f(cfg);
   REQUIRE(FamilyTestHelper::subsector_filter_n(f) == 1u);
+}
+
+// The precompiler against the rows a real symbolic family generates (spec 4.4):
+// the unit corpus is synthetic, this is the shape the benchmark families meet.
+// Every box IBP row must precompile, and evaluating it must reproduce GiNaC's
+// own sum, parsed back with the family's symbol table.
+TEST(row_coeff_precompiles_real_box_ibp_rows) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_row_coeff_box");
+  Family f(cfg);
+  f.init();
+  const auto &ibpM = FamilyTestHelper::ibpM(f);
+  REQUIRE(!ibpM.empty());
+  const unsigned nprops = f.nprops();
+
+  // Seeds of the shapes the settling round emits: a sector support with its
+  // lowest line doubled, one negative power on a line inside the support (the
+  // numerator case) and one above it (the constant case).
+  std::vector<std::vector<int>> seeds;
+  seeds.push_back(std::vector<int>(nprops, 0));
+  for (unsigned neg = 0; neg < nprops; ++neg) {
+    std::vector<int> sv(nprops, 0);
+    sv[0] = 2;
+    sv[neg] -= 1;
+    seeds.push_back(sv);
+  }
+
+  secred::RowTable table; // single-threaded here; the sector holds ginac_mutex
+  GiNaC::parser parser(Family::symtab);
+  unsigned checked = 0;
+  for (unsigned i = 0; i < ibpM.size(); ++i) {
+    table.add(i, ibpM[i]);
+    for (unsigned k = 0; k < ibpM[i].size(); ++k) {
+      REQUIRE(table.rows[i][k].precompiled);
+      ++checked;
+      for (const std::vector<int> &sv : seeds) {
+        const RawIntegral seed(sv);
+        std::string got;
+        const secred::RowEval st = table.eval(i, k, seed, got);
+        GiNaC::ex want;
+        for (unsigned p = 0; p < nprops; ++p)
+          want += ibpM[i][k].second[p] * seed[p];
+        want += ibpM[i][k].second.back();
+        want = want.expand();
+        if (st == secred::RowEval::Zero) {
+          REQUIRE(want.is_zero());
+          continue;
+        }
+        REQUIRE(st == secred::RowEval::Ok);
+        REQUIRE_MSG((parser(got) - want).expand().is_zero(),
+                    "box row " + std::to_string(i) + "/" + std::to_string(k) +
+                        " on seed " + std::to_string(sv[0]) + " evaluated to '" + got +
+                        "'");
+      }
+    }
+  }
+  REQUIRE(checked > 0);
+  REQUIRE_EQ(table.fast_rows, checked);
+  REQUIRE_EQ(table.slow_rows, 0u);
+  std::filesystem::remove_all("tc_row_coeff_box");
 }

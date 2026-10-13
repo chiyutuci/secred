@@ -18,6 +18,7 @@
 
 #include "global_select.h"
 #include "numeric_solver_mod.h"
+#include "row_coeff.h"
 #include "sector_engine.h"
 #include "symmetry.h"
 
@@ -718,6 +719,14 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
     std::vector<RawIntegral> new_uptargets;
     local_eqs.reserve(selected_eqs.size());
 
+    // Symbolic coefficients (spec 4.3): a row is precompiled once, under the
+    // lock, and every later seed is a lock-free integer evaluation.  A row the
+    // precompiler cannot represent keeps the GiNaC path and its lock.
+    // (row_coeff.h's names live in namespace secred; this file spells them the
+    // way it already spells secred::ResEq.)
+    secred::RowTable row_table;
+    unsigned slow_eqs = 0;
+
     for (unsigned i = 0; i < selected_eqs.size(); ++i) {
       unsigned eqnum = selected_eqs[i];
       unsigned seed_idx = eqrecord[eqnum].first;
@@ -728,25 +737,42 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
       if (ibps_sym) {
         // Signed/symbolic path: the elimination structure is decided on the
         // prime-substituted numeric system, but each surviving equation is
-        // re-expressed with its full symbolic coefficient.  GiNaC is not
-        // thread-safe, so the symbolic arithmetic is serialized.
-        std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
-        for (const auto &item : (*ibps_sym)[ibp_idx]) {
-          RawIntegral integral = seed + item.first;
-          GiNaC::ex coeff;
-          for (unsigned p = 0; p < _nprops; ++p)
-            coeff += item.second[p] * seed[p];
-          coeff += item.second.back();
-          coeff = coeff.expand();
-          if (coeff.is_zero())
+        // re-expressed with its full symbolic coefficient.
+        if (!row_table.contains(ibp_idx)) {
+          std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
+          row_table.add(ibp_idx, (*ibps_sym)[ibp_idx]);
+        }
+        bool via_ginac = false;
+        const IBPProtoM &items = (*ibps_sym)[ibp_idx];
+        for (unsigned j = 0; j < items.size(); ++j) {
+          const RawIntegral integral = seed + items[j].first;
+          std::string coeff_text;
+          const secred::RowEval st = row_table.eval(ibp_idx, j, seed, coeff_text);
+          if (st == secred::RowEval::Zero)
             continue;
-
-          std::ostringstream oss;
-          oss << coeff;
+          if (st == secred::RowEval::NotPrecompiled) {
+            // The fallback keeps the previous behaviour exactly: GiNaC is not
+            // thread-safe, so its arithmetic is serialized.
+            if (!via_ginac) {
+              via_ginac = true;
+              ++slow_eqs;
+            }
+            std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
+            GiNaC::ex coeff;
+            for (unsigned p = 0; p < _nprops; ++p)
+              coeff += items[j].second[p] * seed[p];
+            coeff += items[j].second.back();
+            coeff = coeff.expand();
+            if (coeff.is_zero())
+              continue;
+            std::ostringstream oss;
+            oss << coeff;
+            coeff_text = oss.str();
+          }
           if (_weights.contains(integral)) {
-            eq.emplace_back(integral, oss.str());
+            eq.emplace_back(integral, coeff_text);
           } else if (!_trivialsectors.contains(integral.sector())) {
-            eq.emplace_back(integral, oss.str());
+            eq.emplace_back(integral, coeff_text);
             new_uptargets.push_back(integral);
           }
         }
@@ -772,6 +798,11 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
       if (!eq.empty())
         local_eqs.push_back(std::move(eq));
     }
+
+    if (ibps_sym)
+      file << "  symbolic coefficients: " << row_table.fast_rows
+           << " rows precompiled, " << row_table.slow_rows
+           << " via GiNaC, " << slow_eqs << " equations via GiNaC\n";
 
     // Sector symmetry relations (spec 5.1-5.3).  One equation per prescription
     // out of this sector, for every seed this round admitted -- the IBP seed set

@@ -124,6 +124,30 @@ TEST(row_coeff_printer_prints_a_signed_sum) {
   require_prints_to({term(-1, {{0, 1}}), term(-5)}, 1, {}, -d - 5);
 }
 
+// The emission contract the separators must not break: the consumers split on
+// whitespace.  Kira copies the coefficient string verbatim into the internal
+// SYSTEM file it hands to FireFly, whose loader reads `skip coef id sector ...`
+// with `>>`, so a space inside the coefficient truncates the token stream --
+// the reader takes `(-2` as the coefficient, the next `>>` fails and leaves the
+// stream failed, and the loop then ends as if the file were over.  (The
+// baseline's GiNaC spelling contained no spaces; that is why it worked.)
+TEST(row_coeff_printer_emits_a_single_whitespace_free_token) {
+  // The signed sums and the parenthesised sums are where a separator is emitted.
+  const std::vector<std::string> corpus = {
+      printed({term(1, {{0, 1}}), term(-5)}, 1, {}),               // d-5
+      printed({term(-5), term(1, {{0, 1}})}, 1, {}),               // -5+d
+      printed({term(-1, {{0, 1}}), term(-5)}, 1, {}),              // -d-5
+      printed({term(-1, {{0, 1}}), term(4)}, 1, {}),               // 4-d
+      printed({term(1, {{0, 1}}), term(-2)}, 2, {}),               // (d-2)/2
+      printed({term(3, {{0, 1}}), term(1)}, 2, {}),                // (3*d+1)/2
+      printed({term(1, {{0, 1}}), term(-2)}, 2, {{3, 2}}),         // (d-2)/(2*m^2)
+      printed({term(2, {{1, 1}}), term(-1, {{2, 1}})}, 1, {{3, 1}}), // (2*s-t)/m
+      printed({term(-9, {{3, 2}}), term(1, {{0, 1}, {3, 2}})}, 2, {{3, 2}})};
+  for (const std::string &s : corpus)
+    REQUIRE_MSG(s.find_first_of(" \t\n\r\f\v") == std::string::npos,
+                "printed '" + s + "' is not one whitespace-free token");
+}
+
 // ---------------------------------------------------------------------------
 // The precompiler and the evaluator (Task 2).
 // ---------------------------------------------------------------------------

@@ -153,10 +153,15 @@ inline void row_print_vars(const RowVars &vars, const std::vector<std::string> &
 // Append `num / (q * mono)` in the spelling both consumers already accept
 // (spec 4.2):
 //   * when the monomial divides every term it is factored out and each term is
-//     printed as an exact rational -- `-9/2`, `d - 5`, `3/2*d + 1/2`;
-//   * otherwise the whole sum is parenthesised -- `(d - 2)/(2*m^2)`, `(1)/(d)`;
+//     printed as an exact rational -- `-9/2`, `d-5`, `3/2*d+1/2`;
+//   * otherwise the whole sum is parenthesised -- `(d-2)/(2*m^2)`, `(1)/(d)`;
 //   * a unit coefficient is omitted (`d`, `-d`), and an empty sum prints `0`.
 // `names` is the table's symbol-index-to-name list.
+//
+// No whitespace anywhere: the Kira path copies this text verbatim into the
+// system file FireFly reads, and that reader splits on whitespace, so a space
+// inside a coefficient silently truncates it (spec 4.2, `emits_a_single_
+// whitespace_free_token`).
 inline void print_row_poly(const RowNum &num, std::uint32_t q, const RowVars &mono,
                            const std::vector<std::string> &names, std::string &out) {
   if (num.empty()) {
@@ -190,7 +195,7 @@ inline void print_row_poly(const RowNum &num, std::uint32_t q, const RowVars &mo
     if (neg)
       a = -a;
     if (any)
-      out += neg ? " - " : " + ";
+      out += neg ? "-" : "+";
     else if (neg)
       out += '-';
     if (!paren && den != 1) {
