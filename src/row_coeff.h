@@ -315,9 +315,15 @@ inline bool build_row_coeff(const std::vector<GiNaC::ex> &row,
           dn.coef > cln::cl_I(static_cast<unsigned long>(kMaxDen)))
         return false; // a polynomial denominator, or not a small positive integer
       c.q = static_cast<std::uint32_t>(cln::cl_I_to_ulong(dn.coef));
+      // `c.mono` is this coefficient's *own* denominator monomial and `mono` the
+      // running lcm of all of them so far; the two are built separately because
+      // the second pass lifts a term onto the lcm by the difference between the
+      // lcm and `c.mono`, so a coefficient shallower than an earlier one has to
+      // be lifted by its own depth, not by the depth the row has reached.
       for (const auto &ve : dn.vars)
-        row_max_exp(mono, ve.first, static_cast<unsigned>(ve.second));
-      c.mono = mono;
+        row_max_exp(c.mono, ve.first, static_cast<unsigned>(ve.second));
+      for (const RowExp &ve : c.mono)
+        row_max_exp(mono, ve.first, ve.second);
     }
     const std::uint64_t g = std::gcd(q_lcm, static_cast<std::uint64_t>(c.q));
     const std::uint64_t f = static_cast<std::uint64_t>(c.q) / g;

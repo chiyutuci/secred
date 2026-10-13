@@ -245,6 +245,30 @@ TEST(row_coeff_lifts_a_term_that_lacks_a_symbol_of_the_row_lcm) {
   }
 }
 
+// The lift is per coefficient, and the row's running lcm reaching its full
+// depth before this coefficient is seen must not change it: a coefficient whose
+// *own* denominator monomial is shallower than the lcm is lifted by exactly that
+// difference.  `1/m^2` beside `d/m^4` is `1/m^2` whichever of the two the row
+// lists first, and lifting it by the lcm's depth instead would leave it `1/m^4`.
+TEST(row_coeff_lifts_a_coefficient_whose_own_denominator_is_shallower) {
+  const std::vector<GiNaC::ex> row = {d / GiNaC::pow(m, 4),
+                                      GiNaC::ex(1) / GiNaC::pow(m, 2), GiNaC::ex(0)};
+  secred::RowTable table;
+  table.add(0, rows_of({row}));
+  REQUIRE(table.rows[0][0].precompiled);
+
+  GiNaC::parser par = box_parser();
+  const int seeds[4][2] = {{1, 0}, {0, 1}, {1, 1}, {-1, 2}};
+  for (const auto &sv : seeds) {
+    const RawIntegral seed(std::vector<int>(sv, sv + 2));
+    std::string got;
+    REQUIRE(table.eval(0, 0, seed, got) == secred::RowEval::Ok);
+    const GiNaC::ex want = (row[0] * seed[0] + row[1] * seed[1] + row.back()).expand();
+    REQUIRE_MSG((par(got) - want).expand().is_zero(),
+                "seed evaluated to '" + got + "', expected '" + ex_text(want) + "'");
+  }
+}
+
 // A coefficient that cancels exactly is reported as such, not printed: the
 // global system must not gain a column from a phantom integral.
 TEST(row_coeff_reports_a_vanishing_coefficient) {
