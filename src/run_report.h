@@ -203,44 +203,27 @@ struct PhaseTiming {
   double seconds = 0.0;
 };
 
-// The peak memory the run reports is what the run needed, and the global stage of
-// the external-solver path lives in a child process the kernel measures
-// separately.  When that child's high-water mark is known (child_peak_bytes > 0)
-// the block splits the figure in two: SecRed's own, and the run's including the
-// solver — otherwise a run that spent its memory in kira would look frugal.  The
-// second row is the larger of the two, since that is the peak the run reached.
+// Peak memory is the whole run's own resident high-water mark: every stage now
+// runs in this process, so there is no child to account for separately.
 inline std::string format_timing_statistics(
     const std::vector<PhaseTiming> &phases, double total_seconds,
-    std::uint64_t peak_bytes, std::uint64_t child_peak_bytes = 0,
-    const std::string &child_name = {}) {
-  const bool with_child = child_peak_bytes > 0 && !child_name.empty();
-  const std::uint64_t run_peak =
-      std::max(peak_bytes, with_child ? child_peak_bytes : 0);
-  const std::string own_label =
-      with_child ? "Peak memory (SecRed)" : "Peak memory";
-  const std::string child_label =
-      "Peak memory (including " + child_name + ")";
-
+    std::uint64_t peak_bytes) {
   std::vector<std::string> labels;
-  labels.reserve(phases.size() + 3);
+  labels.reserve(phases.size() + 2);
   for (const auto &p : phases)
     labels.push_back(p.label);
   labels.push_back("Total");
-  labels.push_back(own_label);
-  if (with_child)
-    labels.push_back(child_label);
+  labels.push_back("Peak memory");
 
   std::ostringstream oss;
   oss << block_header("Timing Statistics");
   const std::size_t w = block_label_width(labels);
   std::vector<std::string> rows;
-  rows.reserve(phases.size() + 3);
+  rows.reserve(phases.size() + 2);
   for (const auto &p : phases)
     rows.push_back(block_row(p.label, format_duration(p.seconds), w));
   rows.push_back(block_row("Total", format_duration(total_seconds), w));
-  rows.push_back(block_row(own_label, format_memory(peak_bytes), w));
-  if (with_child)
-    rows.push_back(block_row(child_label, format_memory(run_peak), w));
+  rows.push_back(block_row("Peak memory", format_memory(peak_bytes), w));
   oss << block_rows(rows) << "\n" << block_rule();
   return oss.str();
 }

@@ -108,6 +108,9 @@ public:
   static unsigned subsector_filter_n(const Family &f) {
     return f._subsector_filter_n;
   }
+  static const std::string &cache_dir(const Family &f) {
+    return f._cache_dir;
+  }
 };
 
 // ---------------------------------------------------------------------------
@@ -188,7 +191,7 @@ TEST(family_parse_global_tool_default) {
   clear_symtab();
   YAML::Node cfg = box_config("tc_global_tool_default");
   Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_tool(f) == "kira");
+  REQUIRE(FamilyTestHelper::global_tool(f) == "finiteflow");
 }
 
 TEST(family_parse_global_tool_finiteflow) {
@@ -214,13 +217,21 @@ TEST(family_parse_global_tool_firefly) {
   REQUIRE(FamilyTestHelper::global_tool(f) == "firefly");
 }
 
-TEST(family_parse_global_tool_accepts_the_three_backends) {
-  for (const char *tool : {"kira", "finiteflow", "firefly"}) {
+TEST(family_parse_global_tool_accepts_both_backends) {
+  for (const char *tool : {"finiteflow", "firefly"}) {
     clear_symtab();
     YAML::Node cfg = box_config(std::string("tc_global_tool_ok_") + tool);
     cfg["settings"]["global_tool"] = tool;
     REQUIRE_NOTHROW(Family(cfg));
   }
+}
+
+TEST(family_parse_global_tool_rejects_an_external_solver) {
+  // The global stage runs in this process; there is no external backend to name.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_global_tool_kira");
+  cfg["settings"]["global_tool"] = "kira";
+  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
 TEST(family_parse_global_finiteflow_threads_default) {
@@ -238,14 +249,11 @@ TEST(family_parse_global_finiteflow_threads_custom) {
   REQUIRE(FamilyTestHelper::global_finiteflow_threads(f) == 32);
 }
 
-TEST(family_parse_settings_custom_kira) {
+TEST(family_parse_settings_custom_cache_dir) {
   clear_symtab();
   std::string yaml = R"(
 settings:
-  cache_dir: tc_kira
-  kira_cmd: /custom/kira
-  kira_bunch_size: 128
-  kira_parallel: 32
+  cache_dir: tc_custom_cache
 
 family:
   name: box2
@@ -274,8 +282,9 @@ targets:
 )";
   YAML::Node cfg = YAML::Load(yaml);
   Family f(cfg);
-  // kira_cmd / bunch_size / parallel are only observable at reduction time;
-  // successful construction is the verifiable signal here.
+  // The cache directory is what the run writes into; reading it back is the
+  // verifiable signal here.
+  REQUIRE(FamilyTestHelper::cache_dir(f) == "tc_custom_cache");
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +493,7 @@ TEST(family_init_generates_ibp_relations) {
 TEST(family_signed_path_generates_numeric_and_symbolic_ibp) {
   // A symbolic family (symbolic d, s, t) must generate the finite-field IBP
   // proto (used for the FiniteFlow structure) and the symbolic proto (used for
-  // the final emission to kira).  The two must share the same term structure so
+  // the symbolic reduction).  The two must share the same term structure so
   // the (seed, ibp) index recorded by the numeric elimination maps 1:1 onto the
   // symbolic equations.  The full rational _ibpFF is not needed on the signed
   // path (the symbolic _ibpM supplies the coefficients), so it stays empty.
@@ -838,7 +847,7 @@ TEST(family_parse_removed_options_are_ignored) {
   clear_symtab();
   YAML::Node cfg = box_config("tc_removed_keys");
   cfg["settings"]["boundary_mode"] = "totall";
-  cfg["settings"]["equation_selection"] = "kira4";
+  cfg["settings"]["equation_selection"] = "automatic";
   cfg["settings"]["sector_elimination"] = "ffredx";
   cfg["settings"]["global_otf"] = true;
   cfg["settings"]["subsector_depth_offset"] = 3;

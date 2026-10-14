@@ -1,5 +1,5 @@
 # F234_S: the same family at numeric dimension (1999/500) with symbolic
-# kinematics s, t, reduced with Kira.
+# kinematics s, t, reduced in-process.
 family:
   name: 234
   dimension: 1999/500
@@ -32,7 +32,8 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  cache_dir: cache_F234_S     # directory for the global system and Kira scratch files
+  global_tool: finiteflow     # in-process FiniteFlow global reduction (default)
+  cache_dir: cache_F234_S     # directory for the global system and scratch files
 
 targets:
   - [1, 0, 1, 1, 0, 0, 0, 0, 0]

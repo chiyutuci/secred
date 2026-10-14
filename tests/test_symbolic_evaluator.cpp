@@ -250,8 +250,8 @@ TEST(symbolic_evaluator_outputs_are_the_item_list) {
   REQUIRE_EQ(evaluator_of({{0, 0}}, false).n_outputs(), 0u);      // no items
 }
 
-// The three per-phase counters the driver turns into its Kira-style "probe solution
-// steps" line.  A scratch outlives one evaluator, so the counters accumulate and the
+// The three per-phase counters the driver turns into its "probe solution steps"
+// report line.  A scratch outlives one evaluator, so the counters accumulate and the
 // caller reads deltas.
 TEST(symbolic_evaluator_counts_the_three_probe_phases) {
   secred::SymbolicFFEvaluator ev = evaluator_of();

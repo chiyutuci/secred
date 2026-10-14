@@ -179,8 +179,8 @@ bool parse_rat64(const std::string &s, int64_t &num, int64_t &den) {
 // Walk the spill and feed `sink`: `sink.term(id, coeff_begin, coeff_end)` per term line
 // whose integral is known, `sink.end_equation()` on a blank line.  A `term` that returns
 // false aborts the scan (the sink has already set `error`).  `flush_at_eof` reproduces
-// each call site's treatment of a final equation with no blank line after it: the two
-// readers flushed it, `select_dum_eq_from_file` did not.
+// each call site's treatment of a final equation with no blank line after it: both
+// readers flush it.
 template <typename Sink>
 bool scan_spill(const std::string &path, Sink &sink,
                 const std::unordered_map<RawIntegral, unsigned> &integral_id,
@@ -276,32 +276,6 @@ struct NumericSink {
   }
 };
 
-// The dum sink: the largest known integral id of the current equation, and the index of
-// the equation whose value is smallest so far.
-struct DumSink {
-  unsigned best = 0;
-  unsigned best_max = UINT_MAX;
-  unsigned eq_idx = 0;
-  unsigned cur_max = 0;
-  bool have_term = false;
-
-  bool term(unsigned id, const char *, const char *) {
-    if (id > cur_max)
-      cur_max = id;
-    have_term = true;
-    return true;
-  }
-
-  void end_equation() {
-    if (have_term && cur_max < best_max) {
-      best_max = cur_max;
-      best = eq_idx;
-    }
-    ++eq_idx;
-    cur_max = 0;
-    have_term = false;
-  }
-};
 
 // Read one coefficient span the way both sinks need it: the strict grammar first, the
 // GiNaC parser (with the expand + make_sym_coeff pipeline the old reader ran) only for
@@ -706,14 +680,5 @@ bool read_spill_interned(const std::string &path,
   return true;
 }
 
-unsigned scan_spill_dum(const std::string &path,
-                        const std::unordered_map<RawIntegral, unsigned> &integral_id) {
-  DumSink sink;
-  SpillReadStats stats;
-  std::string error;
-  if (!scan_spill(path, sink, integral_id, /*flush_at_eof=*/false, stats, error))
-    return 0; // an unreadable file produced best == 0 before, too
-  return sink.best;
-}
 
 }  // namespace secred

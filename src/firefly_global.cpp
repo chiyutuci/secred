@@ -89,7 +89,6 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
 
   for (unsigned m : learn.masters)
     res.masters.push_back(all_integrals[m]);
-  res.phase_split = true;
   res.learn_seconds = learn.learn_seconds;
 
   // 3) Reconstruct.  Zero outputs is a legal outcome (every target is a master, so
@@ -159,8 +158,8 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
       std::cout << status.finish() << std::flush;
     });
     rec.reconstruct();
-    // Kira reports what one probe costs, split into the three steps of the solve; this is
-    // the same line for the box we drive ourselves.  It is printed before the failure
+    // What one probe costs, split into the three steps of the solve -- our spelling of
+    // the report Kira's own probe prints.  It is printed before the failure
     // check so that a run which failed still reports where its time went.
     {
       const std::uint64_t pts = box.points();

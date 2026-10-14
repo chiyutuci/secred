@@ -81,10 +81,4 @@ bool read_spill_interned(const std::string &path,
                          const std::vector<GiNaC::possymbol> &symbols,
                          SymCoeffPool &pool, SpillReadStats &stats, std::string &error);
 
-// Index of the equation in `path` whose largest known integral id is smallest, i.e. the
-// equation with the simplest leading term (`select_dum_eq_from_file`'s rule).  Never
-// looks at a coefficient; 0 when the file cannot be read, as before.
-unsigned scan_spill_dum(const std::string &path,
-                        const std::unordered_map<RawIntegral, unsigned> &integral_id);
-
 }  // namespace secred

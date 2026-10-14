@@ -15,8 +15,6 @@ sector_timing.csv
 results/
 tmp/
 sectormappings/
-kira.log
-kira_*.log
 firefly.log
 
 # editor / OS noise

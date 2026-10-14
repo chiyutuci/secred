@@ -370,7 +370,7 @@ TEST(seeds_regenerate_after_clear) {
 }
 
 // ---------------------------------------------------------------------------
-// GlobalEquation and ReductionContext — new fields for global kira collection
+// GlobalEquation and ReductionContext — the global collection surface
 // ---------------------------------------------------------------------------
 
 TEST(global_equation_typedef_construction) {
@@ -631,107 +631,6 @@ TEST(append_raw_equation_thread_safe) {
   ctx.rawEqOut.reset();
 
   REQUIRE(ctx.globalEquationsCount.load() == N);
-  std::filesystem::remove(path);
-}
-
-// ---------------------------------------------------------------------------
-// select_dum_eq_from_file — picks the equation with the smallest max integral ID
-// ---------------------------------------------------------------------------
-
-static void write_raw_eqs(const std::string &path,
-                          const std::vector<GlobalEquation> &eqs) {
-  std::ofstream out(path, std::ios::trunc);
-  for (const auto &eq : eqs) {
-    for (const auto &[integ, coeff] : eq)
-      out << integ << '\t' << coeff << '\n';
-    out << '\n';
-  }
-}
-
-TEST(select_dum_eq_single_equation) {
-  // A single equation: must return 0.
-  std::unordered_map<RawIntegral, unsigned> id;
-  id[RI({1, 0})] = 0;
-  id[RI({0, 1})] = 1;
-
-  std::vector<GlobalEquation> eqs(1);
-  eqs[0].emplace_back(RI({1, 0}), "1");
-  eqs[0].emplace_back(RI({0, 1}), "-1");
-
-  const std::string path = "/tmp/secred_test_dum_eqs.txt";
-  write_raw_eqs(path, eqs);
-  REQUIRE(select_dum_eq_from_file(path, id) == 0u);
-  std::filesystem::remove(path);
-}
-
-TEST(select_dum_eq_picks_smallest_max_id) {
-  // eq[0] has max ID 3, eq[1] has max ID 1 → select eq[1].
-  std::unordered_map<RawIntegral, unsigned> id;
-  id[RI({1, 1, 0})] = 3;
-  id[RI({1, 0, 0})] = 1;
-  id[RI({0, 1, 0})] = 0;
-
-  std::vector<GlobalEquation> eqs(2);
-  eqs[0].emplace_back(RI({1, 1, 0}), "2");   // max ID = 3
-  eqs[0].emplace_back(RI({0, 1, 0}), "-1");
-  eqs[1].emplace_back(RI({1, 0, 0}), "3");   // max ID = 1
-  eqs[1].emplace_back(RI({0, 1, 0}), "1");
-
-  const std::string path = "/tmp/secred_test_dum_eqs.txt";
-  write_raw_eqs(path, eqs);
-  REQUIRE(select_dum_eq_from_file(path, id) == 1u);
-  std::filesystem::remove(path);
-}
-
-TEST(select_dum_eq_tie_keeps_first) {
-  // Both equations have the same max ID → return the first (index 0).
-  std::unordered_map<RawIntegral, unsigned> id;
-  id[RI({1, 0})] = 2;
-  id[RI({0, 1})] = 0;
-
-  std::vector<GlobalEquation> eqs(2);
-  eqs[0].emplace_back(RI({1, 0}), "1");   // max ID = 2
-  eqs[1].emplace_back(RI({1, 0}), "-3");  // max ID = 2
-
-  const std::string path = "/tmp/secred_test_dum_eqs.txt";
-  write_raw_eqs(path, eqs);
-  REQUIRE(select_dum_eq_from_file(path, id) == 0u);
-  std::filesystem::remove(path);
-}
-
-TEST(select_dum_eq_ignores_unmapped_integrals) {
-  // An integral with no entry in id_map must not contribute to max_id.
-  std::unordered_map<RawIntegral, unsigned> id;
-  id[RI({1, 1, 0})] = 5;
-  id[RI({1, 0, 0})] = 2;
-  // RI({0,0,1}) intentionally NOT in id_map.
-
-  std::vector<GlobalEquation> eqs(2);
-  eqs[0].emplace_back(RI({1, 1, 0}), "1");   // ID = 5
-  eqs[0].emplace_back(RI({0, 0, 1}), "-2");  // unmapped → ignored
-  eqs[1].emplace_back(RI({1, 0, 0}), "4");   // ID = 2
-
-  const std::string path = "/tmp/secred_test_dum_eqs.txt";
-  write_raw_eqs(path, eqs);
-  REQUIRE(select_dum_eq_from_file(path, id) == 1u);
-  std::filesystem::remove(path);
-}
-
-TEST(select_dum_eq_three_equations_middle_wins) {
-  // Three equations with max IDs 4, 1, 3 → index 1 wins.
-  std::unordered_map<RawIntegral, unsigned> id;
-  id[RI({1, 1})] = 4;
-  id[RI({1, 0})] = 1;
-  id[RI({0, 1})] = 3;
-
-  std::vector<GlobalEquation> eqs(3);
-  eqs[0].emplace_back(RI({1, 1}), "1");  // max ID = 4
-  eqs[1].emplace_back(RI({1, 0}), "1");  // max ID = 1
-  eqs[2].emplace_back(RI({0, 1}), "1");  // max ID = 3
-
-  const std::string path = "/tmp/secred_test_dum_eqs.txt";
-  write_raw_eqs(path, eqs);
-  REQUIRE(select_dum_eq_from_file(path, id) == 1u);
   std::filesystem::remove(path);
 }
 

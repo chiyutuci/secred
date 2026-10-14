@@ -1,8 +1,7 @@
-# dbox_ff: dbox at symbolic dimension, reduced in-process with FiniteFlow instead of
-# Kira.  The smallest input that drives the symbolic FiniteFlow path end to end —
-# system build, learn, degree estimation, sample evaluation, rational-function
-# reconstruction — so it is the smoke test for that path (box.yaml exercises the
-# default Kira backend and F234_N.yaml the numeric FiniteFlow one).
+# dbox_ff: dbox at symbolic dimension, reduced in-process with FiniteFlow.  The
+# smallest input that drives the symbolic path end to end — system build, learn,
+# degree estimation, sample evaluation, rational-function reconstruction — so it is
+# the smoke test for that path (box.yaml exercises the numeric one).
 family:
   name: dbox
   dimension: d
@@ -36,10 +35,10 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  # global_tool: finiteflow replaces Kira with the in-process modular elimination and
-  # FiniteFlow rational-function reconstruction (symbolic dimension).  kira_parallel is
-  # unused on that path; global_finiteflow_threads sets how many threads the
-  # reconstruction uses (default 64).
+  # global_tool: finiteflow runs the in-process modular elimination followed by
+  # FiniteFlow rational-function reconstruction (symbolic dimension);
+  # global_finiteflow_threads sets how many threads the reconstruction uses
+  # (default 64).
   global_tool: finiteflow
   global_finiteflow_threads: 64
   cache_dir: cache_dbox_ff

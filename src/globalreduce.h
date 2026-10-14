@@ -26,22 +26,10 @@ struct GlobalReductionResult {
   std::uint64_t raw_equations = 0;                             // equations sent to the global system
   std::uint64_t selected_equations = 0;                        // equations the selection kept
   bool ok = false;
-  // Wall-clock split of the in-process FiniteFlow phase.  The Kira path has no
-  // separate learn and reconstruction steps, so it leaves phase_split false and
-  // the end-of-run Timing Statistics block prints only its one global phase.
-  bool phase_split = false;
+  // Wall-clock split of the global phase: what the learn pass cost and what the
+  // reconstruction cost.
   double learn_seconds = 0.0;
   double reconstruction_seconds = 0.0;
-  // Kira path only: the equations Kira selected out of the system it was handed
-  // and submitted to FireFly, read back from its log.  This is the count the
-  // reduction is measured by — not the number SecRed sent.  nullopt when the log
-  // could not be read, and the statistics block then leaves the row out rather
-  // than reporting a zero it did not observe.
-  std::optional<std::uint64_t> firefly_equations;
-  // Kira path only: peak resident memory of the Kira subprocess including what it
-  // ran, in bytes.  The kernel accounts for a child separately, so SecRed's own
-  // high-water mark would otherwise hide the global stage's memory.
-  std::uint64_t child_peak_bytes = 0;
 };
 
 // The numeric reconstruction's system, hoisted out of the per-prime loop.
@@ -102,7 +90,7 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
 
 // Pure-numeric in-process global reduction: the elimination runs on FiniteFlow's
 // sparse solver and the coefficients are reconstructed as rational numbers with
-// algorithm_reconstruct_numeric, so neither Kira nor a "dum" symbol is needed.
+// algorithm_reconstruct_numeric, so no auxiliary symbol is needed.
 // raw_equations_path is the spilled system file (<RawIntegral>\t<coeff> per line,
 // a blank line between equations); all_integrals / integral_id are the global
 // integral order and numbering; targets are the target integrals.  The last four

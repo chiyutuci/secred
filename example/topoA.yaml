@@ -47,7 +47,8 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  cache_dir: cache_topoA      # directory for the global system and Kira scratch files
+  global_tool: finiteflow     # in-process FiniteFlow global reduction (default)
+  cache_dir: cache_topoA      # directory for the global system and scratch files
 
 targets:
   - [ 1, 1, 1, 1, -1, 1, -1, 1, 1]

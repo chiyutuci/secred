@@ -60,9 +60,8 @@ private:
   void _run_reduce_layer(Reduce &) const;
   void _run_reduce_fine(Reduce &) const;
   // Post-reduction global solve: it orders the spilled equations into a global
-  // system and then either hands it to the Kira subprocess or runs the
-  // in-process FiniteFlow reduction.  The returned result carries the
-  // FiniteFlow phase split (both zero on the Kira path) into the run's
+  // system and runs the in-process reduction over it.  The returned result
+  // carries the learn/reconstruction phase split into the run's
   // Timing Statistics block.
   GlobalReductionResult _run_global_reduction(Reduce &) const;
 
@@ -106,12 +105,7 @@ private:
   unsigned _threads = 64;
   std::string _parallel_mode = "fine";
 
-  std::string _cache_dir      = "cache";
-  std::string _job_dir        = "";
-  std::string _kira_cmd       = "kira";
-  std::string _kira_jobs_file = "jobs.yaml";
-  unsigned _kira_bunch_size   = 64;
-  unsigned _kira_parallel     = 64;
+  std::string _cache_dir = "cache";
   // Offset n of the subsector filter (see SectorConfig).
   unsigned _subsector_filter_n = 1;
   // settings.symmetry: build and use the sector symmetry relations (default
@@ -129,11 +123,13 @@ private:
   std::vector<unsigned> _cut;
   unsigned _ncut = 0;
 
-  // which tool performs the global reduction: "kira" (external Kira subprocess,
-  // default) or "finiteflow" (in-process FiniteFlow; the in-process solver + CRT
-  // for pure-numeric systems, + FiniteFlow rational-function reconstruction for
-  // symbolic systems). Parsed from settings: global_tool.
-  std::string _global_tool = "kira";
+  // which reconstruction engine performs the global reduction: "finiteflow"
+  // (default; in-process solver + CRT for pure-numeric systems, + FiniteFlow
+  // rational-function reconstruction for symbolic systems) or "firefly" (the
+  // FireFly black box for a symbolic system; a numeric system falls back to the
+  // numeric path, FireFly having no numeric counterpart). Parsed from settings:
+  // global_tool.
+  std::string _global_tool = "finiteflow";
   // number of threads for the FiniteFlow global reconstruction
   // (parsed from settings: global_finiteflow_threads; default 64). The Gaussian
   // elimination itself is single-threaded (FiniteFlow), but the per-coefficient

@@ -123,28 +123,6 @@ void Sector::_order_subintegrals(std::vector<RawIntegral> &subInts,
   std::reverse(subInts.begin(), subInts.end());
 }
 
-void createJobFile(const std::string &filename) {
-  std::ofstream file(filename);
-
-  file << "jobs:" << std::endl;
-  file << "  - reduce_user_defined_system:" << std::endl;
-  file << "      input_system: {files: [\"system\"], config: false, otf: false}"
-       << std::endl;
-  file << "      select_integrals:" << std::endl;
-  file << "        select_mandatory_list:" << std::endl;
-  file << "          - [targets]" << std::endl;
-  file << std::endl;
-  file << "      conditional: true" << std::endl;
-  file << std::endl;
-  file << "      run_firefly: true" << std::endl;
-  file << std::endl;
-  file << "  - kira2file:" << std::endl;
-  file << "      target:" << std::endl;
-  file << "       - [targets]" << std::endl;
-
-  file.close();
-}
-
 void writeTargetList(const std::string &path,
                      const std::set<RawIntegral> &targets) {
   std::ofstream file(path);
@@ -854,7 +832,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
               if (!expand_prescription<GiNaC::ex>(p, f_ex, c_ex, seed, trivial, terms))
                 continue;
               // Merge the image terms by integral and add the seed itself with
-              // coefficient -1 (Kira's convention, spec 5.1): a seed the
+              // coefficient -1 (the -1 seed convention, spec 5.1): a seed the
               // correspondence fixes -- the all-ones seed of a sector, whose
               // in-sector lines all carry power one -- cancels to nothing here
               // and carries no equation.  A flat list replaces the map's
@@ -960,12 +938,3 @@ void Sector::clear() {
   _masters.shrink_to_fit();
 }
 
-unsigned
-select_dum_eq_from_file(const std::string &path,
-                        const std::unordered_map<RawIntegral, unsigned> &id_map) {
-  // Scan the raw spill file and return the equation index whose largest integral ID
-  // is smallest.  Same selection rule as the former in-memory select_dum_eq; the scan
-  // reads through the shared scanner and never looks at a coefficient, so the Kira
-  // path stops paying a third full text parse of a 2.35 GB file.
-  return secred::scan_spill_dum(path, id_map);
-}

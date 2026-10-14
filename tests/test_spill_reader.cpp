@@ -189,24 +189,6 @@ TEST(spill_integral_beyond_max_props_falls_back_without_corruption) {
   REQUIRE_EQ(system.size(), std::size_t(1));
 }
 
-TEST(scan_spill_dum_picks_the_smallest_leading_id) {
-  const std::string p = write_spill("dum",
-      term_line({1, 1}, "3") + "\n" +
-      term_line({0, 1}, "1") + term_line({1, 0}, "2") + "\n" +
-      term_line({0, 0}, "5") + "\n");
-  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}});
-  REQUIRE_EQ(secred::scan_spill_dum(p, ids), 2u);   // its largest id is 0
-}
-
-// The dum scan does *not* flush a final unterminated equation (sector.cpp:953-986 did
-// not either), so a truncated tail cannot change the pick.
-TEST(scan_spill_dum_ignores_a_final_unterminated_equation) {
-  const std::string p = write_spill("dumtail",
-      term_line({1, 1}, "3") + "\n" + term_line({0, 0}, "5"));
-  const auto ids = ids_of({{0, 0}, {1, 1}});
-  REQUIRE_EQ(secred::scan_spill_dum(p, ids), 0u);
-}
-
 // Spec §7's `+`-prefixed and `-0` cases: both readers must read them alike.  `-0` is
 // inside the strict grammar (a sign and digits) and gives 0; `+` is not, so that one
 // falls back and is counted -- the value is the reference's either way.

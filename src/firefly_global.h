@@ -1,7 +1,6 @@
 // SecRed's own reconstruction backend: FireFly's Reconstructor driven by a black box
 // that wraps the shared SymbolicFFEvaluator.  FireFly takes no equations -- the whole
-// system lives inside the box -- so this replaces the Kira global scheme (job file,
-// FireFly subprocess, "dum" variable) with an in-process call.
+// system lives inside the box -- so the entire call stays in this process.
 #pragma once
 
 #include <array>
@@ -142,7 +141,7 @@ public:
   std::uint64_t bad_points() const { return bad_points_.load(std::memory_order_relaxed); }
   std::uint64_t primes() const { return primes_.load(std::memory_order_relaxed); }
   // Seconds spent in each step of the per-point solve, summed over every lane of every
-  // probe: what the driver turns into the Kira-style "probe solution steps" line.
+  // probe: what the driver turns into the "probe solution steps" report line.
   double eval_seconds() const { return eval_ns_.load(std::memory_order_relaxed) * 1e-9; }
   double fwd_seconds() const { return fwd_ns_.load(std::memory_order_relaxed) * 1e-9; }
   double bwd_seconds() const { return bwd_ns_.load(std::memory_order_relaxed) * 1e-9; }

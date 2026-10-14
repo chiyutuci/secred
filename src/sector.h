@@ -261,18 +261,8 @@ inline bool balance_less(const RawIntegral &a, const RawIntegral &b) {
 
 // One term in a global equation: the integral and its coefficient as a string.
 // Coefficient strings come from rational::str() (ff_n path) or GiNaC stream
-// output (ff_m path) and are written verbatim into the kira system file.
+// output (ff_m path) and are written verbatim into the global system file.
 using GlobalEquation = std::vector<std::pair<RawIntegral, std::string>>;
-
-// Returns the index of the equation in the raw spill file whose leading term
-// (largest integral ID) is smallest, i.e. the equation with the simplest
-// leading term.  Used by _run_global_reduction to pick the single equation into
-// which the auxiliary 'dum' variable is injected so that kira accepts a
-// symbol-free rational system.  The scan is coefficient-free: it reads the
-// integrals only (spill_reader.h), so it never parses the coefficient text.
-unsigned select_dum_eq_from_file(
-    const std::string &path,
-    const std::unordered_map<RawIntegral, unsigned> &id_map);
 
 // Wall-clock cost of one sector's adaptive seeding (ATPS).  Every round is a
 // full pass: probeNanos accumulates the reporting rounds that were discarded --
@@ -458,11 +448,6 @@ struct ReductionContext {
   ReductionContext(const ReductionContext &) = delete;
   ReductionContext &operator=(const ReductionContext &) = delete;
 };
-
-// Write a standard kira jobs YAML file for reduce_user_defined_system.
-// Write the Kira job file that reduces the global system (on-the-fly loading is
-// off: Kira materialises the system instead of reading it incrementally).
-void createJobFile(const std::string &filename);
 
 // The seed boundary a sector is reduced with: the region of seeds that may
 // generate equations, and the quantity the subsector filter measures in.

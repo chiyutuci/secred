@@ -27,15 +27,14 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  kira_parallel: 8            # Kira -p; Kira also starts this many Fermat instances at the end of the run
-  # global_tool: kira (default) | finiteflow | firefly picks the global reducer; on the
-  # in-process ones global_finiteflow_threads sets their reconstruction's thread count
-  # (for firefly, how many FireFly probes run at once).  This file uses the default.
   ordering_mode: balance      # integral ordering: normal (generation order) | balance (default;
                               # seeds, subsector columns and the global numbering all follow the
                               # balance key: total power, depth, rank, max denominator power,
                               # max numerator power)
-  cache_dir: cache_box        # directory for the global system and Kira scratch files
+  global_tool: finiteflow     # global reducer: finiteflow (default, in-process) | firefly
+                              # (FireFly's reconstructor); global_finiteflow_threads sets the
+                              # reconstruction's thread count
+  cache_dir: cache_box        # directory for the global system and scratch files
 
 targets:
   - [ 2, 2, 1, 1 ]

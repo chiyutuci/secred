@@ -7,8 +7,8 @@
 #include <vector>
 
 // Global integral numbering (src/global_order.h).  The number is the index after
-// the sort, and the smallest one is what Kira and the in-process solver prefer as
-// a master, so these orders decide the master basis directly.
+// the sort, and the smallest one is what the solver prefers as a master, so
+// these orders decide the master basis directly.
 namespace {
 
 RawIntegral RI(std::initializer_list<int> il) {
@@ -177,8 +177,8 @@ TEST(global_order_is_input_order_independent) {
 }
 
 // ---------------------------------------------------------------------------
-// Direction: number 0 is the simplest integral of its layer (Kira prefers it as
-// a master)
+// Direction: number 0 is the simplest integral of its layer (the solver prefers
+// it as a master)
 // ---------------------------------------------------------------------------
 
 TEST(global_order_zero_id_is_the_simplest_in_its_layer) {

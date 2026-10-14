@@ -125,8 +125,8 @@ TEST(row_coeff_printer_prints_a_signed_sum) {
 }
 
 // The emission contract the separators must not break: the consumers split on
-// whitespace.  Kira copies the coefficient string verbatim into the internal
-// SYSTEM file it hands to FireFly, whose loader reads `skip coef id sector ...`
+// whitespace.  The writer copies the coefficient string verbatim into the global
+// system file, whose loader reads `skip coef id sector ...`
 // with `>>`, so a space inside the coefficient truncates the token stream --
 // the reader takes `(-2` as the coefficient, the next `>>` fails and leaves the
 // stream failed, and the loop then ends as if the file were over.  (The

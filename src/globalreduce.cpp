@@ -174,7 +174,7 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
 }
 
 // ---------------------------------------------------------------------------
-// Pure-numeric FiniteFlow global reduction (no symbols, no Kira/FireFly, no "dum" variable)
+// Pure-numeric FiniteFlow global reduction (no symbols, no interpolation)
 // ---------------------------------------------------------------------------
 
 namespace {
@@ -502,7 +502,7 @@ GlobalReductionResult reduce_global_finiteflow(
   std::unordered_set<uint32_t> needed = sweep(true); // fallback closure: forward and backward
   const std::unordered_set<uint32_t> needed_fwd = sweep(false);
 
-  // Small-system diagnostic: print the whole reduction to compare against Kira.
+  // Small-system diagnostic: dump the whole system and its reduction for eyeballing.
   if (neqs <= 1000) {
     std::cerr << "\n===== RAW equations (" << neqs << ") =====\n";
     for (std::size_t i = 0; i < system.size(); ++i) {
@@ -687,7 +687,6 @@ GlobalReductionResult reduce_global_finiteflow(
 
   // The phase split is reported by the end-of-run Timing Statistics block, which
   // family.cpp prints once the whole run — including the file writes — is done.
-  res.phase_split = true;
   res.learn_seconds = learn_s;
   res.reconstruction_seconds =
       std::chrono::duration<double>(t3 - t2).count();
@@ -1112,7 +1111,6 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
 
   // As in the numeric path, the split is reported by the end-of-run Timing
   // Statistics block.
-  res.phase_split = true;
   res.learn_seconds = learn.learn_seconds;
   res.reconstruction_seconds =
       std::chrono::duration<double>(t3 - t2).count();

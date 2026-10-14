@@ -91,7 +91,7 @@ TEST(firefly_box_returns_the_evaluators_values) {
 
 // The box adds each probe's share of the three solve phases (the scratch is thread-local
 // and outlives the probe, so what it reads is a delta), which the driver averages into
-// the Kira-style "probe solution steps" line.
+// the "probe solution steps" report line.
 TEST(firefly_box_reports_the_probe_phase_seconds) {
   secred::SymbolicFFEvaluator ev = evaluator_of();
   secred::SecRedFireFlyBlackBox box(ev, 1);

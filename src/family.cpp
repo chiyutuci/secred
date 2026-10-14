@@ -24,7 +24,7 @@
 // numeric FiniteFlow path.  The substitution is generic: with overwhelming
 // probability the linear dependencies among equations are unchanged, so the
 // (seed, ibp) structure recorded by FiniteFlow carries over to the full
-// symbolic equations handed to kira for reconstruction.
+// symbolic equations fed to the reconstruction.
 //
 // The primes are kept around 2^31 rather than 2^63: primes near 2^63 make the
 // coefficients ~19 decimal digits, which slows FiniteFlow's finite-field
@@ -87,7 +87,7 @@ void Family::run_reduce(Reduce &reduce) {
 
   // Release the remaining IBP prototypes and the intra-sector propagation
   // state.  They are only consumed while generating sector equations; without
-  // this they stay resident through the global kira phase and keep the process
+  // this they stay resident through the global phase and keep the process
   // at its sector-reduction peak.  (_ibp itself was already released before the
   // parallel passes.)
   _ibpFF.clear();
@@ -108,7 +108,7 @@ void Family::run_reduce(Reduce &reduce) {
 
   // Probe narrowing statistics are final once the sector phase completes. Write
   // them to cache/sectors/sectors and echo them now — before the (possibly very
-  // long) global Kira reduction — so this feedback is not delayed.
+  // long) global reduction — so this feedback is not delayed.
   {
     unsigned ok = reduce._ctx.narrowingSuccess.load();
     unsigned fail = reduce._ctx.narrowingFail.load();
@@ -148,10 +148,10 @@ void Family::run_reduce(Reduce &reduce) {
       std::cout << "\n Probe narrowing: succeeded " << ok << " / failed " << fail
                 << " / total " << total << " ("
                 << std::fixed << std::setprecision(1) << ratio << " % success)"
-                << std::endl;  // flush so it precedes the kira subprocess output
+                << std::endl;  // flush so it precedes the global stage's output
   }
 
-  // Send the spilled equations to kira for the global reduction (numeric and
+  // Send the spilled equations to the global stage (numeric and
   // signed paths alike).
   const auto global_t0 = std::chrono::steady_clock::now();
   GlobalReductionResult globalResult;
@@ -208,11 +208,6 @@ void Family::run_reduce(Reduce &reduce) {
     std::vector<std::string> labels{"Master integrals",
                                     "Raw equations generated (full pass)",
                                     "Equations in global system"};
-    // The equations kira selected for FireFly, when its log could be read: the
-    // system the reconstruction ran on, which is smaller than the one SecRed
-    // assembled.  A run whose log is unreadable says nothing rather than zero.
-    if (globalResult.firefly_equations)
-      labels.push_back("Equations to FireFly");
     const std::size_t w = secred::block_label_width(labels);
 
     std::vector<std::string> rows{
@@ -221,10 +216,6 @@ void Family::run_reduce(Reduce &reduce) {
                           std::to_string(ctx.rawEquationsTotal.load()), w),
         secred::block_row("Equations in global system",
                           std::to_string(ctx.globalEquationsCount.load()), w)};
-    if (globalResult.firefly_equations)
-      rows.push_back(secred::block_row(
-          "Equations to FireFly",
-          std::to_string(*globalResult.firefly_equations), w));
 
     std::cout << "\n"
               << secred::block_header("Reduction Statistics")
@@ -232,26 +223,18 @@ void Family::run_reduce(Reduce &reduce) {
               << secred::block_rule();
   }
 
-  // Closing summary of where the run's wall-clock time went.  The finiteflow
-  // paths also report their own learn/reconstruction split; the Kira path has
-  // only the one global phase.
+  // Closing summary of where the run's wall-clock time went, with the global
+  // stage split into its learn and reconstruction halves.
   {
     std::vector<secred::PhaseTiming> phases{
         {"Sector reduction", sectorSeconds},
-        {"Global reduction", globalSeconds}};
-    if (globalResult.phase_split) {
-      phases.push_back({"Global learn", globalResult.learn_seconds});
-      phases.push_back({"Reconstruction", globalResult.reconstruction_seconds});
-    }
-    // The global kira run lives in a child the kernel measures on its own, so the
-    // block also reports the peak of the run including it — otherwise a run whose
-    // memory went into kira would report only what SecRed itself held.  The
-    // in-process finiteflow paths have no child and keep their single row.
+        {"Global reduction", globalSeconds},
+        {"Global learn", globalResult.learn_seconds},
+        {"Reconstruction", globalResult.reconstruction_seconds}};
     std::cout << "\n"
               << secred::format_timing_statistics(
                      phases, secred::run_elapsed_seconds(),
-                     process_peak_memory(), globalResult.child_peak_bytes,
-                     "Kira");
+                     process_peak_memory());
   }
 }
 
@@ -390,7 +373,7 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
   }
 
   // Build the distinct-integral table from the resident set and sort it into
-  // global IDs (simpler first → lower ID → kira prefers them as masters).
+  // global IDs (simpler first → lower ID, the masters-first convention).
   std::vector<RawIntegral> all_integrals(ctx.distinctIntegrals.begin(),
                                          ctx.distinctIntegrals.end());
   ctx.distinctIntegrals.clear();  // free the set (contents now in the vector)
@@ -408,17 +391,15 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
 
   namespace fs = std::filesystem;
   std::string global_path = _cache_dir + "/global";
-  fs::create_directories(global_path + "/system");
 
-  // In-process global reduction, skipping the Kira subprocess (and the "dum"
-  // symbol workaround) entirely: modular elimination + CRT for a pure-numeric
-  // system, rational-function reconstruction for a symbolic one.  FireFly is
-  // the second reconstruction engine for the symbolic system (its black box
-  // expresses the coefficients as functions of the parameters, so it has no
-  // numeric counterpart); a numeric system under "firefly" uses the FiniteFlow
-  // numeric path.
-  if (_global_tool == "finiteflow" || _global_tool == "firefly") {
-    GlobalReductionResult result;
+  // The global reduction, end to end in-process: modular elimination + CRT for a
+  // pure-numeric system, rational-function reconstruction for a symbolic one.
+  // FireFly is the second reconstruction engine for the symbolic system (its
+  // black box expresses the coefficients as functions of the parameters, so it
+  // has no numeric counterpart); a numeric system under "firefly" uses the
+  // numeric path, which is what the line below says when it happens.
+  GlobalReductionResult result;
+  {
     const std::string mastersFinalPath =
         _cache_dir + "/" + secred::kMastersFinalFile;
     if (_symbols.empty()) {
@@ -471,128 +452,10 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
         }
       }
     }
-    return result;
   }
-
-  // Integral index table: one line per integral "<id> <RawIntegral>".
-  {
-    std::ofstream intfile(global_path + "/integrals");
-    for (unsigned i = 0; i < all_integrals.size(); ++i)
-      intfile << i << " " << all_integrals[i] << "\n";
-  }
-
-  // Kira equation system: each equation is a block of "id*(coeff)" lines
-  // terminated by a blank line.  Read the spill file and translate each
-  // RawIntegral to its global ID.
-  // Kira requires at least one symbol in the system.  The ff_n path produces
-  // purely rational coefficients, so we inject an auxiliary variable 'dum'
-  // into the first term of the equation with the simplest leading term
-  // (smallest max integral ID) and pass -sdum=1 to substitute dum→1.  The
-  // signed path already carries the d/kinematic symbols, so no dum is needed.
-  {
-    const bool signed_path = !_symbols.empty();
-    unsigned dum_eq =
-        signed_path ? 0 : select_dum_eq_from_file(ctx.rawEquationsPath, integral_id);
-    std::ifstream in(ctx.rawEquationsPath);
-    std::ofstream eqfile(global_path + "/system/userDefinedSystem.kira");
-    unsigned eq_idx = 0;
-    bool dum_injected = false;
-    std::string line;
-    while (std::getline(in, line)) {
-      if (line.empty()) {  // end of one equation
-        eqfile << "\n";
-        ++eq_idx;
-        dum_injected = false;
-        continue;
-      }
-      auto tab = line.find('\t');
-      if (tab == std::string::npos)
-        continue;
-      RawIntegral integ = RawIntegral::from_text(line.substr(0, tab));
-      const std::string coeff = line.substr(tab + 1);
-      auto it = integral_id.find(integ);
-      if (it == integral_id.end())
-        continue;
-      if (!signed_path && eq_idx == dum_eq && !dum_injected) {
-        eqfile << it->second << "*(" << coeff << "*dum)\n";
-        dum_injected = true;
-      } else {
-        eqfile << it->second << "*(" << coeff << ")\n";
-      }
-    }
-  }
-
-  // The equations are now serialized to the kira system file; the raw spill
-  // file is dead and can be removed.  (integral_id / all_integrals are still
-  // needed below.)
-  std::filesystem::remove(ctx.rawEquationsPath);
-
-  // Target IDs: global IDs of the original target integrals.
-  {
-    std::ofstream targetfile(global_path + "/targets");
-    for (const auto &integ : reduce._rawTargets) {
-      auto it = integral_id.find(integ);
-      if (it != integral_id.end())
-        targetfile << it->second << "\n";
-    }
-  }
-
-  createJobFile(global_path + "/" + _kira_jobs_file);
-
-  std::string jobpath = _job_dir.empty() ? fs::current_path().string() : _job_dir;
-  std::string kira_dir = (!global_path.empty() && global_path[0] == '/')
-                             ? global_path
-                             : jobpath + "/" + global_path;
-  std::string cmd = "cd " + kira_dir + "\n" +
-                    _kira_cmd + " " + _kira_jobs_file +
-                    " -p" + std::to_string(_kira_parallel) +
-                    " --bunch_size=" + std::to_string(_kira_bunch_size);
-  if (_symbols.empty())
-    cmd += " -sdum=1";
-  if (std::system(cmd.c_str()) == -1)
-    std::cerr << "Failed to execute global kira\n";
-
-  // Replace integer IDs in kira output with concrete integral notation,
-  // and substitute the auxiliary variable 'dum' → 1 everywhere.
-  {
-    std::ifstream in(global_path + "/results/Tuserweight/kira_targets.kira");
-    std::ofstream out(_cache_dir + "/reductions");
-    if (in && out) {
-      std::string line;
-      while (std::getline(in, line)) {
-        auto star = line.find('*');
-        if (star == std::string::npos) {
-          out << line << "\n";
-          continue;
-        }
-        unsigned id = std::stoul(line.substr(0, star));
-        std::ostringstream oss;
-        oss << all_integrals[id];
-        std::string coeff = line.substr(star);
-        for (size_t pos = 0;
-             (pos = coeff.find("dum", pos)) != std::string::npos;
-             pos += 1)
-          coeff.replace(pos, 3, "1");
-        out << oss.str() << coeff << "\n";
-      }
-    }
-  }
-
-  // The Kira path has no learn/reconstruction split to report; Kira's own
-  // outputs are the masters and reductions it wrote above.
-  GlobalReductionResult kira_result;
-  kira_result.ok = true;
-  // Kira is the only child this process ever runs, so the kernel's account of the
-  // reaped children is its account of kira — the global stage's memory, which
-  // SecRed's own high-water mark does not cover.  Read after the call above
-  // returned, when the child's usage had been folded into the parent.
-  kira_result.child_peak_bytes = child_peak_memory();
-  // What kira handed to FireFly is not what SecRed handed to kira: kira selects,
-  // and the selection is the system the reconstruction actually runs on.
-  kira_result.firefly_equations =
-      selected_equations_from_log(global_path + "/kira.log");
-  return kira_result;
+  return result;
 }
+
 
 Family::Family(const YAML::Node &config) {
   if (!config["family"])
@@ -711,11 +574,6 @@ Family::Family(const YAML::Node &config) {
   if (config["settings"]) {
     const YAML::Node &s = config["settings"];
     if (s["cache_dir"])       _cache_dir       = s["cache_dir"].as<std::string>();
-    if (s["job_dir"])         _job_dir         = s["job_dir"].as<std::string>();
-    if (s["kira_cmd"])        _kira_cmd        = s["kira_cmd"].as<std::string>();
-    if (s["kira_jobs_file"])  _kira_jobs_file  = s["kira_jobs_file"].as<std::string>();
-    if (s["kira_bunch_size"])          _kira_bunch_size          = s["kira_bunch_size"].as<unsigned>();
-    if (s["kira_parallel"])            _kira_parallel            = s["kira_parallel"].as<unsigned>();
     if (s["threads"])                  _threads                  = s["threads"].as<unsigned>();
     if (s["parallel_mode"]) {
       _parallel_mode = s["parallel_mode"].as<std::string>();
@@ -748,16 +606,16 @@ Family::Family(const YAML::Node &config) {
     // memory_reserve: system memory (in GB) kept free during parallel sectors.
     if (s["memory_reserve"])
       _memory_reserve = (std::uint64_t)(s["memory_reserve"].as<double>() * 1024 * 1024 * 1024);
-    // global_tool: which tool performs the global reduction ("kira",
-    // "finiteflow" or "firefly", default "kira").  "firefly" reconstructs with
+    // global_tool: which engine performs the global reduction ("finiteflow",
+    // the default, or "firefly").  "firefly" reconstructs with
     // FireFly's Reconstructor in-process, which needs a symbolic system; on a
     // numeric system it falls back to the FiniteFlow numeric path.
     if (s["global_tool"]) {
       _global_tool = s["global_tool"].as<std::string>();
-      if (_global_tool != "kira" && _global_tool != "finiteflow" &&
+      if (_global_tool != "finiteflow" &&
           _global_tool != "firefly")
         throw std::runtime_error(
-            "global_tool must be 'kira', 'finiteflow' or 'firefly', got '" +
+            "global_tool must be 'finiteflow' or 'firefly', got '" +
             _global_tool + "'");
     }
     // global_finiteflow_threads: threads for the FiniteFlow reconstruction.
@@ -946,7 +804,7 @@ void Family::_generate_ibp() {
   if (_symbols.size() == 0) {
     _generate_ibp_ff_n();
   } else {
-    _generate_ibp_ff_m();  // symbolic coefficients (for the final kira emission)
+    _generate_ibp_ff_m();  // symbolic coefficients (for the global emission)
     _generate_ibp_ff_n();  // prime-substituted numeric (for FiniteFlow structure)
   }
 }
@@ -1046,7 +904,7 @@ void Family::_generate_ibp_ff_n() {
   // substitute distinct large primes so the coefficients become pure numbers
   // and the numeric FiniteFlow path can be reused for structural reduction.
   // The symbolic coefficients are kept separately in _ibpM and used for the
-  // final emission to kira (see sector_reduction_ff_n).
+  // final emission to the global system (see sector_reduction_ff_n).
   GiNaC::lst primeSubs;
   if (!_symbols.empty()) {
     for (unsigned i = 0; i < _symbols.size() && i < kNumPrimeSubs; ++i)
@@ -1055,7 +913,7 @@ void Family::_generate_ibp_ff_n() {
 
   // convert to numeric equations: full rationals (for global-equation emission)
   // alongside finite-field residues (for the compact FiniteFlow solver input).
-  // On the signed path the symbolic _ibpM supplies the coefficients for kira
+  // On the signed path the symbolic _ibpM supplies the coefficients for the
   // emission, so the full rational _ibpFF is dead weight there: build and store
   // only the finite-field residues.
   const bool keep_rational = _symbols.empty();

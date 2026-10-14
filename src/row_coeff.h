@@ -158,9 +158,9 @@ inline void row_print_vars(const RowVars &vars, const std::vector<std::string> &
 //   * a unit coefficient is omitted (`d`, `-d`), and an empty sum prints `0`.
 // `names` is the table's symbol-index-to-name list.
 //
-// No whitespace anywhere: the Kira path copies this text verbatim into the
-// system file FireFly reads, and that reader splits on whitespace, so a space
-// inside a coefficient silently truncates it (spec 4.2, `emits_a_single_
+// No whitespace anywhere: the writer copies this text verbatim into the global
+// system file, and its reader splits on whitespace, so a space inside a
+// coefficient silently truncates it (spec 4.2, `emits_a_single_
 // whitespace_free_token`).
 inline void print_row_poly(const RowNum &num, std::uint32_t q, const RowVars &mono,
                            const std::vector<std::string> &names, std::string &out) {
