@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <initializer_list>
+#include <random>
 #include <vector>
 
 // Global integral numbering (src/global_order.h).  The number is the index after
@@ -192,4 +193,85 @@ TEST(global_order_zero_id_is_the_simplest_in_its_layer) {
     REQUIRE(!balance_less(x, bal.front()));
   auto nor = run(in, OrderingMode::Normal);
   REQUIRE(nor.front() == RI({1, 0}));
+}
+
+// ---------------------------------------------------------------------------
+// The packed sort key (decorate-sort-undecorate)
+//
+// The numbered table is the solver's column order, so the key must induce
+// exactly the comparator's order -- a key that differs anywhere moves the master
+// basis.  These tests pit the key against global_integral_less itself.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A deterministic corpus: the field extremes of the packed key (the widest
+// powers the type admits, the empty integral) plus random integrals over mixed
+// propagator counts, so the lexicographic fallback and the nprops tie-break are
+// exercised as well.
+std::vector<RawIntegral> order_corpus(unsigned count, unsigned seed) {
+  std::vector<RawIntegral> v;
+  v.reserve(count + 6);
+  v.emplace_back(std::vector<int>(32, 127));   // depth 32 * 127, the widest key
+  v.emplace_back(std::vector<int>(32, -128));  // rank 32 * 128
+  v.emplace_back(std::vector<int>{0});
+  v.emplace_back(std::vector<int>{1, 0});
+  v.emplace_back(std::vector<int>{0, 1});
+  v.emplace_back(std::vector<int>{127, -128});
+  std::mt19937 rng(seed);
+  std::uniform_int_distribution<int> idx(-4, 4);
+  std::uniform_int_distribution<unsigned> np(1, 6);
+  for (unsigned k = 0; k < count; ++k) {
+    std::vector<int> w(np(rng));
+    for (int &x : w)
+      x = idx(rng);
+    v.emplace_back(std::move(w));
+  }
+  return v;
+}
+
+std::vector<secred::GlobalOrderKey> keyed(const std::vector<RawIntegral> &v,
+                                          OrderingMode mode) {
+  std::vector<secred::GlobalOrderKey> k;
+  k.reserve(v.size());
+  for (unsigned i = 0; i < v.size(); ++i)
+    k.push_back(secred::global_order_key(v[i], mode, i));
+  return k;
+}
+
+}  // namespace
+
+TEST(global_order_key_orders_exactly_like_the_comparator) {
+  auto v = order_corpus(400, 20261014u);
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    auto k = keyed(v, mode);
+    for (unsigned i = 0; i < v.size(); ++i) {
+      for (unsigned j = 0; j < v.size(); ++j) {
+        // Both directions, so a key that only reproduces "less" but not its
+        // negation (a wrong field order, a truncated field) is caught.
+        REQUIRE(secred::global_order_key_less(k[i], k[j], v) ==
+                secred::global_integral_less(v[i], v[j], mode));
+        REQUIRE(secred::global_order_key_less(k[j], k[i], v) ==
+                secred::global_integral_less(v[j], v[i], mode));
+      }
+    }
+  }
+}
+
+TEST(global_order_decorated_sort_reproduces_the_comparator_sort) {
+  // The same sort two ways: the compact key with the gather, and the original
+  // comparator in place.  Both are total orders, so the sequences must agree
+  // element for element.
+  auto v = order_corpus(3000, 7u);
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    std::vector<RawIntegral> want = v;
+    std::sort(want.begin(), want.end(),
+              [mode](const RawIntegral &a, const RawIntegral &b) {
+                return secred::global_integral_less(a, b, mode);
+              });
+    std::vector<RawIntegral> got = v;
+    secred::order_global_integrals(got, mode);
+    expect_order(got, want);
+    expect_permutation(v, got);
+  }
 }
