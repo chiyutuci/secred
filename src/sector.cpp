@@ -703,12 +703,20 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
     std::vector<RawIntegral> new_uptargets;
     local_eqs.reserve(selected_eqs.size());
 
-    // Symbolic coefficients (spec 4.3): a row is precompiled once, under the
-    // lock, and every later seed is a lock-free integer evaluation.  A row the
-    // precompiler cannot represent keeps the GiNaC path and its lock.
-    // (row_coeff.h's names live in namespace secred; this file spells them the
-    // way it already spells secred::ResEq.)
-    secred::RowTable row_table;
+    // Symbolic coefficients (spec 4.3): the family's rows are already
+    // precompiled -- Family::init_reduce built the one table, before any sector
+    // thread started -- so every equation here is a lock-free integer
+    // evaluation.  A row the precompiler cannot represent keeps the GiNaC path
+    // and its lock.  (row_coeff.h's names live in namespace secred; this file
+    // spells them the way it already spells secred::ResEq.)
+    const bool family_table = ctx.rowTable != nullptr;
+    // A caller that hands us no table (the reduction driven without
+    // init_reduce, as the tests do) gets the sector-local table this stage used
+    // before: identical coefficients, built lazily one generator at a time.
+    // Never a silent difference in the result -- only in who does the GiNaC
+    // work and when.
+    secred::RowTable local_table;
+    const secred::RowTable *row_table = family_table ? ctx.rowTable : &local_table;
     unsigned slow_eqs = 0;
 
     for (unsigned i = 0; i < selected_eqs.size(); ++i) {
@@ -722,16 +730,19 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
         // Signed/symbolic path: the elimination structure is decided on the
         // prime-substituted numeric system, but each surviving equation is
         // re-expressed with its full symbolic coefficient.
-        if (!row_table.contains(ibp_idx)) {
+        // The family's table is complete -- init_reduce built every generator --
+        // so a miss in it is a generator with no items, and there is nothing to
+        // add.  The fallback is built on first use, as this stage always was.
+        if (!family_table && !local_table.contains(ibp_idx)) {
           std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
-          row_table.add(ibp_idx, (*ibps_sym)[ibp_idx]);
+          local_table.add(ibp_idx, (*ibps_sym)[ibp_idx]);
         }
         bool via_ginac = false;
         const IBPProtoM &items = (*ibps_sym)[ibp_idx];
         for (unsigned j = 0; j < items.size(); ++j) {
           const RawIntegral integral = seed + items[j].first;
           std::string coeff_text;
-          const secred::RowEval st = row_table.eval(ibp_idx, j, seed, coeff_text);
+          const secred::RowEval st = row_table->eval(ibp_idx, j, seed, coeff_text);
           if (st == secred::RowEval::Zero)
             continue;
           if (st == secred::RowEval::NotPrecompiled) {
@@ -783,9 +794,13 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
         local_eqs.push_back(std::move(eq));
     }
 
+    // The first two counts are the table's, which is the family's: the same
+    // numbers in every sector's log, because the same generators are built for
+    // all of them.  The third is this sector's own -- how many equations it had
+    // to take down the GiNaC path -- and is the one that varies.
     if (ibps_sym)
-      file << "  symbolic coefficients: " << row_table.fast_rows
-           << " rows precompiled, " << row_table.slow_rows
+      file << "  symbolic coefficients: " << row_table->fast_rows
+           << " rows precompiled, " << row_table->slow_rows
            << " via GiNaC, " << slow_eqs << " equations via GiNaC\n";
 
     // Sector symmetry relations (spec 5.1-5.3).  One equation per prescription

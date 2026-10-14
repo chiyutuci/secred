@@ -596,6 +596,68 @@ TEST(init_reduce_prints_correctly) {
   std::filesystem::remove_all("tc_bubble_print");
 }
 
+// The settling round's row table belongs to the family, not to the sector.
+// Family::init_reduce builds it once -- before prepare_sectors starts any
+// thread -- so a family's IBP generators are expanded once instead of once per
+// sector under one process-wide mutex, and every later seed is a lock-free
+// integer evaluation.  Read-only from that point on (ctx.rowTable).
+TEST(init_reduce_builds_the_family_row_table_once) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_rowtable_box");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  const secred::RowTable *table = r.row_table();
+  REQUIRE(table != nullptr);
+  const auto &ibpM = FamilyTestHelper::ibpM(f);
+  REQUIRE(!ibpM.empty());
+  unsigned total = 0;
+  for (unsigned i = 0; i < ibpM.size(); ++i) {
+    total += ibpM[i].size();
+    if (!ibpM[i].empty())
+      REQUIRE_MSG(table->contains(i), "generator " + std::to_string(i) +
+                                          " is missing from the family row table");
+  }
+  // Every item row of every generator, not just the ones a first sector used.
+  REQUIRE_EQ(table->fast_rows + table->slow_rows, total);
+  std::filesystem::remove_all("tc_rowtable_box");
+}
+
+// A numeric family -- no symbols, so `dimension` is a number and the invariant
+// is the one set to unity -- has no symbolic coefficients to precompile: its
+// settling round evaluates integer coefficient vectors instead, and the table
+// stays null so the sector never looks for one.
+TEST(init_reduce_leaves_a_numeric_family_without_a_row_table) {
+  clear_symtab();
+  YAML::Node cfg = YAML::Load(R"(
+settings:
+  cache_dir: tc_rowtable_num
+family:
+  name: bubnum
+  dimension: 1999/500
+  internals: [l]
+  externals: [p]
+  invariants:
+    - [p2, 2]
+  invar_one: p2
+  sps_rules:
+    - [p, p, p2]
+  propagators:
+    - [l, 0]
+    - [l+p, 0]
+
+targets:
+  - [1, 1]
+)");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  REQUIRE(r.row_table() == nullptr);
+  std::filesystem::remove_all("tc_rowtable_num");
+}
+
 // ---------------------------------------------------------------------------
 // Hierarchical parallel execution — sector ordering invariant
 //

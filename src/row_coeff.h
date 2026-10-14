@@ -395,11 +395,17 @@ inline RowEval eval_row_coeff(const RowCoeff &row, const RawIntegral &seed,
   return RowEval::Ok;
 }
 
-// The per-sector cache: the rows a sector's settling round actually uses, built
-// lazily.  One entry per IBP generator, holding one RowCoeff per item, because
-// an IBPProtoM bundles several global rows into one generator.  Owned by one
-// sector thread, so `add` needs no lock of its own -- but it is GiNaC work, so
-// the caller holds `ginac_mutex` around it (spec 4.3).
+// The precompiled rows of a family's IBP generators: one entry per generator,
+// holding one RowCoeff per item, because an IBPProtoM bundles several global
+// rows into one generator.
+//
+// A row is the same row in every sector -- its coefficients do not depend on
+// the seed, and neither does the seed's sector -- so the table is the family's:
+// `Family::init_reduce` builds it once with `build_all`, single-threaded and
+// before any sector thread starts, and every sector reads it afterwards
+// (spec 4.3).  That is what makes `add`'s GiNaC work happen once per generator
+// per run instead of once per generator per sector, and it is why the sector's
+// evaluation loop takes no lock: by the time it runs, the table is read-only.
 struct RowTable {
   std::vector<std::string> names;                  // symbol index -> name
   std::unordered_map<std::string, unsigned> index; // name -> symbol index
@@ -412,6 +418,14 @@ struct RowTable {
   }
 
   void add(unsigned ibp_idx, const IBPProtoM &items);
+
+  // Build every generator, in index order: what the family-level table wants,
+  // and exactly what adding them one at a time gives (the counters and the name
+  // list are the same either way).  Idempotent, since `add` is.
+  void build_all(const std::vector<IBPProtoM> &ibps) {
+    for (unsigned i = 0; i < ibps.size(); ++i)
+      add(i, ibps[i]);
+  }
 
   RowEval eval(unsigned ibp_idx, unsigned item, const RawIntegral &seed,
                std::string &out) const {

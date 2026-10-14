@@ -38,6 +38,9 @@ struct SectorConfig {
 
 class Reduce;
 class SymmetryTable; // src/symmetry.h
+namespace secred {
+struct RowTable; // src/row_coeff.h
+}
 
 class RawIntegral {
 public:
@@ -315,6 +318,12 @@ struct ReductionContext {
   // so no lock is needed.  A table with no prescriptions when the feature is
   // off, so every consumer sees nothing to do.
   const SymmetryTable *symmetries = nullptr;
+  // The family's precompiled IBP-row table (spec 4.3), owned by Reduce.  Built
+  // by Family::init_reduce before prepare_sectors starts any thread and
+  // read-only after, so the settling round's coefficient evaluation needs no
+  // lock.  Null on a numeric family, whose settling round evaluates integer
+  // coefficient vectors instead of symbolic ones.
+  const secred::RowTable *rowTable = nullptr;
   std::mutex mastersMutex;
   std::mutex uptargetsMutex;
   unsigned totalSectors = 0;

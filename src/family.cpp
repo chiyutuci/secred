@@ -703,6 +703,17 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
     std::cout << "\n #0.4   Searching sector symmetries finished.\n";
   }
 
+  // The settling round's precompiled rows (spec 4.3).  A row's coefficients do
+  // not depend on the seed, so they do not depend on the sector either: the
+  // table is the family's, built here -- single-threaded, before
+  // prepare_sectors starts any sector thread -- and read-only from then on.
+  // Built per sector it was the same GiNaC work done once per sector, each
+  // under ginac_mutex, which serialised the settling rounds against each other.
+  if (!_symbols.empty()) {
+    reduce._rowTable.build_all(_ibpM);
+    reduce._ctx.rowTable = &reduce._rowTable;
+  }
+
   reduce.prepare_sectors();
 }
 

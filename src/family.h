@@ -8,6 +8,7 @@
 #include "yaml-cpp/yaml.h"
 
 #include "globalreduce.h"
+#include "row_coeff.h"
 #include "sector.h"
 #include "symmetry.h"
 #include "utils.h"
@@ -176,6 +177,10 @@ public:
   // it, and empty for the whole run when settings.symmetry is false.
   const SymmetryTable &symmetries() const { return _symmetries; }
 
+  // The family's precompiled IBP-row table (spec 4.3), or null when there is
+  // none to build -- a numeric family, or an init_reduce that has not run yet.
+  const secred::RowTable *row_table() const { return _ctx.rowTable; }
+
   friend class Family;
 
 private:
@@ -206,5 +211,9 @@ private:
   // before any thread starts, pruned at the end of prepare_sectors, read-only
   // after.
   SymmetryTable _symmetries;
+  // The settling round's precompiled IBP rows (spec 4.3): one table for the
+  // whole family, built in init_reduce before any sector thread starts, and
+  // handed to the sectors through _ctx.rowTable.
+  secred::RowTable _rowTable;
   ReductionContext _ctx;
 };

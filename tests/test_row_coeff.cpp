@@ -307,6 +307,56 @@ TEST(row_table_builds_one_generator_at_a_time_and_counts) {
           secred::RowEval::NotPrecompiled);
 }
 
+// The family-level build: the same table the settling round used to build
+// lazily, one generator at a time, per sector.  A row is the same row in every
+// sector, so building all of them once, before any thread starts, must give
+// exactly what the lazy path gives -- same names, same index, same counters,
+// same evaluations -- and must be idempotent, because a second call is a
+// no-op rather than a second count.
+TEST(row_table_build_all_matches_the_lazy_build_and_is_idempotent) {
+  const std::vector<IBPProtoM> ibps = {
+      rows_of({{d + 1, GiNaC::ex(2), GiNaC::ex(0)}, {1 / (1 + m), GiNaC::ex(2), GiNaC::ex(0)}}),
+      IBPProtoM{},  // a generator with no items: nothing to build, nothing to count
+      rows_of({{d - 2, s * m, GiNaC::ex(1)}})};
+
+  secred::RowTable lazy;
+  lazy.add(0, ibps[0]);
+  lazy.add(2, ibps[2]);
+
+  secred::RowTable all;
+  all.build_all(ibps);
+
+  REQUIRE_EQ(all.fast_rows, lazy.fast_rows);
+  REQUIRE_EQ(all.slow_rows, lazy.slow_rows);
+  REQUIRE(all.names == lazy.names);
+  REQUIRE(all.index == lazy.index);
+  REQUIRE(all.contains(0));
+  REQUIRE(all.contains(2));
+  // The empty generator is not "contained": contains() is what gates the build,
+  // so an entry no item was ever built for has to read as absent, exactly as the
+  // lazy path leaves it.
+  REQUIRE(!all.contains(1));
+  REQUIRE(!all.contains(3));
+  REQUIRE_EQ(all.rows.size(), ibps.size());
+
+  const RawIntegral seed(std::vector<int>({1, 2}));
+  for (unsigned j = 0; j < ibps[0].size(); ++j) {
+    std::string a, b;
+    REQUIRE_EQ(all.eval(0, j, seed, a), lazy.eval(0, j, seed, b));
+    REQUIRE(a == b);
+  }
+  for (unsigned j = 0; j < ibps[2].size(); ++j) {
+    std::string a, b;
+    REQUIRE_EQ(all.eval(2, j, seed, a), lazy.eval(2, j, seed, b));
+    REQUIRE(a == b);
+  }
+
+  all.build_all(ibps);
+  REQUIRE_EQ(all.fast_rows, lazy.fast_rows);
+  REQUIRE_EQ(all.slow_rows, lazy.slow_rows);
+  REQUIRE_EQ(all.names.size(), lazy.names.size());
+}
+
 // A seed whose length does not match the row cannot be evaluated: the row is
 // only valid for the nprops its coefficients were built for.
 TEST(row_coeff_refuses_a_seed_of_the_wrong_length) {
