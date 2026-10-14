@@ -22,7 +22,7 @@ family:
   # cut: [0, 0, 0, 0]
 
 settings:
-  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
@@ -31,10 +31,8 @@ settings:
                               # seeds, subsector columns and the global numbering all follow the
                               # balance key: total power, depth, rank, max denominator power,
                               # max numerator power)
-  global_tool: finiteflow     # global reducer: finiteflow (default, in-process) | firefly
-                              # (FireFly's reconstructor); global_finiteflow_threads sets the
-                              # reconstruction's thread count
-  cache_dir: cache_box        # directory for the global system and scratch files
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
+  cache_dir: cache_box        # directory for the run's output (reductions, masters, logs)
 
 targets:
   - [ 2, 2, 1, 1 ]

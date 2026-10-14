@@ -11,7 +11,7 @@
 // produces, and the basis the global reduction settles on.  They answer different
 // questions (the sector phase's union is not the final basis), so they are two files
 // with two names, and both hold one integral per line so either can be diffed against
-// the global tool's own list.
+// the other.
 
 namespace {
 
@@ -31,7 +31,7 @@ struct TempFile {
 
 TEST(masters_file_names_pin_the_two_bases) {
   REQUIRE_EQ(std::string(secred::kMastersSectorFile), std::string("masters_sector"));
-  REQUIRE_EQ(std::string(secred::kMastersFinalFile), std::string("masters_final"));
+  REQUIRE_EQ(std::string(secred::kMastersGlobalFile), std::string("masters_global"));
 }
 
 TEST(write_masters_file_writes_one_integral_per_line) {
@@ -56,6 +56,6 @@ TEST(write_masters_file_handles_an_empty_basis) {
 }
 
 TEST(write_masters_file_reports_an_unwritable_path) {
-  REQUIRE(!secred::write_masters_file("no_such_directory/masters_final",
+  REQUIRE(!secred::write_masters_file("no_such_directory/masters_global",
                                       std::vector<std::string>{"[1, 1, 1, 1]"}));
 }

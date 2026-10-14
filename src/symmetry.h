@@ -203,8 +203,6 @@ public:
   // symbolic family's sector stage can expand with `rational` instead of GiNaC.
   // One-off work, called from Family::init_reduce before any thread starts.
   void try_to_numeric_all();
-  // Diagnostic dump of the table (spec 4.1).
-  void dump(const std::string &path) const;
 
 private:
   std::vector<std::string> _canonical;                   // per sector id

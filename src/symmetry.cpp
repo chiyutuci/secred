@@ -667,31 +667,6 @@ void SymmetryTable::dropCross() {
   }
 }
 
-void SymmetryTable::dump(const std::string &path) const {
-  std::ofstream out(path);
-  unsigned pres = 0, dots = 0;
-  for (const auto &v : _bySource)
-    for (const PropPrescription &p : v) {
-      ++pres;
-      if (p.dot_only)
-        ++dots;
-    }
-  out << "# symmetry table: " << pres << " prescriptions, " << dots << " dot_only\n";
-  for (unsigned s = 0; s < _bySource.size(); ++s)
-    for (const PropPrescription &p : _bySource[s]) {
-      out << p.from << " -> " << p.to << " dot_only=" << (p.dot_only ? 1 : 0) << " nrows="
-          << nrows(p.from) << " ing=";
-      for (unsigned k = 0; k < p.ing.size(); ++k)
-        out << (k ? "," : "") << p.ing[k];
-      out << '\n';
-      for (unsigned k = 0; k < p.f.rows(); ++k) {
-        for (unsigned j = 0; j < p.f.cols(); ++j)
-          out << show(p.f(k, j)) << ' ';
-        out << "| " << show(p.c(k, 0)) << '\n';
-      }
-    }
-}
-
 namespace {
 
 // The expansion is written once over the coefficient type (spec 5.1): GiNaC::ex

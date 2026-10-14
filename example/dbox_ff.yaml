@@ -1,7 +1,9 @@
-# dbox_ff: dbox at symbolic dimension, reduced in-process with FiniteFlow.  The
-# smallest input that drives the symbolic path end to end — system build, learn,
-# degree estimation, sample evaluation, rational-function reconstruction — so it is
-# the smoke test for that path (box.yaml exercises the numeric one).
+# dbox_ff: dbox at symbolic dimension.  The smallest input that drives the symbolic
+# global path end to end — system build, learn, degree estimation, sample
+# evaluation, rational-function reconstruction — so it is the smoke test for the
+# symbolic learn and evaluator (the FiniteFlow symbolic path of the unit tests'
+# test_symbolic_evaluator; a run reconstructs a symbolic system with FireFly, so
+# this file and dbox_firefly.yaml reduce the same system with the same engine).
 family:
   name: dbox
   dimension: d
@@ -30,17 +32,12 @@ family:
     - [ l2+p1, 0 ]
 
 settings:
-  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  # global_tool: finiteflow runs the in-process modular elimination followed by
-  # FiniteFlow rational-function reconstruction (symbolic dimension);
-  # global_finiteflow_threads sets how many threads the reconstruction uses
-  # (default 64).
-  global_tool: finiteflow
-  global_finiteflow_threads: 64
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
   cache_dir: cache_dbox_ff
 
 targets:

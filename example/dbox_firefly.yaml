@@ -1,7 +1,7 @@
-# dbox_firefly: dbox at symbolic dimension, reduced in-process with FireFly.  Same
-# system as dbox_ff.yaml (the symbolic FiniteFlow path) but the global
-# rational-function reconstruction runs through FireFly's Reconstructor, so it is the
-# smoke test and the correctness benchmark for the `global_tool: firefly` backend.
+# dbox_firefly: dbox at symbolic dimension, reduced in-process with FireFly's
+# Reconstructor — the engine every symbolic system gets.  Same system as
+# dbox_ff.yaml, hence the same reduction, so the pair is the correctness benchmark
+# of the FireFly backend against the FiniteFlow symbolic path.
 family:
   name: dbox
   dimension: d
@@ -30,16 +30,12 @@ family:
     - [ l2+p1, 0 ]
 
 settings:
-  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  # global_tool: firefly runs FireFly's Reconstructor over the same symbolic system
-  # dbox_ff.yaml uses; global_finiteflow_threads sets how many probes the
-  # reconstruction runs concurrently (default 64).
-  global_tool: firefly
-  global_finiteflow_threads: 64
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
   cache_dir: cache_dbox_firefly
 
 targets:

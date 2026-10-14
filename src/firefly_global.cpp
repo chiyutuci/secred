@@ -30,7 +30,7 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
     const std::vector<GiNaC::possymbol> &symbols,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_final_path, unsigned nthreads) {
+    const std::string &masters_global_path, unsigned nthreads) {
   GlobalReductionResult res;
   if (nthreads == 0)
     nthreads = 1;
@@ -75,7 +75,7 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
 
   secred::SymbolicGlobalLearn learn =
       secred::symbolic_global_learn(pool, target_ids, all_integrals, symbols,
-                                    fflow::BIG_UINT_PRIMES[0], masters_final_path,
+                                    fflow::BIG_UINT_PRIMES[0], masters_global_path,
                                     secred::kFireFlyTag, narrowing_success,
                                     narrowing_fail, raw_equations_total,
                                     global_equations_count);

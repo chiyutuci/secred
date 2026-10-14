@@ -52,7 +52,7 @@ static YAML::Node symmetry_box_config(const std::string &cache_dir) {
   std::string yaml = R"(
 settings:
   cache_dir: )" + cache_dir + R"(
-  threads: 1
+  sthreads: 1
 
 family:
   name: box
@@ -95,7 +95,7 @@ static YAML::Node symmetry_sunrise_config(const std::string &cache_dir) {
   std::string yaml = R"(
 settings:
   cache_dir: )" + cache_dir + R"(
-  threads: 1
+  sthreads: 1
 
 family:
   name: sunrise
@@ -131,7 +131,7 @@ static YAML::Node symmetry_dbox_config(const std::string &cache_dir) {
   std::string yaml = R"(
 settings:
   cache_dir: )" + cache_dir + R"(
-  threads: 1
+  sthreads: 1
 
 family:
   name: dbox

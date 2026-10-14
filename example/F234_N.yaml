@@ -27,14 +27,13 @@ family:
     - [ l1+p1, 0 ]
 
 settings:
-  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  cache_dir: cache_F234_N     # directory for the global system and scratch files
-  global_tool: finiteflow     # numeric system: reduce in-process with FiniteFlow
-  global_finiteflow_threads: 64
+  cache_dir: cache_F234_N     # directory for the run's output (reductions, masters, logs)
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
 
 targets:
   - [1, 0, 1, 1, 0, 0, 0, 0, 0]

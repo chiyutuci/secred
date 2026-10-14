@@ -1,7 +1,8 @@
 # fam96: the two-loop five-point family of the AMFlow/AnaIBP run in
 # ~/Downloads/lizi/96 (cache/anaibp1), converted from that run's Kira input
 # (config/integralfamilies.yaml + config/kinematics.yaml) and reduced with the
-# in-process FiniteFlow global backend.
+# in-process global backend (FireFly: the system is symbolic, its free symbols
+# being the kinematics s and t at a numeric dimension).
 #
 # Mapping from the Kira input:
 #   autop1, autop2          -> l1, l2
@@ -48,7 +49,8 @@
 #   differ too, so a disagreement there says nothing about whether the conversion is
 #   right.
 #
-# Run record (64 threads, finiteflow backend): 435758 raw / 37229 global / 26463 final
+# Run record (64 threads, the FiniteFlow symbolic backend the run predates the
+# fixed dispatch with): 435758 raw / 37229 global / 26463 final
 # equations, 63 masters, 567 = 9x63 reconstructed outputs; sector reduction 4.4 s,
 # global 1 m 29 s, total 1 m 33 s, peak memory 1.14 GB.
 family:
@@ -78,14 +80,13 @@ family:
     - [ l1+p2, 0 ]
 
 settings:
-  threads: 64                 # worker threads for the sector-wise reduction (default: 64)
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
   parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  global_tool: finiteflow     # in-process FiniteFlow global reduction (no external solver)
-  global_finiteflow_threads: 64   # threads for the global FiniteFlow reconstruction
-  cache_dir: cache_fam96      # directory for the global system and scratch files
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
+  cache_dir: cache_fam96      # directory for the run's output (reductions, masters, logs)
 
 # Verbatim from the AnaIBP run's target list (`cache/anaibp1/target`).
 targets:

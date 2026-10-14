@@ -350,10 +350,10 @@ TEST(symbolic_global_learn_picks_the_same_selection_every_time) {
   secred::intern_sym_system(b, pb);
   const secred::SymbolicGlobalLearn la =
       secred::symbolic_global_learn(pa, {3}, integrals, symbols, 1125899906842597ULL,
-                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+                                    "/tmp/secred_test_masters_global", "[test]", 0, 0, 0, 0);
   const secred::SymbolicGlobalLearn lb =
       secred::symbolic_global_learn(pb, {3}, integrals, symbols, 1125899906842597ULL,
-                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+                                    "/tmp/secred_test_masters_global", "[test]", 0, 0, 0, 0);
   REQUIRE(la.ok);
   REQUIRE_EQ(la.nnindeps, 1u);                        // one master: [0,0]
   REQUIRE_EQ(la.dep_targets.size(), std::size_t(1));
@@ -385,7 +385,7 @@ TEST(symbolic_global_learn_builds_the_item_list) {
                                               RawIntegral(std::vector<int>{1, 1})};
   const secred::SymbolicGlobalLearn l =
       secred::symbolic_global_learn(pool, {3}, integrals, symbols, 1125899906842597ULL,
-                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+                                    "/tmp/secred_test_masters_global", "[test]", 0, 0, 0, 0);
   REQUIRE(l.ok);
   REQUIRE_EQ(l.dep_targets.size(), std::size_t(1));
   REQUIRE_EQ(l.items.begin.size(), l.dep_targets.size() + 1);   // one row boundary each
@@ -406,7 +406,7 @@ TEST(symbolic_global_learn_reports_a_target_that_is_a_master) {
                                               RawIntegral(std::vector<int>{1})};
   const secred::SymbolicGlobalLearn l =
       secred::symbolic_global_learn(pool, {0}, integrals, symbols, 1125899906842597ULL,
-                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+                                    "/tmp/secred_test_masters_global", "[test]", 0, 0, 0, 0);
   REQUIRE(l.ok);
   REQUIRE_EQ(l.dep_targets.size(), std::size_t(0));   // [0] never becomes a pivot
   REQUIRE_EQ(l.nnindeps, 0u);

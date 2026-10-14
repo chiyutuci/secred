@@ -304,7 +304,7 @@ inline void solve_res_eqs(std::vector<ResEq> &res_eqs, std::vector<uint32_t> &sy
 // known as soon as the learn pass has run, so it lands before the reconstruction —
 // which can be the longest phase of the run.
 template <typename Integral>
-void write_masters_final(const std::string &path,
+void write_masters_global(const std::string &path,
                          const std::vector<Integral> &all_integrals,
                          const std::vector<unsigned> &masters,
                          const char *tag = kFlowTag) {
@@ -313,10 +313,10 @@ void write_masters_final(const std::string &path,
   for (unsigned m : masters)
     basis.push_back(all_integrals[m]);
   if (!write_masters_file(path, basis)) {
-    std::cerr << tag << " masters_final: cannot write " << path << "\n";
+    std::cerr << tag << " masters_global: cannot write " << path << "\n";
     return;
   }
-  std::cout << "  " << tag << " masters_final: " << basis.size()
+  std::cout << "  " << tag << " masters_global: " << basis.size()
             << " masters written to " << path << "\n";
 }
 
@@ -343,7 +343,7 @@ struct SymbolicGlobalLearn {
 // entropy, so the same input picks the same equations in every run and in both
 // backends), forward/backward eliminate, take the masters as the union of the targets'
 // right-hand sides, mark-and-sweep from the targets with the numeric sufficiency repair
-// (global_select.h), write masters_final, and print the Learn Summary and Reduction
+// (global_select.h), write masters_global, and print the Learn Summary and Reduction
 // Statistics blocks.
 //
 // `system` is mutated (its tables are reduced for the learn prime) and is meant to be
@@ -354,7 +354,7 @@ SymbolicGlobalLearn symbolic_global_learn(
     SymCoeffPool &pool, const std::vector<unsigned> &target_ids,
     const std::vector<Integral> &all_integrals,
     const std::vector<GiNaC::possymbol> &symbols, std::uint64_t learn_prime,
-    const std::string &masters_final_path, const char *tag,
+    const std::string &masters_global_path, const char *tag,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count) {
   SymbolicGlobalLearn out;
@@ -522,7 +522,7 @@ SymbolicGlobalLearn symbolic_global_learn(
     std::cout << "\n" << format_learn_summary(ls, tag);
   }
 
-  write_masters_final(masters_final_path, all_integrals, out.masters, tag);
+  write_masters_global(masters_global_path, all_integrals, out.masters, tag);
 
   // Consolidated Reduction Statistics (as in the numeric path): "Final
   // equations" is what the mark-and-sweep keeps, i.e. what the reconstruction

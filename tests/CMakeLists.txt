@@ -24,6 +24,7 @@ set(TEST_SOURCES
     test_row_coeff.cpp
     test_progress_bar.cpp
     test_masters_file.cpp
+    test_log_files.cpp
     test_run_report.cpp
     test_utils.cpp
     test_firefly_global.cpp

@@ -257,11 +257,11 @@ namespace {
 namespace ff = fflow;
 
 // The shared evaluation half lives in symbolic_ffred.h, which owns `parallel_for`, the
-// shared subset solve and the masters_final writer; this file feeds it the parsed
+// shared subset solve and the masters_global writer; this file feeds it the parsed
 // system and drives the reconstruction.
 using secred::parallel_for;
 using secred::solve_res_eqs;
-using secred::write_masters_final;
+using secred::write_masters_global;
 
 // Rational reconstruction with progress logging.  The elimination's input is the plan,
 // so a prime costs one `values` fill and one planned elimination; the primes themselves
@@ -451,7 +451,7 @@ GlobalReductionResult reduce_global_finiteflow(
     const std::vector<RawIntegral> &targets,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_final_path, unsigned nthreads) {
+    const std::string &masters_global_path, unsigned nthreads) {
   GlobalReductionResult res;
   namespace ff = fflow;
 
@@ -700,7 +700,7 @@ GlobalReductionResult reduce_global_finiteflow(
     std::cout << "\n" << secred::format_learn_summary(ls);
   }
 
-  write_masters_final(masters_final_path, all_integrals, masters);
+  write_masters_global(masters_global_path, all_integrals, masters);
 
   // Consolidated Reduction Statistics.  "Final equations" is what the
   // mark-and-sweep keeps: the equations each prime's elimination runs on.
@@ -900,7 +900,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::vector<GiNaC::possymbol> &symbols,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_final_path, unsigned nthreads) {
+    const std::string &masters_global_path, unsigned nthreads) {
   GlobalReductionResult res;
   namespace ff = fflow;
 
@@ -958,7 +958,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   // the masters, the mark-and-sweep selection and both report blocks (symbolic_ffred.h).
   const uint64_t learn_prime = ff::BIG_UINT_PRIMES[0];
   secred::SymbolicGlobalLearn learn = secred::symbolic_global_learn(
-      pool, target_ids, all_integrals, symbols, learn_prime, masters_final_path,
+      pool, target_ids, all_integrals, symbols, learn_prime, masters_global_path,
       secred::kFlowTag, narrowing_success, narrowing_fail, raw_equations_total,
       global_equations_count);
   if (!learn.ok) {

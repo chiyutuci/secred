@@ -32,6 +32,11 @@ public:
   // number of propagators
   unsigned nprops() const { return _nprops; }
 
+  // The cache directory this family's run writes into.  The run's log copy lives
+  // there too (src/log_files.h), and it is opened by SecRed rather than by the
+  // family, which is why the directory is readable from outside.
+  const std::string &cache_dir() const { return _cache_dir; }
+
   // Non-trivial sectors of the family inside `top` (index = sector id, true =
   // non-trivial), by the Euler-form triviality test.  This is the "#0.4
   // Searching trivial sectors" stage of init_reduce, on its own so that the
@@ -103,7 +108,9 @@ private:
   // number of propagators
   unsigned _nprops = 0;
 
-  unsigned _threads = 64;
+  // Worker threads of the sector phase (parsed from settings: sthreads; default
+  // 64).
+  unsigned _sthreads = 64;
   std::string _parallel_mode = "fine";
 
   std::string _cache_dir = "cache";
@@ -124,18 +131,12 @@ private:
   std::vector<unsigned> _cut;
   unsigned _ncut = 0;
 
-  // which reconstruction engine performs the global reduction: "finiteflow"
-  // (default; in-process solver + CRT for pure-numeric systems, + FiniteFlow
-  // rational-function reconstruction for symbolic systems) or "firefly" (the
-  // FireFly black box for a symbolic system; a numeric system falls back to the
-  // numeric path, FireFly having no numeric counterpart). Parsed from settings:
-  // global_tool.
-  std::string _global_tool = "finiteflow";
-  // number of threads for the FiniteFlow global reconstruction
-  // (parsed from settings: global_finiteflow_threads; default 64). The Gaussian
-  // elimination itself is single-threaded (FiniteFlow), but the per-coefficient
-  // rational reconstruction (CRT + rat_rec) is parallelised across threads.
-  unsigned _global_finiteflow_threads = 64;
+  // Threads of the global phase (parsed from settings: gthreads; when the setting
+  // is absent it takes sthreads' value, so one number configures both phases).
+  // The Gaussian elimination itself is single-threaded (FiniteFlow), but the
+  // per-coefficient rational reconstruction (CRT + rat_rec) and FireFly's probes
+  // are parallelised across these threads.
+  unsigned _gthreads = 64;
 
   // symbols for integral indices
   std::vector<GiNaC::symbol> _symIndices;

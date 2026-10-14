@@ -2,6 +2,7 @@
 #include "BS_thread_pool.hpp"
 #include "global_order.h"
 #include "globalreduce.h"
+#include "log_files.h"
 #include "masters_file.h"
 #include "ginac/factor.h"
 #include <algorithm>
@@ -47,7 +48,7 @@ void Family::run_reduce(Reduce &reduce) {
   // Open the incremental equation spill. Each sector appends its selected
   // equations here (instead of accumulating them in RAM), so the global system
   // never stays resident through the sector phase.
-  reduce._ctx.rawEquationsPath = _cache_dir + "/global/raw_equations";
+  reduce._ctx.rawEquationsPath = _cache_dir + "/raw_equations";
   reduce._ctx.openSpill();
 
   // Fresh per-sector ATPS timing table: a header line here, then one row per
@@ -92,13 +93,12 @@ void Family::run_reduce(Reduce &reduce) {
   _ibpM.shrink_to_fit();
   reduce._ctx.uptargets.clear();
 
-  // In-process global reduction (FiniteFlow, or FireFly for a symbolic
-  // system): the probe-narrowing and final reduction statistics are
+  // In-process global reduction (FiniteFlow for a numeric system, FireFly for a
+  // symbolic one): the probe-narrowing and final reduction statistics are
   // consolidated into the Reduction Statistics block printed inside the
-  // in-process reducer (after learn, before reconstruction).
-  const bool finiteflow_global =
-      (_global_tool == "finiteflow" || _global_tool == "firefly") &&
-      reduce._ctx.globalEquationsCount.load() > 0;
+  // in-process reducer (after learn, before reconstruction), so the legacy
+  // blocks below print only for a run that has no global system at all.
+  const bool have_global_system = reduce._ctx.globalEquationsCount.load() > 0;
 
   // Probe narrowing statistics are final once the sector phase completes. Write
   // them to cache/sectors/sectors and echo them now — before the (possibly very
@@ -138,7 +138,7 @@ void Family::run_reduce(Reduce &reduce) {
 
     // With the pure-numeric FiniteFlow global reduction the probe narrowing is
     // folded into the Reduction Statistics summary printed after learn.
-    if (!finiteflow_global)
+    if (!have_global_system)
       std::cout << "\n Probe narrowing: succeeded " << ok << " / failed " << fail
                 << " / total " << total << " ("
                 << std::fixed << std::setprecision(1) << ratio << " % success)"
@@ -159,7 +159,7 @@ void Family::run_reduce(Reduce &reduce) {
 
   // Write the sector-local masters — the union of the per-sector masters, the
   // candidates the global step then selects from — to cache/masters_sector; the
-  // basis the global reduction settles on is cache/masters_final.
+  // basis the global reduction settles on is cache/masters_global.
   {
     std::vector<RawIntegral> sector_masters;
     for (const auto &sector : reduce._ctx.allMasters)
@@ -168,25 +168,12 @@ void Family::run_reduce(Reduce &reduce) {
                                sector_masters);
   }
 
-  // Count final master integrals.
-  //
-  // Numeric path: the global reduction writes "masters" during INIT and
-  // "masters.final" during FF_RECON.  Prefer "masters" (full dependency analysis,
-  // which excludes integrals appearing only as pivots), then "masters.final",
-  // then the sector-local list.
+  // Count final master integrals: the basis the global phase settled on, which is
+  // what it wrote to cache/masters_global.  With no global system there is no
+  // global phase, and the sector-local union stands.
   unsigned masterCount = 0;
-  const std::string mastersInitPath =
-      _cache_dir + "/global/results/Tuserweight/masters";
-  const std::string mastersFinalPath =
-      _cache_dir + "/global/results/Tuserweight/masters.final";
-  std::ifstream mastersFile(mastersInitPath);
-  if (!mastersFile.is_open())
-    mastersFile.open(mastersFinalPath);
-  if (mastersFile.is_open()) {
-    std::string line;
-    while (std::getline(mastersFile, line))
-      if (!line.empty())
-        ++masterCount;
+  if (have_global_system) {
+    masterCount = globalResult.masters.size();
   } else {
     for (const auto &sector : reduce._ctx.allMasters)
       masterCount += sector.size();
@@ -195,7 +182,7 @@ void Family::run_reduce(Reduce &reduce) {
   // Print reduction statistics summary.  (Probe narrowing stats were already
   // printed before the global reduction; the in-process paths print their
   // consolidated Reduction Statistics inside the reducer itself instead.)
-  if (!finiteflow_global) {
+  if (!have_global_system) {
     const auto &ctx = reduce._ctx;
     std::vector<std::string> labels{"Master integrals",
                                     "Raw equations generated (full pass)",
@@ -231,7 +218,7 @@ void Family::run_reduce(Reduce &reduce) {
 }
 
 void Family::_run_reduce_layer(Reduce &reduce) const {
-  BS::thread_pool pool(_threads);
+  BS::thread_pool pool(_sthreads);
   SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode};
 
   // Hierarchical parallel execution: sectors are pre-sorted by descending
@@ -323,7 +310,7 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
   // pool is declared before run_sector so that pool outlives run_sector:
   // destructor order is run_sector first (safe — all tasks done by then),
   // then pool.
-  BS::thread_pool pool(_threads);
+  BS::thread_pool pool(_sthreads);
 
   std::function<void(unsigned)> run_sector = [&](unsigned i) {
     auto &sector = reduce._reduceSectors[i];
@@ -376,54 +363,47 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
   for (unsigned i = 0; i < all_integrals.size(); ++i)
     integral_id[all_integrals[i]] = i;
 
-  namespace fs = std::filesystem;
-  std::string global_path = _cache_dir + "/global";
+  // The global reduction, end to end in-process.  Which engine runs is fixed by
+  // the system, not by a setting: a symbolic system (free symbols in the
+  // coefficients) is reconstructed with FireFly's black box, which expresses the
+  // coefficients as functions of those symbols; a numeric one goes through the
+  // modular elimination + CRT path.  Neither is a fallback for the other -- a
+  // system that reaches the wrong engine fails there rather than quietly being
+  // reduced by the other.
+  const bool symbolic = !_symbols.empty();
+  const char *tool = symbolic ? "firefly" : "finiteflow";
+  const std::string mastersGlobalPath =
+      _cache_dir + "/" + secred::kMastersGlobalFile;
 
-  // The global reduction, end to end in-process: modular elimination + CRT for a
-  // pure-numeric system, rational-function reconstruction for a symbolic one.
-  // FireFly is the second reconstruction engine for the symbolic system (its
-  // black box expresses the coefficients as functions of the parameters, so it
-  // has no numeric counterpart); a numeric system under "firefly" uses the
-  // numeric path, which is what the line below says when it happens.
   GlobalReductionResult result;
   {
-    const std::string mastersFinalPath =
-        _cache_dir + "/" + secred::kMastersFinalFile;
-    if (_symbols.empty()) {
-      if (_global_tool == "firefly")
-        std::cout << "  " << secred::kFireFlyTag
-                  << " numeric system: reconstructing with the in-process numeric "
-                     "path\n";
-      result = reduce_global_finiteflow(
-          ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
-          ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
-          ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
-          mastersFinalPath, _global_finiteflow_threads);
-    } else if (_global_tool == "firefly") {
+    // FireFly writes its log to a path it hardcodes in the working directory, so
+    // the reconstruction is bracketed by the two calls that keep that file out of
+    // the run's way and inside the cache directory (src/log_files.h).
+    secred::reset_firefly_log();
+    struct CollectFireflyLog {
+      const std::string &cache_dir;
+      ~CollectFireflyLog() { secred::collect_firefly_log(cache_dir); }
+    } collect_log{_cache_dir};
+
+    if (symbolic)
       result = secred::reduce_global_firefly_symbolic(
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
           _symbols, ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
-          mastersFinalPath, _global_finiteflow_threads);
-    } else {
-      result = reduce_global_finiteflow_symbolic(
+          mastersGlobalPath, _gthreads);
+    else
+      result = reduce_global_finiteflow(
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
-          _symbols, ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
+          ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
-          mastersFinalPath, _global_finiteflow_threads);
-    }
+          mastersGlobalPath, _gthreads);
     std::filesystem::remove(ctx.rawEquationsPath);
 
     // A phase that did not complete has no table to write: stop the run before the
     // masters file and cache/reductions below turn a failure into an empty reduction.
-    secred::require_global_reduction(result, _global_tool);
+    secred::require_global_reduction(result, tool);
 
-    fs::create_directories(global_path + "/results/Tuserweight");
-    {
-      std::ofstream mf(global_path + "/results/Tuserweight/masters");
-      for (const auto &m : result.masters)
-        mf << m << "\n";
-    }
     // Final reduction table under cache/reductions; blank line between targets.
     {
       std::ofstream of(_cache_dir + "/reductions");
@@ -560,8 +540,26 @@ Family::Family(const YAML::Node &config) {
   // settings (top-level, optional)
   if (config["settings"]) {
     const YAML::Node &s = config["settings"];
+    // Settings that used to exist and no longer do.  Each would otherwise be
+    // ignored in silence, leaving a config asking for one thing and a run doing
+    // another (a stale global_tool would pick the other global engine, a stale
+    // threads would leave the thread count at its default), so they are refused
+    // with the name of what replaced them.
+    for (const auto &[key, replacement] :
+         std::initializer_list<std::pair<const char *, const char *>>{
+             {"global_tool",
+              "the global tool is fixed: a symbolic system is reconstructed with "
+              "FireFly, a numeric one with FiniteFlow"},
+             {"threads", "settings.sthreads"},
+             {"global_finiteflow_threads", "settings.gthreads"}}) {
+      if (s[key])
+        throw std::runtime_error("settings." + std::string(key) +
+                                 " was removed; use " + replacement);
+    }
     if (s["cache_dir"])       _cache_dir       = s["cache_dir"].as<std::string>();
-    if (s["threads"])                  _threads                  = s["threads"].as<unsigned>();
+    if (s["sthreads"])        _sthreads        = s["sthreads"].as<unsigned>();
+    // gthreads unset: the global phase uses the sector phase's thread count.
+    _gthreads = s["gthreads"] ? s["gthreads"].as<unsigned>() : _sthreads;
     if (s["parallel_mode"]) {
       _parallel_mode = s["parallel_mode"].as<std::string>();
       if (_parallel_mode != "layer" && _parallel_mode != "fine")
@@ -593,21 +591,6 @@ Family::Family(const YAML::Node &config) {
     // memory_reserve: system memory (in GB) kept free during parallel sectors.
     if (s["memory_reserve"])
       _memory_reserve = (std::uint64_t)(s["memory_reserve"].as<double>() * 1024 * 1024 * 1024);
-    // global_tool: which engine performs the global reduction ("finiteflow",
-    // the default, or "firefly").  "firefly" reconstructs with
-    // FireFly's Reconstructor in-process, which needs a symbolic system; on a
-    // numeric system it falls back to the FiniteFlow numeric path.
-    if (s["global_tool"]) {
-      _global_tool = s["global_tool"].as<std::string>();
-      if (_global_tool != "finiteflow" &&
-          _global_tool != "firefly")
-        throw std::runtime_error(
-            "global_tool must be 'finiteflow' or 'firefly', got '" +
-            _global_tool + "'");
-    }
-    // global_finiteflow_threads: threads for the FiniteFlow reconstruction.
-    if (s["global_finiteflow_threads"])
-      _global_finiteflow_threads = s["global_finiteflow_threads"].as<unsigned>();
     // symmetry: detect the sector symmetry relations and use them in the
     // per-sector reduction (default true; spec 5.6/5.10).  With false no table
     // is built, nothing is dumped and the reduction is the symmetry-free one.
@@ -699,7 +682,6 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
     // one.  Filled here, before prepare_sectors starts any thread: the sector
     // stage reads them without a lock.
     reduce._symmetries.try_to_numeric_all();
-    reduce._symmetries.dump(_cache_dir + "/symmetries.txt");
     std::cout << "\n #0.4   Searching sector symmetries finished.\n";
   }
 

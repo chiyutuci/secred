@@ -16,7 +16,7 @@ static YAML::Node box_config(const std::string &cache_dir = "test_cache_box") {
   std::string yaml = R"(
 settings:
   cache_dir: )" + cache_dir + R"(
-  threads: 4
+  sthreads: 4
 
 family:
   name: box
@@ -92,13 +92,8 @@ public:
   static std::uint64_t memory_reserve(const Family &f) {
     return f._memory_reserve;
   }
-  static const std::string &global_tool(const Family &f) {
-    return f._global_tool;
-  }
-  static unsigned global_finiteflow_threads(const Family &f) {
-    return f._global_finiteflow_threads;
-  }
-  static unsigned threads(const Family &f) { return f._threads; }
+  static unsigned gthreads(const Family &f) { return f._gthreads; }
+  static unsigned sthreads(const Family &f) { return f._sthreads; }
   static const std::string &parallel_mode(const Family &f) {
     return f._parallel_mode;
   }
@@ -144,21 +139,48 @@ TEST(family_parse_propagator_count_bubble) {
   Family f(cfg);
 }
 
-TEST(family_parse_threads) {
-  // The box config sets threads: 4 — verify the explicit value is stored.
+TEST(family_parse_sthreads) {
+  // The box config sets sthreads: 4 — verify the explicit value is stored.
   clear_symtab();
-  YAML::Node cfg = box_config("tc_threads");
+  YAML::Node cfg = box_config("tc_sthreads");
   Family f(cfg);
-  REQUIRE(FamilyTestHelper::threads(f) == 4);
+  REQUIRE(FamilyTestHelper::sthreads(f) == 4);
 }
 
-TEST(family_parse_threads_default) {
-  // Without a threads entry the default (64) applies.
+TEST(family_parse_sthreads_default) {
+  // Without a sthreads entry the default (64) applies.
   clear_symtab();
-  YAML::Node cfg = box_config("tc_threads_default");
-  cfg["settings"].remove("threads");
+  YAML::Node cfg = box_config("tc_sthreads_default");
+  cfg["settings"].remove("sthreads");
   Family f(cfg);
-  REQUIRE(FamilyTestHelper::threads(f) == 64);
+  REQUIRE(FamilyTestHelper::sthreads(f) == 64);
+}
+
+TEST(family_parse_gthreads_defaults_to_sthreads) {
+  // gthreads unset: the global phase runs on as many threads as the sector phase.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_gthreads_default");
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::gthreads(f) == 4);
+}
+
+TEST(family_parse_gthreads_defaults_to_the_default_sthreads) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_gthreads_default_sthreads");
+  cfg["settings"].remove("sthreads");
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::sthreads(f) == 64);
+  REQUIRE(FamilyTestHelper::gthreads(f) == 64);
+}
+
+TEST(family_parse_gthreads_custom) {
+  // An explicit gthreads wins over sthreads; the two are independent.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_gthreads_custom");
+  cfg["settings"]["gthreads"] = 32;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::sthreads(f) == 4);
+  REQUIRE(FamilyTestHelper::gthreads(f) == 32);
 }
 
 TEST(family_parse_settings_cache_dir) {
@@ -187,66 +209,28 @@ TEST(family_parse_memory_reserve_custom) {
   REQUIRE(FamilyTestHelper::memory_reserve(f) == 40ULL * 1024 * 1024 * 1024);
 }
 
-TEST(family_parse_global_tool_default) {
+TEST(family_rejects_the_removed_global_tool_setting) {
+  // The global tool is fixed by the system (symbolic -> FireFly, numeric ->
+  // FiniteFlow), so the setting is gone.  A config that still carries it must say
+  // so instead of being silently reduced by the other engine.
   clear_symtab();
-  YAML::Node cfg = box_config("tc_global_tool_default");
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_tool(f) == "finiteflow");
-}
-
-TEST(family_parse_global_tool_finiteflow) {
-  clear_symtab();
-  YAML::Node cfg = box_config("tc_global_tool_finiteflow");
-  cfg["settings"]["global_tool"] = "finiteflow";
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_tool(f) == "finiteflow");
-}
-
-TEST(family_parse_global_tool_rejects_an_unknown_value) {
-  clear_symtab();
-  YAML::Node cfg = box_config("tc_global_tool_unknown");
-  cfg["settings"]["global_tool"] = "fireflyy";
-  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
-}
-
-TEST(family_parse_global_tool_firefly) {
-  clear_symtab();
-  YAML::Node cfg = box_config("tc_global_tool_firefly");
+  YAML::Node cfg = box_config("tc_global_tool_removed");
   cfg["settings"]["global_tool"] = "firefly";
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_tool(f) == "firefly");
-}
-
-TEST(family_parse_global_tool_accepts_both_backends) {
-  for (const char *tool : {"finiteflow", "firefly"}) {
-    clear_symtab();
-    YAML::Node cfg = box_config(std::string("tc_global_tool_ok_") + tool);
-    cfg["settings"]["global_tool"] = tool;
-    REQUIRE_NOTHROW(Family(cfg));
-  }
-}
-
-TEST(family_parse_global_tool_rejects_an_external_solver) {
-  // The global stage runs in this process; there is no external backend to name.
-  clear_symtab();
-  YAML::Node cfg = box_config("tc_global_tool_kira");
-  cfg["settings"]["global_tool"] = "kira";
   REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
-TEST(family_parse_global_finiteflow_threads_default) {
+TEST(family_rejects_the_removed_threads_setting) {
   clear_symtab();
-  YAML::Node cfg = box_config("tc_global_finiteflow_threads_default");
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_finiteflow_threads(f) == 64);
+  YAML::Node cfg = box_config("tc_threads_removed");
+  cfg["settings"]["threads"] = 8;
+  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
-TEST(family_parse_global_finiteflow_threads_custom) {
+TEST(family_rejects_the_removed_global_finiteflow_threads_setting) {
   clear_symtab();
-  YAML::Node cfg = box_config("tc_global_finiteflow_threads_custom");
-  cfg["settings"]["global_finiteflow_threads"] = 32;
-  Family f(cfg);
-  REQUIRE(FamilyTestHelper::global_finiteflow_threads(f) == 32);
+  YAML::Node cfg = box_config("tc_gff_threads_removed");
+  cfg["settings"]["global_finiteflow_threads"] = 8;
+  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
 TEST(family_parse_settings_custom_cache_dir) {

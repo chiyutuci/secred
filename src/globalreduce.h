@@ -104,7 +104,7 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
 // statistics feed the "Reduction Statistics" summary printed after the learn step
 // and before the reconstruction (narrowing counts, the equation count after learn
 // and the final reduction counts).
-// masters_final_path receives the final master basis (one integral per line, the same
+// masters_global_path receives the final master basis (one integral per line, the same
 // format as masters_sector) as soon as the learn pass has run — before the
 // reconstruction, which can be the longest phase of the run.
 // The reconstruction set is always the forward closure plus the numeric
@@ -117,7 +117,7 @@ GlobalReductionResult reduce_global_finiteflow(
     const std::vector<RawIntegral> &targets,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_final_path, unsigned nthreads = 64);
+    const std::string &masters_global_path, unsigned nthreads = 64);
 
 // Symbolic in-process global reduction: the coefficients are GiNaC polynomials in
 // `symbols`, the elimination uses the built-in modular solver (the same machinery
@@ -126,7 +126,7 @@ GlobalReductionResult reduce_global_finiteflow(
 // reconstruction (algorithm_reconstruct).  `symbols` are the variables of the
 // rational function (d plus the kinematic invariants), in the order FiniteFlow's
 // nparsin expects.
-// masters_final_path is written as in the numeric path, and the sample-point
+// masters_global_path is written as in the numeric path, and the sample-point
 // evaluation that dominates the reconstruction reports its progress.
 GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::string &raw_equations_path,
@@ -136,7 +136,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     const std::vector<GiNaC::possymbol> &symbols,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_final_path, unsigned nthreads = 64);
+    const std::string &masters_global_path, unsigned nthreads = 64);
 
 namespace secred {
 
@@ -181,6 +181,6 @@ GlobalReductionResult reduce_global_firefly_symbolic(
     const std::vector<GiNaC::possymbol> &symbols,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_final_path, unsigned nthreads = 64);
+    const std::string &masters_global_path, unsigned nthreads = 64);
 
 } // namespace secred
