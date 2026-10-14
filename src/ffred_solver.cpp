@@ -413,6 +413,17 @@ void FwdStore::reset(std::size_t n_ids) {
   else
     std::fill(has.begin(), has.begin() + (n_ids + 63) / 64, 0);
   row_of.resize(n_ids);
+  // One store per worker, and every point of a plan produces the same rows, so the sizes
+  // here -- the last point's -- say what this point will fill and the capacities say what
+  // it has to fill them in.  Keep the capacity: a point's push_back doubling leaves up to
+  // twice the terms it used, and the next point's rows are the same rows, so a capacity
+  // trimmed to the rows at hand would only be reallocated on the way back up.  Drop the
+  // pages instead (purge_vector_tail): at F234's 5.6M terms the tail is 33 MB a worker,
+  // and MADV_DONTNEED returns it without the copy shrink_to_fit would make of it.
+  purge_vector_tail(begin);
+  purge_vector_tail(len);
+  purge_vector_tail(ids);
+  purge_vector_tail(vals);
   begin.clear();
   len.clear();
   ids.clear();

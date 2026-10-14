@@ -5,9 +5,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <fstream>
 #include <initializer_list>
 #include <random>
 #include <set>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -20,6 +22,15 @@ namespace {
 using secred::Eq;
 using secred::Rat64;
 using secred::ResEq;
+
+// This process's resident set in kB (statm's resident field, in pages).  Only the purge test
+// reads it, and only for the difference one madvise makes.
+long resident_kb() {
+  std::ifstream f("/proc/self/statm");
+  long total = 0, resident = 0;
+  f >> total >> resident;
+  return resident * (::sysconf(_SC_PAGESIZE) / 1024);
+}
 
 constexpr uint64_t P = 1000000007ULL;
 
@@ -995,6 +1006,120 @@ TEST(ffred_planned_store_reset_forgets_rows) {
       }
     }
   }
+}
+
+// A store grows its arenas by push_back, so after the first point they hold up to twice
+// the terms the point used -- and there is one store per worker, so at F234's 5.6M terms
+// that slack is 33 MB of resident pages a worker.  The rows are the same rows at every
+// point (one plan), so reset -- where the sizes are still the last point's -- is the place
+// to hand those pages back; the capacity stays, because it is what the next point fills,
+// and nothing may be copied: shrink_to_fit allocates the smaller block before freeing the
+// larger, which doubles a worker's arena for the length of the copy, and every worker
+// reaches its second point at the same moment.
+TEST(ffred_planned_store_reset_keeps_its_arenas_in_place) {
+  secred::FwdStore store;
+  // The state one point leaves behind: 600 rows, 2000 terms, and the capacity a growth by
+  // doubling overshoots to.  What a point used is the sizes; what it holds is the
+  // capacities.
+  store.begin.assign(600u, 0u);
+  store.len.assign(600u, 0u);
+  store.ids.assign(2000u, 0u);
+  store.vals.assign(2000u, 0u);
+  store.begin.reserve(4000u);
+  store.len.reserve(4000u);
+  store.ids.reserve(8000u);
+  store.vals.reserve(8000u);
+
+  const uint32_t *const ids_data = store.ids.data();
+  const uint64_t *const vals_data = store.vals.data();
+  const uint32_t *const begin_data = store.begin.data();
+  const uint32_t *const len_data = store.len.data();
+
+  store.reset(129u);
+
+  REQUIRE_EQ(store.ids.size(), std::size_t(0));
+  REQUIRE_EQ(store.begin.size(), std::size_t(0));
+  // The capacity is what the next point fills, so it survives the reset -- and surviving it
+  // in place is the point: a reset that reallocated would show up here as a moved data().
+  REQUIRE_EQ(store.ids.capacity(), std::size_t(8000));
+  REQUIRE_EQ(store.vals.capacity(), std::size_t(8000));
+  REQUIRE_EQ(store.begin.capacity(), std::size_t(4000));
+  REQUIRE_EQ(store.len.capacity(), std::size_t(4000));
+  REQUIRE(store.ids.data() == ids_data);
+  REQUIRE(store.vals.data() == vals_data);
+  REQUIRE(store.begin.data() == begin_data);
+  REQUIRE(store.len.data() == len_data);
+
+  // Tightening must not touch what a point put there: the same fixture reduced at the
+  // same prime, before and after a reset that had something to tighten.
+  const std::vector<Eq> &system = planned_fixture();
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin{0u}, sys_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i])
+      terms.emplace_back(t.first, static_cast<uint32_t>(terms.size()));
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+  const uint64_t p = fflow::BIG_UINT_PRIMES[1];
+  std::vector<uint64_t> values(terms.size(), 0);
+  std::size_t v = 0;
+  for (const Eq &e : system)
+    for (const auto &t : e)
+      values[v++] = secred::rat_mod_u64(t.second.num, t.second.den, p);
+
+  store.reset(129u);
+  secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+  const std::vector<uint32_t> ids_before = store.ids;
+  const std::vector<uint64_t> vals_before = store.vals;
+  const std::vector<uint32_t> row_of_before = store.row_of;
+  REQUIRE(!ids_before.empty());
+
+  store.reset(129u);
+  secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+  REQUIRE(store.ids == ids_before);
+  REQUIRE(store.vals == vals_before);
+  REQUIRE(store.row_of == row_of_before);
+  // The point filled the capacity the reset left it, so it reallocated nothing: the rows
+  // went into the same buffer the previous point's did.
+  REQUIRE(store.ids.data() == ids_data);
+  REQUIRE(store.vals.data() == vals_data);
+}
+
+// The trim's other half, which the store's own state cannot show: the pages are the OS's
+// again.  A vector whose capacity outruns its size keeps every page of that tail resident
+// and untouched until something writes it, and the point about dropping them is that the
+// drop costs no copy -- so the assertion is the resident set the kernel reports.
+TEST(ffred_purge_vector_tail_returns_the_pages_it_covers) {
+  std::vector<uint64_t> arena(1u << 20, 1u); // 8 MB, every page written
+  arena.resize(1u << 19);                    // half live, half an untouched-but-resident tail
+  const long before = resident_kb();
+  secred::purge_vector_tail(arena);
+  const long after = resident_kb();
+  // The whole 4 MB tail is page-aligned and mapped, so the kernel drops it there and then;
+  // half of it is the margin a test can afford to ask for.
+  REQUIRE(before - after >= 2048);
+
+  // What the vector holds is untouched: same address, same capacity, same elements, and a
+  // write into the tail still lands (faulting the page back in).
+  REQUIRE_EQ(arena.capacity(), std::size_t(1u << 20));
+  REQUIRE_EQ(arena.size(), std::size_t(1u << 19));
+  REQUIRE(arena[0] == 1u);
+  REQUIRE(arena[(1u << 19) - 1] == 1u);
+  arena.resize(1u << 20, 7u);
+  REQUIRE(arena[0] == 1u);
+  REQUIRE(arena[(1u << 20) - 1] == 7u);
+
+  // A tail shorter than the page it would have to share is left alone: dropping it would
+  // take the live elements sharing that page with it.
+  std::vector<uint64_t> narrow(8u, 3u);
+  const long narrow_before = resident_kb();
+  secred::purge_vector_tail(narrow);
+  REQUIRE(resident_kb() >= narrow_before - 8); // nothing to drop, nothing dropped
+  REQUIRE(narrow[7] == 3u);
 }
 
 // The plan's order is one vector shared by every prime and every point, so a point must

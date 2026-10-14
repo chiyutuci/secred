@@ -3,6 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
@@ -202,6 +204,45 @@ struct Row {
   }
 };
 
+// Hand the kernel the pages of a vector's unused tail, leaving its size, contents and
+// capacity exactly as they were.
+//
+// The planned path refills the same arenas from empty at every sample point, so the
+// capacity a point leaves behind is the capacity the next point wants -- shrinking it to
+// the terms at hand would only make the next fill allocate again.  The resident pages are
+// the other matter: push_back doubles, so a point can leave up to twice the terms it used
+// mapped and untouched, 33 MB a worker at F234's size against a 106 MB store.  MADV_DONTNEED
+// drops exactly those pages; the next point faults them back in as it writes them, and
+// nothing is copied.
+//
+// shrink_to_fit is the wrong tool for the same job: it allocates the smaller block before
+// freeing the larger, so for the length of the copy a worker holds both, and the workers
+// reach their second point together -- 64 of them at once is a transient the process's
+// high-water mark keeps even though the steady state is lower.
+//
+// Only whole pages *inside* the allocation are dropped, so a page the tail shares with the
+// live elements below it, or with whatever the allocator placed after it, keeps its
+// contents: rounding the end down matters as much as rounding the start up, because
+// madvise rounds its length up to a page and the page past the end is not ours.
+template <typename V> void purge_vector_tail(V &v) {
+  using T = typename V::value_type;
+  T *const base = v.data();
+  if (base == nullptr || v.capacity() <= v.size())
+    return;
+  const long page = ::sysconf(_SC_PAGESIZE);
+  if (page <= 0)
+    return;
+  const std::uintptr_t mask = static_cast<std::uintptr_t>(page) - 1;
+  const std::uintptr_t first =
+      (reinterpret_cast<std::uintptr_t>(base + v.size()) + mask) & ~mask;
+  const std::uintptr_t last =
+      reinterpret_cast<std::uintptr_t>(base + v.capacity()) & ~mask;
+  if (first >= last)
+    return;
+  ::madvise(reinterpret_cast<void *>(first), static_cast<std::size_t>(last - first),
+            MADV_DONTNEED);
+}
+
 // One point's solutions: rows in two flat arenas, membership in a bitset.
 //
 // Row r is ids[begin[r] .. begin[r]+len[r]) with ids[begin[r]] its pivot, descending, the
@@ -231,8 +272,10 @@ struct FwdStore {
   // Size of the id space, not of one row: kept here for the same reason as the buffers.
   std::vector<uint32_t> eval_len, eval_front;
 
-  // Cover ids [0, n_ids) and forget every row.  `row_of` is not cleared: its entries are
-  // only read where `has` says a row exists, and `has` is cleared here.
+  // Cover ids [0, n_ids) and forget every row, handing the arenas' unused pages back to
+  // the kernel (purge_vector_tail) while keeping their capacity for the next point.
+  // `row_of` is not cleared: its entries are only read where `has` says a row exists, and
+  // `has` is cleared here.
   void reset(std::size_t n_ids);
   bool has_row(uint32_t id) const { return (has[id >> 6] >> (id & 63)) & 1u; }
   void mark(uint32_t id, uint32_t row) {
