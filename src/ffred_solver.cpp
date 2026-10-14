@@ -1,6 +1,7 @@
 #include "ffred_solver.h"
 
 #include <algorithm>
+#include <cstring>
 
 namespace secred {
 
@@ -443,23 +444,18 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
     store.order_ptr = &store.order_own;
   }
 
-  std::vector<uint32_t> &pids = store.pids;
-  std::vector<uint64_t> &pvals = store.pvals;
-  std::vector<uint32_t> &mids = store.mids;
-  std::vector<uint64_t> &mvals = store.mvals;
+  Row &pend = store.pend;
+  Row &merged = store.merged;
   for (uint32_t k : *store.order_ptr) {
     // This point's row k, gathered on demand: the row's terms whose coefficient did not
     // vanish here.  Descending id, as the merge below assumes.
-    pids.clear();
-    pvals.clear();
+    pend.clear();
     for (std::size_t t = rows.begin(k), te = rows.begin(k + 1); t < te; ++t) {
       const uint64_t v = values[rows.terms[t].second];
-      if (v) {
-        pids.push_back(rows.terms[t].first);
-        pvals.push_back(v);
-      }
+      if (v)
+        pend.push(rows.terms[t].first, v);
     }
-    if (pids.empty())
+    if (pend.empty())
       continue; // reduced to 0 = 0
 
     // Substitute the highest reducible term repeatedly.  Each substitution merges one
@@ -467,18 +463,18 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
     // descending with unique ids.
     std::size_t scan = 0; // [0, scan) came through the last merge unchanged
     while (true) {
-      std::size_t idx = pids.size();
-      for (std::size_t i = scan; i < pids.size(); ++i) {
-        if (store.has_row(pids[i])) {
+      std::size_t idx = pend.n;
+      for (std::size_t i = scan; i < pend.n; ++i) {
+        if (store.has_row(pend.ids[i])) {
           idx = i;
           break;
         }
       }
-      if (idx == pids.size())
+      if (idx == pend.n)
         break;
 
-      const uint32_t w = pids[idx];
-      const uint64_t c = pvals[idx];
+      const uint32_t w = pend.ids[idx];
+      const uint64_t c = pend.vals[idx];
       const uint32_t row = store.row_of[w];
       const uint32_t rb = store.begin[row], rl = store.len[row];
       const uint32_t *rids = store.ids.data() + rb;
@@ -493,66 +489,68 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
       // instead (what the loop below does from idx on) would re-compare every one of those
       // terms once per substitution of this row: at F234's sizes idx grows along the row,
       // and that re-walk is the per-point elimination's largest single term.
-      mids.clear();
-      mvals.clear();
-      mids.reserve(pids.size() + rl);
-      mvals.reserve(pids.size() + rl);
-      mids.insert(mids.end(), pids.begin(), pids.begin() + idx);
-      mvals.insert(mvals.end(), pvals.begin(), pvals.begin() + idx);
+      const std::size_t n = pend.n;
+      merged.ensure(n + rl); // an upper bound: no term lands more than once
+      uint32_t *oid = merged.ids.get();
+      uint64_t *oval = merged.vals.get();
+      std::memcpy(oid, pend.ids.get(), idx * sizeof(uint32_t));
+      std::memcpy(oval, pend.vals.get(), idx * sizeof(uint64_t));
+      oid += idx;
+      oval += idx;
       std::size_t i = idx + 1, j = 1; // the w entry at idx is dropped: it cancels
-      while (i < pids.size() && j < rl) {
-        const uint32_t a = pids[i], b = rids[j];
+      while (i < n && j < rl) {
+        const uint32_t a = pend.ids[i], b = rids[j];
         if (a > b) {
-          mids.push_back(a);
-          mvals.push_back(pvals[i]);
+          *oid++ = a;
+          *oval++ = pend.vals[i];
           ++i;
         } else if (a < b) {
-          mids.push_back(b);
-          mvals.push_back(shoup_mul(rvals[j], c, cp, p));
+          *oid++ = b;
+          *oval++ = shoup_mul(rvals[j], c, cp, p);
           ++j;
         } else {
-          uint64_t v = pvals[i] + shoup_mul(rvals[j], c, cp, p);
+          uint64_t v = pend.vals[i] + shoup_mul(rvals[j], c, cp, p);
           if (v >= p)
             v -= p;
           if (v) {
-            mids.push_back(a);
-            mvals.push_back(v);
+            *oid++ = a;
+            *oval++ = v;
           }
           ++i;
           ++j;
         }
       }
-      while (i < pids.size()) {
-        mids.push_back(pids[i]);
-        mvals.push_back(pvals[i]);
+      while (i < n) {
+        *oid++ = pend.ids[i];
+        *oval++ = pend.vals[i];
         ++i;
       }
       while (j < rl) {
-        mids.push_back(rids[j]);
-        mvals.push_back(shoup_mul(rvals[j], c, cp, p));
+        *oid++ = rids[j];
+        *oval++ = shoup_mul(rvals[j], c, cp, p);
         ++j;
       }
-      pids.swap(mids);
-      pvals.swap(mvals);
+      merged.n = static_cast<std::size_t>(oid - merged.ids.get());
+      merged.swap(pend);
       scan = idx;
     }
 
-    if (pids.empty())
+    if (pend.empty())
       continue;
 
     // Normalise the pivot on the remaining highest term: coefficient -> -1.
-    const uint32_t pivot = pids.front();
-    const uint64_t neg_inv = (p - mod_inverse_u64_fast(pvals.front(), p)) % p;
+    const uint32_t pivot = pend.ids[0];
+    const uint64_t neg_inv = (p - mod_inverse_u64_fast(pend.vals[0], p)) % p;
     const uint64_t np = shoup_precomp(neg_inv, p);
     const uint32_t row = static_cast<uint32_t>(store.begin.size());
     store.begin.push_back(static_cast<uint32_t>(store.ids.size()));
-    store.len.push_back(static_cast<uint32_t>(pids.size()));
+    store.len.push_back(static_cast<uint32_t>(pend.n));
     // The ids need no arithmetic, so the whole row is appended with one memmove; only the
     // values are scaled, one by one (push_back rather than a resize, which would
     // value-initialise the tail only for the loop to overwrite it).
-    store.ids.insert(store.ids.end(), pids.begin(), pids.end());
-    for (std::size_t t = 0; t < pids.size(); ++t)
-      store.vals.push_back(shoup_mul(pvals[t], neg_inv, np, p));
+    store.ids.insert(store.ids.end(), pend.ids.get(), pend.ids.get() + pend.n);
+    for (std::size_t t = 0; t < pend.n; ++t)
+      store.vals.push_back(shoup_mul(pend.vals[t], neg_inv, np, p));
     store.mark(pivot, row);
   }
 }

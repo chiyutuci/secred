@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -148,6 +149,56 @@ struct SymRowTable {
   std::size_t row_size(std::size_t e) const { return eq_begin[e + 1] - eq_begin[e]; }
 };
 
+// One row of the planned elimination: ids and their values in two parallel arrays.
+//
+// Deliberately not a `std::vector` pair.  A point's merge runs ~19M times at F234's size
+// and moves ~663M terms, and `push_back` pays a capacity test and a size rewrite on every
+// one of them -- four memory operations to store a term that needs two.  Here the length
+// and the capacity are separate, growth doubles and copies only the live terms (never
+// value-initialising a tail nothing reads), and the merge writes through `ids`/`vals`
+// directly and sets `n` once at the end.
+//
+// `ensure` preserves the first `n` terms, so a row can also be built term by term.
+struct Row {
+  std::unique_ptr<uint32_t[]> ids;
+  std::unique_ptr<uint64_t[]> vals;
+  std::size_t n = 0;   // terms held
+  std::size_t cap = 0; // terms the arrays can hold
+
+  void ensure(std::size_t need) {
+    if (cap >= need)
+      return;
+    std::size_t nc = cap ? cap : 8;
+    while (nc < need)
+      nc *= 2;
+    // `new T[n]` leaves the elements uninitialised for a trivial T, which is the point:
+    // the merge overwrites all of [0, n) before anything reads it.
+    std::unique_ptr<uint32_t[]> ni(new uint32_t[nc]);
+    std::unique_ptr<uint64_t[]> nv(new uint64_t[nc]);
+    for (std::size_t k = 0; k < n; ++k) {
+      ni[k] = ids[k];
+      nv[k] = vals[k];
+    }
+    cap = nc;
+    ids = std::move(ni);
+    vals = std::move(nv);
+  }
+  void clear() { n = 0; }
+  bool empty() const { return n == 0; }
+  void push(uint32_t id, uint64_t v) {
+    ensure(n + 1);
+    ids[n] = id;
+    vals[n] = v;
+    ++n;
+  }
+  void swap(Row &o) {
+    ids.swap(o.ids);
+    vals.swap(o.vals);
+    std::swap(n, o.n);
+    std::swap(cap, o.cap);
+  }
+};
+
 // One point's solutions: rows in two flat arenas, membership in a bitset.
 //
 // Row r is ids[begin[r] .. begin[r]+len[r]) with ids[begin[r]] its pivot, descending, the
@@ -168,12 +219,10 @@ struct FwdStore {
   const std::vector<uint32_t> *order_ptr = nullptr;
   std::vector<uint32_t> order_own;
   const std::vector<uint32_t> &order() const { return *order_ptr; }
-  // Reused merge buffers: one pending row and its merged replacement.  Ids and values in
-  // parallel arrays rather than one 16-byte pair: the merge compares ids only, and a pair
-  // would make every comparison drag a value it never looks at.  Kept here so a point
-  // allocates nothing after the first row.
-  std::vector<uint32_t> pids, mids;
-  std::vector<uint64_t> pvals, mvals;
+  // Reused merge buffers: one pending row and its merged replacement (`Row`, which is
+  // where the parallel arrays and their reasons live).  Kept here so a point allocates
+  // nothing after the first row.
+  Row pend, merged;
   // Reused by the fallback order (a point where a coefficient vanished): each row's
   // evaluated length and leading id, so the order reads them instead of walking the rows.
   // Size of the id space, not of one row: kept here for the same reason as the buffers.
