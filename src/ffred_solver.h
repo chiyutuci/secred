@@ -22,6 +22,18 @@ using ResEq = std::vector<std::pair<uint32_t, uint64_t>>;
 // Modular inverse of a modulo the prime p (gcd(a,p)=1), via __int128 extended Euclid.
 uint64_t mod_inverse_u64(uint64_t a, uint64_t p);
 
+// The same inverse without a single division: binary extended Euclid over 64-bit words,
+// carrying u = x1*a (mod p) and v = x2*a (mod p) alongside the remainders and halving both
+// by the same rule, so the survivor's coefficient is the inverse.  a = 0 is not invertible
+// and returns 0, exactly as mod_inverse_u64 does.
+//
+// The sample-point path normalises one pivot per row -- ~547k inverses per point at F234's
+// size -- and that is where the 128-bit Euclid loop's ~50 iterations of __udivti3 put most
+// of the forward elimination's constant factor.  Every intermediate here stays below
+// 2p < 2^64 because p < 2^63, which is the same bound the rest of this file assumes.
+// Preconditions: p odd and 0 <= a < p.
+uint64_t mod_inverse_u64_fast(uint64_t a, uint64_t p);
+
 // (num/den) mod p with den > 0, using 128-bit machine arithmetic.
 uint64_t rat_mod_u64(int64_t num, int64_t den, uint64_t p);
 
@@ -149,12 +161,19 @@ struct FwdStore {
   std::vector<uint32_t> begin, len;
   std::vector<uint32_t> ids;
   std::vector<uint64_t> vals;
-  // The order this point's elimination ran in: the plan's, or -- at a point where a
-  // coefficient vanished -- the one rebuilt from the rows themselves.
-  std::vector<uint32_t> order;
-  // Reused merge buffers: one pending row and its merged replacement, kept here so a
-  // point allocates nothing after the first row.
-  std::vector<std::pair<uint32_t, uint64_t>> pending, merged;
+  // The order this point's elimination ran in: the plan's own vector where the point's
+  // rows are the plan's rows, otherwise the one rebuilt from the evaluated rows
+  // (`order_own`).  A pointer, because the plan's order is one vector shared by every prime
+  // and every point and the copy would be 547k entries -- 2.3 MB -- per point.
+  const std::vector<uint32_t> *order_ptr = nullptr;
+  std::vector<uint32_t> order_own;
+  const std::vector<uint32_t> &order() const { return *order_ptr; }
+  // Reused merge buffers: one pending row and its merged replacement.  Ids and values in
+  // parallel arrays rather than one 16-byte pair: the merge compares ids only, and a pair
+  // would make every comparison drag a value it never looks at.  Kept here so a point
+  // allocates nothing after the first row.
+  std::vector<uint32_t> pids, mids;
+  std::vector<uint64_t> pvals, mvals;
   // Reused by the fallback order (a point where a coefficient vanished): each row's
   // evaluated length and leading id, so the order reads them instead of walking the rows.
   // Size of the id space, not of one row: kept here for the same reason as the buffers.
@@ -182,7 +201,7 @@ struct FwdStore {
 // The plan is checked first: a coefficient that vanishes here shortens its row and can
 // move its front, and the reference -- which orders the rows it was handed -- would then
 // sort that row somewhere else, so the order is rebuilt from the evaluated rows
-// (`store.order`).  Every slot occurs in some row, so "no value is zero" answers what a
+// (`store.order()`).  Every slot occurs in some row, so "no value is zero" answers what a
 // per-row length-and-front check would, in one scan of the slot array.
 void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                std::size_t n_values, const FwdPlan &plan, uint64_t p,

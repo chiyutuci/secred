@@ -607,6 +607,44 @@ const std::vector<Eq> &planned_fixture() {
 
 } // namespace
 
+// The sample-point path inverts one coefficient per pivot row -- ~547k inverses per point
+// at F234's size -- so its normalisation cannot pay the reference's 128-bit Euclid loop.
+// The 64-bit form has to agree with the reference on every residue the reconstruction will
+// see, and its boundaries matter more than its random cases: 1 and p-1 are the ends of the
+// range, and 0 (not invertible) is what both forms document as 0.
+TEST(ffred_fast_inverse_matches_reference) {
+  std::mt19937_64 rng(20261014ULL);
+  for (unsigned pi = 1; pi <= 4; ++pi) {
+    const uint64_t p = fflow::BIG_UINT_PRIMES[pi];
+    REQUIRE_EQ(secred::mod_inverse_u64_fast(1, p), uint64_t(1));
+    REQUIRE_EQ(secred::mod_inverse_u64_fast(p - 1, p), p - 1);
+    REQUIRE_EQ(secred::mod_inverse_u64_fast(0, p), uint64_t(0));
+    for (int k = 0; k < 2000; ++k) {
+      const uint64_t a = rng() % p;
+      const uint64_t inv = secred::mod_inverse_u64_fast(a, p);
+      REQUIRE_EQ(inv, secred::mod_inverse_u64(a, p));
+      if (a)
+        REQUIRE_EQ(static_cast<uint64_t>((static_cast<unsigned __int128>(a) * inv) % p),
+                   uint64_t(1));
+    }
+  }
+  // The small prime the fixture tests use is not one of fflow's, so cover it too.
+  REQUIRE_EQ(secred::mod_inverse_u64_fast(1, P), uint64_t(1));
+  REQUIRE_EQ(secred::mod_inverse_u64_fast(P - 1, P), P - 1);
+  REQUIRE_EQ(secred::mod_inverse_u64_fast(7, P),
+             secred::mod_inverse_u64(7, P));
+  // Exhaustive on small odd primes: every residue, even ones included, since a halving
+  // step on an even operand is where a binary extended Euclid goes wrong.
+  for (uint64_t p : {uint64_t(3), uint64_t(5), uint64_t(101), uint64_t(65537)}) {
+    for (uint64_t a = 0; a < p; ++a) {
+      const uint64_t inv = secred::mod_inverse_u64_fast(a, p);
+      REQUIRE_EQ(inv, secred::mod_inverse_u64(a, p));
+      if (a)
+        REQUIRE_EQ((a * inv) % p, uint64_t(1));
+    }
+  }
+}
+
 // Shoup's division-free product must equal the plain 128-bit product at every prime the
 // reconstruction draws, for arbitrary residues.
 TEST(ffred_shoup_mul_matches_reference_product) {
@@ -836,7 +874,7 @@ TEST(ffred_planned_sees_a_vanishing_shared_coefficient) {
   secred::FwdStore store;
   store.reset(n_ids);
   secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
-  REQUIRE(store.order == from_rows);
+  REQUIRE(store.order() == from_rows);
 
   // The reference over the same evaluated rows: same pivots, same rows, term for term.
   std::vector<ResEq> ref_eqs;
@@ -859,7 +897,7 @@ TEST(ffred_planned_sees_a_vanishing_shared_coefficient) {
   secred::FwdStore at_plan;
   at_plan.reset(n_ids);
   secred::forward_eliminate_planned(table, clean.data(), clean.size(), plan, q, at_plan);
-  REQUIRE(at_plan.order == plan.order);
+  REQUIRE(at_plan.order() == plan.order);
 
   // Both passages agree with the reference, with and without a restricted chain.
   compare_paths(system, p, n_ids, nullptr);
@@ -908,5 +946,98 @@ TEST(ffred_planned_store_reset_forgets_rows) {
         REQUIRE(a == b);
       }
     }
+  }
+}
+
+// The plan's order is one vector shared by every prime and every point, so a point must
+// read it rather than copy it: at F234's size the copy is 547k entries, 2.3 MB, once per
+// point.  Only the fallback -- a point where some coefficient vanished -- gives the store
+// an order of its own, and then it is the rebuilt one.
+TEST(ffred_planned_reads_the_plan_order_without_copying_it) {
+  const std::vector<Eq> &system = planned_fixture();
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin{0u}, sys_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i])
+      terms.emplace_back(t.first, static_cast<uint32_t>(terms.size()));
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  // A prime no coefficient of the fixture vanishes at: the plan applies as it stands.
+  const uint64_t p = fflow::BIG_UINT_PRIMES[1];
+  std::vector<uint64_t> values(terms.size(), 0);
+  std::size_t v = 0;
+  for (const Eq &e : system)
+    for (const auto &t : e)
+      values[v++] = secred::rat_mod_u64(t.second.num, t.second.den, p);
+
+  secred::FwdStore store;
+  store.reset(129u);
+  secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+  REQUIRE(store.order() == plan.order);
+  REQUIRE(store.order_ptr == &plan.order);
+  REQUIRE(store.order_own.empty());
+
+  // The vanishing case: the store's own order, and the pointer follows it there.
+  const std::vector<std::pair<uint32_t, uint32_t>> shared{{6u, 0u}, {4u, 1u},
+                                                          {5u, 2u}, {4u, 0u}};
+  const std::vector<uint32_t> shared_begin{0u, 2u, 4u};
+  const std::vector<uint32_t> shared_idx{0u, 1u};
+  const uint64_t q = 7;
+  const std::vector<uint64_t> vanishing{secred::rat_mod_u64(7, 1, q),
+                                        secred::rat_mod_u64(-1, 1, q),
+                                        secred::rat_mod_u64(1, 1, q)};
+  secred::FwdPlan shared_plan;
+  secred::build_fwd_plan(shared, shared_begin, shared_idx, shared_plan);
+  secred::SymRowTable shared_table{shared.data(), shared_begin.data(), 2u};
+  secred::FwdStore fallback;
+  fallback.reset(8u);
+  secred::forward_eliminate_planned(shared_table, vanishing.data(), vanishing.size(),
+                                    shared_plan, q, fallback);
+  REQUIRE(fallback.order_ptr == &fallback.order_own);
+  REQUIRE(fallback.order() != shared_plan.order);
+}
+
+// The fallback order is the risky half of the sample-point path: a point where a
+// coefficient vanishes orders the rows the reference's way instead of replaying the plan.
+// The two tests above drive one vanishing coefficient each; this drives many at once, over
+// random structures, so the merge buffers and the fallback order are exercised together.
+TEST(ffred_planned_matches_reference_when_many_coefficients_vanish) {
+  std::mt19937_64 rng(20261014ULL);
+  const uint64_t p = 7; // small enough that "a multiple of p" is common in the draw below
+  const uint32_t n_ids = 40;
+  for (int trial = 0; trial < 24; ++trial) {
+    std::vector<Eq> system;
+    const unsigned nrows = 4 + static_cast<unsigned>(rng() % 10);
+    for (unsigned r = 0; r < nrows; ++r) {
+      const uint32_t front = 1 + static_cast<uint32_t>(rng() % (n_ids - 1));
+      Eq e;
+      e.emplace_back(front, Rat64{1, 1});
+      std::unordered_set<uint32_t> used{front};
+      const unsigned tail = 1 + static_cast<unsigned>(rng() % 4);
+      std::vector<uint32_t> ids;
+      for (unsigned k = 0; k < tail; ++k) {
+        const uint32_t id = static_cast<uint32_t>(rng() % front);
+        if (used.insert(id).second)
+          ids.push_back(id);
+      }
+      std::sort(ids.begin(), ids.end(), std::greater<uint32_t>());
+      for (uint32_t id : ids) {
+        int64_t num = 1 + static_cast<int64_t>(rng() % 7);
+        if (rng() % 2)
+          num = -num;
+        if (rng() % 3 == 0)
+          num *= 7; // 0 at p = 7: this row loses the term at this point
+        e.emplace_back(id, Rat64{num, 1});
+      }
+      system.push_back(std::move(e));
+    }
+    compare_paths(system, p, n_ids, nullptr);
+    const std::vector<uint32_t> chain{1u, 2u, 3u, 5u};
+    compare_paths(system, p, n_ids, &chain);
   }
 }

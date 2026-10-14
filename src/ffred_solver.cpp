@@ -21,6 +21,34 @@ uint64_t mod_inverse_u64(uint64_t a, uint64_t p) {
   return static_cast<uint64_t>(s0);
 }
 
+uint64_t mod_inverse_u64_fast(uint64_t a, uint64_t p) {
+  if (a == 0)
+    return 0; // not invertible; mod_inverse_u64 returns 0 here too
+  uint64_t u = a, v = p, x1 = 1, x2 = 0;
+  while (u != 1 && v != 1) {
+    // Halve an even remainder, and its coefficient with it: an odd coefficient is carried
+    // through (x + p)/2, which is the halving modulo p because p is odd and gcd(a, p) = 1.
+    while ((u & 1) == 0) {
+      u >>= 1;
+      x1 = (x1 & 1) ? (x1 + p) >> 1 : x1 >> 1;
+    }
+    while ((v & 1) == 0) {
+      v >>= 1;
+      x2 = (x2 & 1) ? (x2 + p) >> 1 : x2 >> 1;
+    }
+    // One subtraction instead of a division: u -= v and v -= u drive both remainders to
+    // 1, which a binary gcd does in O(log p) subtractions.
+    if (u >= v) {
+      u -= v;
+      x1 = (x1 >= x2) ? x1 - x2 : x1 + p - x2;
+    } else {
+      v -= u;
+      x2 = (x2 >= x1) ? x2 - x1 : x2 + p - x1;
+    }
+  }
+  return u == 1 ? x1 : x2;
+}
+
 uint64_t rat_mod_u64(int64_t num, int64_t den, uint64_t p) {
   __int128 n = num % static_cast<int64_t>(p);
   if (n < 0)
@@ -388,6 +416,7 @@ void FwdStore::reset(std::size_t n_ids) {
   len.clear();
   ids.clear();
   vals.clear();
+  order_ptr = nullptr;
 }
 
 void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
@@ -406,104 +435,124 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
   const bool plan_matches =
       plan.len.size() == rows.n_rows &&
       std::find(values, values + n_values, uint64_t(0)) == values + n_values;
-  if (plan_matches)
-    store.order = plan.order;
-  else
+  if (plan_matches) {
+    store.order_ptr = &plan.order;
+  } else {
     fwd_order_from_values(rows, values, plan.sys_idx, store.eval_len, store.eval_front,
-                          store.order);
+                          store.order_own);
+    store.order_ptr = &store.order_own;
+  }
 
-  std::vector<std::pair<uint32_t, uint64_t>> &pending = store.pending;
-  std::vector<std::pair<uint32_t, uint64_t>> &merged = store.merged;
-  for (uint32_t k : store.order) {
+  std::vector<uint32_t> &pids = store.pids;
+  std::vector<uint64_t> &pvals = store.pvals;
+  std::vector<uint32_t> &mids = store.mids;
+  std::vector<uint64_t> &mvals = store.mvals;
+  for (uint32_t k : *store.order_ptr) {
     // This point's row k, gathered on demand: the row's terms whose coefficient did not
     // vanish here.  Descending id, as the merge below assumes.
-    pending.clear();
+    pids.clear();
+    pvals.clear();
     for (std::size_t t = rows.begin(k), te = rows.begin(k + 1); t < te; ++t) {
       const uint64_t v = values[rows.terms[t].second];
-      if (v)
-        pending.emplace_back(rows.terms[t].first, v);
+      if (v) {
+        pids.push_back(rows.terms[t].first);
+        pvals.push_back(v);
+      }
     }
-    if (pending.empty())
+    if (pids.empty())
       continue; // reduced to 0 = 0
 
     // Substitute the highest reducible term repeatedly.  Each substitution merges one
-    // solved right-hand side into pending with an ordered merge, keeping pending
+    // solved right-hand side into the pending row with an ordered merge, keeping it
     // descending with unique ids.
     std::size_t scan = 0; // [0, scan) came through the last merge unchanged
     while (true) {
-      std::size_t idx = pending.size();
-      for (std::size_t i = scan; i < pending.size(); ++i) {
-        if (store.has_row(pending[i].first)) {
+      std::size_t idx = pids.size();
+      for (std::size_t i = scan; i < pids.size(); ++i) {
+        if (store.has_row(pids[i])) {
           idx = i;
           break;
         }
       }
-      if (idx == pending.size())
+      if (idx == pids.size())
         break;
 
-      const uint32_t w = pending[idx].first;
-      const uint64_t c = pending[idx].second;
+      const uint32_t w = pids[idx];
+      const uint64_t c = pvals[idx];
       const uint32_t row = store.row_of[w];
       const uint32_t rb = store.begin[row], rl = store.len[row];
       const uint32_t *rids = store.ids.data() + rb;
       const uint64_t *rvals = store.vals.data() + rb;
       const uint64_t cp = shoup_precomp(c, p);
 
-      // Merge pending (minus w at idx) with c * sol[1..].  The solved row's terms are all
-      // below its pivot w, and pending's are descending, so everything taken from the
-      // solved row lands at or after idx: [0, idx) survives untouched and the next scan
-      // can start there.
-      merged.clear();
-      merged.reserve(pending.size() + rl);
-      std::size_t i = 0, j = 1;
-      while (i < pending.size() && j < rl) {
-        if (i == idx) {
-          ++i;
-          continue;
-        }
-        const uint32_t a = pending[i].first, b = rids[j];
+      // Merge the pending row (minus w at idx) with c * sol[1..].  The solved row's terms
+      // are all below its pivot w, and the pending row's are descending, so everything
+      // taken from the solved row lands at or after idx: [0, idx) survives untouched --
+      // term for term, and it is what the next scan starts on -- so it is copied over in
+      // one go and only [idx, end) is actually merged.  Walking it against the solved row
+      // instead (what the loop below does from idx on) would re-compare every one of those
+      // terms once per substitution of this row: at F234's sizes idx grows along the row,
+      // and that re-walk is the per-point elimination's largest single term.
+      mids.clear();
+      mvals.clear();
+      mids.reserve(pids.size() + rl);
+      mvals.reserve(pids.size() + rl);
+      mids.insert(mids.end(), pids.begin(), pids.begin() + idx);
+      mvals.insert(mvals.end(), pvals.begin(), pvals.begin() + idx);
+      std::size_t i = idx + 1, j = 1; // the w entry at idx is dropped: it cancels
+      while (i < pids.size() && j < rl) {
+        const uint32_t a = pids[i], b = rids[j];
         if (a > b) {
-          merged.push_back(pending[i++]);
+          mids.push_back(a);
+          mvals.push_back(pvals[i]);
+          ++i;
         } else if (a < b) {
-          merged.emplace_back(b, shoup_mul(rvals[j], c, cp, p));
+          mids.push_back(b);
+          mvals.push_back(shoup_mul(rvals[j], c, cp, p));
           ++j;
         } else {
-          uint64_t v = pending[i].second + shoup_mul(rvals[j], c, cp, p);
+          uint64_t v = pvals[i] + shoup_mul(rvals[j], c, cp, p);
           if (v >= p)
             v -= p;
-          if (v)
-            merged.emplace_back(a, v);
+          if (v) {
+            mids.push_back(a);
+            mvals.push_back(v);
+          }
           ++i;
           ++j;
         }
       }
-      while (i < pending.size()) {
-        if (i != idx)
-          merged.push_back(pending[i]);
+      while (i < pids.size()) {
+        mids.push_back(pids[i]);
+        mvals.push_back(pvals[i]);
         ++i;
       }
       while (j < rl) {
-        merged.emplace_back(rids[j], shoup_mul(rvals[j], c, cp, p));
+        mids.push_back(rids[j]);
+        mvals.push_back(shoup_mul(rvals[j], c, cp, p));
         ++j;
       }
-      pending.swap(merged);
+      pids.swap(mids);
+      pvals.swap(mvals);
       scan = idx;
     }
 
-    if (pending.empty())
+    if (pids.empty())
       continue;
 
     // Normalise the pivot on the remaining highest term: coefficient -> -1.
-    const uint32_t pivot = pending.front().first;
-    const uint64_t neg_inv = (p - mod_inverse_u64(pending.front().second, p)) % p;
+    const uint32_t pivot = pids.front();
+    const uint64_t neg_inv = (p - mod_inverse_u64_fast(pvals.front(), p)) % p;
     const uint64_t np = shoup_precomp(neg_inv, p);
     const uint32_t row = static_cast<uint32_t>(store.begin.size());
     store.begin.push_back(static_cast<uint32_t>(store.ids.size()));
-    store.len.push_back(static_cast<uint32_t>(pending.size()));
-    for (const auto &t : pending) {
-      store.ids.push_back(t.first);
-      store.vals.push_back(shoup_mul(t.second, neg_inv, np, p));
-    }
+    store.len.push_back(static_cast<uint32_t>(pids.size()));
+    // The ids need no arithmetic, so the whole row is appended with one memmove; only the
+    // values are scaled, one by one (push_back rather than a resize, which would
+    // value-initialise the tail only for the loop to overwrite it).
+    store.ids.insert(store.ids.end(), pids.begin(), pids.end());
+    for (std::size_t t = 0; t < pids.size(); ++t)
+      store.vals.push_back(shoup_mul(pvals[t], neg_inv, np, p));
     store.mark(pivot, row);
   }
 }
