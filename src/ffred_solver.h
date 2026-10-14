@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -252,16 +253,25 @@ struct FwdStore {
 // sort that row somewhere else, so the order is rebuilt from the evaluated rows
 // (`store.order()`).  Every slot occurs in some row, so "no value is zero" answers what a
 // per-row length-and-front check would, in one scan of the slot array.
-void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
+//
+// `abort`, when given, is polled between rows: the reconstruction pool runs primes ahead
+// of its consumer, and an elimination the consumer no longer needs (it converged on an
+// earlier prime) is dead weight -- one prime is seconds of work.  The call then returns
+// false with `store` holding whatever it had built so far; the caller is the reconstruction
+// worker, which drops the result instead of publishing it.
+bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                std::size_t n_values, const FwdPlan &plan, uint64_t p,
-                               FwdStore &store);
+                               FwdStore &store,
+                               const std::atomic<bool> *abort = nullptr);
 
 // backward_eliminate over `store`, restricted to `only_keys` (ascending; the lazy chain of
 // the reconstruction).  A rewritten row is appended as a new row and the key's row index
 // repointed: rows grow and shrink here, and the old row may still be read... it is not,
 // because keys ascend and every substituted id is smaller, so no reader is left behind.
-void backward_eliminate_planned(FwdStore &store, uint64_t p,
-                                const std::vector<uint32_t> &only_keys);
+// `abort` is polled between keys, as above.
+bool backward_eliminate_planned(FwdStore &store, uint64_t p,
+                                const std::vector<uint32_t> &only_keys,
+                                const std::atomic<bool> *abort = nullptr);
 
 // Everything one subset solve produces: the solution map, the raw equation index of
 // each pivot, and the forward / backward dependencies.  Full-system learn, the numeric

@@ -136,7 +136,8 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
                          const std::unordered_map<unsigned, unsigned> &master_index,
                          secred::FwdStore &store, std::vector<std::uint64_t> &values,
                          std::vector<std::uint64_t> &xout,
-                         std::uint32_t &fail_target, std::uint32_t &fail_integral) {
+                         std::uint32_t &fail_target, std::uint32_t &fail_integral,
+                         const std::atomic<bool> *abort) {
   const unsigned nnindeps = masters.size();
   // The rows the selection kept, eliminated at this prime: the plan was built from their
   // structure, and a coefficient that vanishes here is exactly the case
@@ -144,9 +145,13 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
   // reduce_mod + forward_eliminate row for row.
   plan.fill_values(p, values);
   store.reset(plan.store_ids);
-  secred::forward_eliminate_planned(plan.rows(), values.data(), values.size(),
-                                    plan.plan, p, store);
-  secred::backward_eliminate_planned(store, p, bwd_chain);
+  // Both passes poll `abort`; a false return means this prime's elimination was dropped
+  // half-way, which only happens once the consumer has left its loop.
+  if (!secred::forward_eliminate_planned(plan.rows(), values.data(), values.size(),
+                                         plan.plan, p, store, abort))
+    return false;
+  if (!secred::backward_eliminate_planned(store, p, bwd_chain, abort))
+    return false;
 
   xout.assign(dep_targets.size() * static_cast<std::size_t>(nnindeps), 0);
   for (unsigned i = 0; i < dep_targets.size(); ++i) {
@@ -245,10 +250,15 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
         const auto t0 = std::chrono::steady_clock::now();
         slot.ok = solve_prime_numeric(plan, p, bwd_chain, dep_targets, masters,
                                       master_index, store, values, slot.xout,
-                                      slot.fail_target, slot.fail_integral);
+                                      slot.fail_target, slot.fail_integral, &stop);
         slot.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
                                                     t0)
                            .count();
+        // Consumed by then: the consumer only sets `stop` once its loop is over, so this
+        // prime is one it stopped waiting for.  Drop it instead of publishing, and do not
+        // start another.
+        if (stop.load(std::memory_order_relaxed))
+          break;
         {
           std::lock_guard<std::mutex> lock(m);
           slot.ready = true;

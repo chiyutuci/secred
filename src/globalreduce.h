@@ -4,6 +4,7 @@
 // reconstruction; no external tool is involved.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <iomanip>
 #include <optional>
@@ -79,6 +80,11 @@ struct NumericEvalPlan {
 // Fails when a target's right-hand side carries an integral the master table does not
 // know, which means the selection is stale at this prime; the caller reports it rather
 // than emit a truncated reduction.  `fail_target` / `fail_integral` name the pair.
+//
+// `abort`, when given, is polled inside the elimination: the reconstruction pool runs
+// primes ahead of its consumer, and a prime the consumer no longer needs is dropped
+// half-way instead of being finished.  The false return then means "abandoned", not
+// "failed" -- the caller distinguishes them by the flag itself.
 bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
                          const std::vector<std::uint32_t> &bwd_chain,
                          const std::vector<unsigned> &dep_targets,
@@ -86,7 +92,8 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
                          const std::unordered_map<unsigned, unsigned> &master_index,
                          secred::FwdStore &store, std::vector<std::uint64_t> &values,
                          std::vector<std::uint64_t> &xout,
-                         std::uint32_t &fail_target, std::uint32_t &fail_integral);
+                         std::uint32_t &fail_target, std::uint32_t &fail_integral,
+                         const std::atomic<bool> *abort = nullptr);
 
 // Pure-numeric in-process global reduction: the elimination runs on FiniteFlow's
 // sparse solver and the coefficients are reconstructed as rational numbers with

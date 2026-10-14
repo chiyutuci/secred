@@ -420,9 +420,9 @@ void FwdStore::reset(std::size_t n_ids) {
   order_ptr = nullptr;
 }
 
-void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
+bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                std::size_t n_values, const FwdPlan &plan, uint64_t p,
-                               FwdStore &store) {
+                               FwdStore &store, const std::atomic<bool> *abort) {
   // The rows handed in are the pool's rows minus whatever vanished at this point (a
   // numerator or a denominator that is 0 mod p), and a dropped coefficient moves its row
   // in the reference's order: the row is shorter, and if the front term went, its front
@@ -447,6 +447,8 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
   Row &pend = store.pend;
   Row &merged = store.merged;
   for (uint32_t k : *store.order_ptr) {
+    if (abort && abort->load(std::memory_order_relaxed))
+      return false;
     // This point's row k, gathered on demand: the row's terms whose coefficient did not
     // vanish here.  Descending id, as the merge below assumes.
     pend.clear();
@@ -463,6 +465,8 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
     // descending with unique ids.
     std::size_t scan = 0; // [0, scan) came through the last merge unchanged
     while (true) {
+      if (abort && abort->load(std::memory_order_relaxed))
+        return false;
       std::size_t idx = pend.n;
       for (std::size_t i = scan; i < pend.n; ++i) {
         if (store.has_row(pend.ids[i])) {
@@ -553,13 +557,17 @@ void forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
       store.vals.push_back(shoup_mul(pend.vals[t], neg_inv, np, p));
     store.mark(pivot, row);
   }
+  return true;
 }
 
-void backward_eliminate_planned(FwdStore &store, uint64_t p,
-                                const std::vector<uint32_t> &only_keys) {
+bool backward_eliminate_planned(FwdStore &store, uint64_t p,
+                                const std::vector<uint32_t> &only_keys,
+                                const std::atomic<bool> *abort) {
   std::vector<std::pair<uint32_t, uint64_t>> masters;
   std::vector<std::pair<uint32_t, uint64_t>> out;
   for (uint32_t k : only_keys) {
+    if (abort && abort->load(std::memory_order_relaxed))
+      return false;
     if (!store.has_row(k))
       continue;
     if (store.row_size(k) <= 1)
@@ -617,6 +625,7 @@ void backward_eliminate_planned(FwdStore &store, uint64_t p,
     }
     store.row_of[k] = nr;
   }
+  return true;
 }
 
 } // namespace secred

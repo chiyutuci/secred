@@ -3,6 +3,7 @@
 #include "ffred_solver.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <initializer_list>
 #include <random>
@@ -1087,4 +1088,58 @@ TEST(ffred_planned_matches_reference_when_many_coefficients_vanish) {
     const std::vector<uint32_t> chain{1u, 2u, 3u, 5u};
     compare_paths(system, p, n_ids, &chain);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Abandoning an obsolete prime
+//
+// The reconstruction pool runs primes ahead of the consumer; once the consumer
+// has converged, the primes still in flight are dead work, and one elimination at
+// F234_N's sizes is ~3 s.  These two functions take the flag that lets a worker
+// drop the elimination it is in the middle of.
+// ---------------------------------------------------------------------------
+
+TEST(forward_eliminate_planned_abandons_the_work_on_the_flag) {
+  std::vector<Eq> system;
+  system.push_back(eq({{6, {1, 1}}, {4, {-1, 1}}}));
+  system.push_back(eq({{5, {1, 1}}, {4, {1, 1}}}));
+  const uint64_t p = fflow::BIG_UINT_PRIMES[0];
+  const std::size_t n_ids = 8u;
+
+  const std::vector<std::pair<uint32_t, uint32_t>> terms{{6u, 0u}, {4u, 1u},
+                                                         {5u, 0u}, {4u, 2u}};
+  const std::vector<uint32_t> eq_begin{0u, 2u, 4u};
+  const std::vector<uint32_t> sys_idx{0u, 1u};
+  const std::vector<uint64_t> values{secred::rat_mod_u64(1, 1, p),
+                                     secred::rat_mod_u64(-1, 1, p),
+                                     secred::rat_mod_u64(1, 1, p)};
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  // The flag is already set when the call starts: the elimination reports that it
+  // did not finish and has solved nothing (both rows of this system are solvable,
+  // so a call that ran would have appended two).
+  secred::FwdStore stopped;
+  stopped.reset(n_ids);
+  std::atomic<bool> abort_flag{true};
+  REQUIRE(!secred::forward_eliminate_planned(table, values.data(), values.size(),
+                                             plan, p, stopped, &abort_flag));
+  REQUIRE_EQ(stopped.begin.size(), std::size_t(0));
+
+  // The identical call with the flag clear does the work, so the flag is the only
+  // difference between the two.
+  secred::FwdStore done;
+  done.reset(n_ids);
+  std::atomic<bool> go{false};
+  REQUIRE(secred::forward_eliminate_planned(table, values.data(), values.size(),
+                                            plan, p, done, &go));
+  REQUIRE_EQ(done.begin.size(), std::size_t(2));
+
+  // The backward pass honours the same flag: it rewrites the rows its chain names,
+  // and with the flag set it must leave every one of them where it was.
+  const std::vector<uint32_t> before = done.row_of;
+  std::atomic<bool> stop_bwd{true};
+  REQUIRE(!secred::backward_eliminate_planned(done, p, {6u, 5u}, &stop_bwd));
+  REQUIRE(done.row_of == before);
 }
