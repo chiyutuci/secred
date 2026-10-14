@@ -43,6 +43,137 @@
 #include "symbolic_ffred.h"
 
 // ---------------------------------------------------------------------------
+// The numeric reconstruction's hoisted plan (see globalreduce.h for why)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The distinct-coefficient map's key.  The reader writes coefficients in lowest terms
+// with den > 0, so the pair is the identity of the rational: no normalisation before
+// hashing, and two equations naming the same number share a slot.
+struct Rat64Hash {
+  std::size_t operator()(const secred::Rat64 &r) const {
+    std::uint64_t h = static_cast<std::uint64_t>(r.num);
+    h ^= static_cast<std::uint64_t>(r.den) + 0x9e3779b97f4a7c15ull + (h << 6) +
+         (h >> 2);
+    return static_cast<std::size_t>(h);
+  }
+};
+
+struct Rat64Eq {
+  bool operator()(const secred::Rat64 &a, const secred::Rat64 &b) const {
+    return a.num == b.num && a.den == b.den;
+  }
+};
+
+} // namespace
+
+void NumericEvalPlan::build(const std::vector<secred::Eq> &system,
+                            const std::vector<std::uint32_t> &eq_idx) {
+  terms.clear();
+  eq_begin.clear();
+  coeffs.clear();
+  sys_idx = eq_idx;
+  std::size_t n_terms = 0;
+  for (std::uint32_t i : eq_idx)
+    n_terms += system[i].size();
+  eq_begin.reserve(eq_idx.size() + 1);
+  eq_begin.push_back(0);
+  terms.reserve(n_terms);
+  std::unordered_map<secred::Rat64, std::uint32_t, Rat64Hash, Rat64Eq> slot_of;
+  std::uint32_t max_id = 0;
+  for (std::uint32_t i : eq_idx) {
+    for (const auto &t : system[i]) {
+      // A coefficient that is zero as a rational is zero modulo every prime, so
+      // reduce_mod drops it at every one of them.  Keeping such a term would leave a
+      // slot that is always 0, and a zero in `values` is exactly what
+      // forward_eliminate_planned reads as "these are not the plan's rows" -- the plan
+      // check would fail at every prime and the rebuilt order would silently replace
+      // the hoisted one, costing the very thing this table exists for.
+      if (t.second.num == 0)
+        continue;
+      auto it = slot_of.find(t.second);
+      std::uint32_t slot;
+      if (it == slot_of.end()) {
+        slot = static_cast<std::uint32_t>(coeffs.size());
+        coeffs.push_back(t.second);
+        slot_of.emplace(t.second, slot);
+      } else {
+        slot = it->second;
+      }
+      terms.emplace_back(t.first, slot);
+      if (t.first > max_id)
+        max_id = t.first;
+    }
+    eq_begin.push_back(static_cast<std::uint32_t>(terms.size()));
+  }
+  store_ids = static_cast<std::size_t>(max_id) + 1;
+  // sys_idx (the raw equation index of each row) is the order's last tie-break, exactly
+  // as the reference derivation passes it, so the plan is the reference's order by
+  // construction rather than by luck.
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+}
+
+secred::SymRowTable NumericEvalPlan::rows() const {
+  secred::SymRowTable t;
+  t.terms = terms.data();
+  t.eq_begin = eq_begin.data();
+  t.n_rows = sys_idx.size();
+  return t;
+}
+
+void NumericEvalPlan::fill_values(std::uint64_t p,
+                                  std::vector<std::uint64_t> &values) const {
+  values.resize(coeffs.size());
+  for (std::size_t s = 0; s < coeffs.size(); ++s)
+    values[s] = secred::rat_mod_u64(coeffs[s].num, coeffs[s].den, p);
+}
+
+bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
+                         const std::vector<std::uint32_t> &bwd_chain,
+                         const std::vector<unsigned> &dep_targets,
+                         const std::vector<unsigned> &masters,
+                         const std::unordered_map<unsigned, unsigned> &master_index,
+                         secred::FwdStore &store, std::vector<std::uint64_t> &values,
+                         std::vector<std::uint64_t> &xout,
+                         std::uint32_t &fail_target, std::uint32_t &fail_integral) {
+  const unsigned nnindeps = masters.size();
+  // The rows the selection kept, eliminated at this prime: the plan was built from their
+  // structure, and a coefficient that vanishes here is exactly the case
+  // forward_eliminate_planned detects and reorders for, so this reproduces
+  // reduce_mod + forward_eliminate row for row.
+  plan.fill_values(p, values);
+  store.reset(plan.store_ids);
+  secred::forward_eliminate_planned(plan.rows(), values.data(), values.size(),
+                                    plan.plan, p, store);
+  secred::backward_eliminate_planned(store, p, bwd_chain);
+
+  xout.assign(dep_targets.size() * static_cast<std::size_t>(nnindeps), 0);
+  for (unsigned i = 0; i < dep_targets.size(); ++i) {
+    const std::uint32_t target = dep_targets[i];
+    if (!store.has_row(target))
+      continue; // the target is itself a master: no reduction at this prime
+    const std::uint32_t *red_ids = store.row_ids(target);
+    const std::uint64_t *red_vals = store.row_vals(target);
+    const std::uint32_t red_size = store.row_size(target);
+    for (std::uint32_t k = 1; k < red_size; ++k) {
+      auto mit = master_index.find(red_ids[k]);
+      if (mit == master_index.end()) {
+        // Hard check: a non-master on a right-hand side means the selection or the
+        // bootstrap structure disagrees with the learn prime (cancelling columns
+        // dropping an equation, pivot drift), so xout would miss a term and the
+        // reconstructed coefficient would be wrong -- never emit a truncated reduction.
+        fail_target = target;
+        fail_integral = red_ids[k];
+        return false;
+      }
+      xout[static_cast<std::size_t>(i) * nnindeps + mit->second] = red_vals[k];
+    }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
 // Pure-numeric FiniteFlow global reduction (no symbols, no Kira/FireFly, no "dum" variable)
 // ---------------------------------------------------------------------------
 
@@ -56,11 +187,13 @@ using secred::parallel_for;
 using secred::solve_res_eqs;
 using secred::write_masters_final;
 
-// Multithreaded rational reconstruction with progress logging: per prime, ffred
-// forward elimination yields the target coefficients, then rat_rec and CRT run in
-// parallel per coefficient.  True on convergence, false on failure.
-bool reconstruct_ffred(const std::vector<secred::Eq> &system,
-                       const std::vector<uint32_t> &eq_idx,
+// Rational reconstruction with progress logging.  The elimination's input is the plan,
+// so a prime costs one `values` fill and one planned elimination; the primes themselves
+// are independent of each other, so a pool of workers runs them concurrently while the
+// main thread consumes their results in order -- CRT and the convergence test are
+// sequential in the prime index, and stay exactly as algorithm_reconstruct_numeric has
+// them.  True on convergence, false on failure.
+bool reconstruct_ffred(const NumericEvalPlan &plan,
                        const std::vector<uint32_t> &bwd_chain,
                        const std::vector<unsigned> &dep_targets,
                        const std::vector<unsigned> &masters,
@@ -70,71 +203,92 @@ bool reconstruct_ffred(const std::vector<secred::Eq> &system,
   const unsigned nndeps = dep_targets.size();
   const unsigned nnindeps = masters.size();
   const unsigned nparsout = nndeps * nnindeps;
+  if (nthreads == 0)
+    nthreads = 1;
 
-  std::unique_ptr<ff::UInt[]> xout(new ff::UInt[nparsout]);
+  // One slot per prime the run could reach.  A worker fills its slot and wakes the
+  // consumer; the consumer reads slot ip only after `ready` is set under the mutex,
+  // which is what orders the worker's writes before the read.
+  const std::size_t nprime_max = static_cast<std::size_t>(max_primes) + 1;
+  struct PrimeSlot {
+    std::vector<ff::UInt> xout;
+    double seconds = 0.0;
+    bool ready = false;
+    bool ok = true;
+    std::uint32_t fail_target = 0, fail_integral = 0;
+  };
+  std::vector<PrimeSlot> slots(nprime_max);
+
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> stop{false};
+  std::mutex m;
+  std::condition_variable cv;
+
+  // Each worker owns one store and one slot array: a prime allocates nothing after the
+  // first, and a worker reuses its memory for every prime it takes.  The plan's table is
+  // shared and read-only.  More workers than concurrent primes is pure memory (one store
+  // holds the whole selected solution), so the pool is capped by the prime count as well.
+  const unsigned nworkers =
+      static_cast<unsigned>(std::min<std::size_t>(nthreads, nprime_max));
+  std::vector<std::thread> workers;
+  workers.reserve(nworkers);
+  for (unsigned w = 0; w < nworkers; ++w) {
+    workers.emplace_back([&]() {
+      secred::FwdStore store;
+      std::vector<std::uint64_t> values;
+      for (;;) {
+        const std::size_t ip = next.fetch_add(1, std::memory_order_relaxed);
+        if (ip >= nprime_max || stop.load(std::memory_order_relaxed))
+          break;
+        const std::uint64_t p = ff::BIG_UINT_PRIMES[ip % ff::BIG_UINT_PRIMES_SIZE];
+        PrimeSlot &slot = slots[ip];
+        const auto t0 = std::chrono::steady_clock::now();
+        slot.ok = solve_prime_numeric(plan, p, bwd_chain, dep_targets, masters,
+                                      master_index, store, values, slot.xout,
+                                      slot.fail_target, slot.fail_integral);
+        slot.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                    t0)
+                           .count();
+        {
+          std::lock_guard<std::mutex> lock(m);
+          slot.ready = true;
+        }
+        cv.notify_all();
+        if (!slot.ok)
+          break; // the consumer stops on a failure; do not start another prime
+      }
+    });
+  }
+
   std::unique_ptr<ff::MPInt[]> zout(new ff::MPInt[nparsout]);
   ff::MPInt totmod, c1, c2;
+  bool ok = false;
 
-  std::size_t prime_i = 0;
-
-  for (std::size_t ip = 0; ip < max_primes + 1; ++ip) {
-    ff::Mod mod(ff::BIG_UINT_PRIMES[prime_i]);
-    const uint64_t p = mod.n();
-
-    // At this prime only the equations mark-and-sweep selected are eliminated.
-    auto t_elim0 = std::chrono::steady_clock::now();
-    std::vector<secred::ResEq> res_eqs;
-    std::vector<uint32_t> sys_idx;
-    res_eqs.reserve(eq_idx.size());
-    sys_idx.reserve(eq_idx.size());
-    for (uint32_t i : eq_idx) {
-      secred::ResEq re;
-      secred::reduce_mod(system[i], p, re);
-      if (!re.empty()) {
-        res_eqs.push_back(std::move(re));
-        sys_idx.push_back(i);
-      }
+  for (std::size_t ip = 0; ip < nprime_max; ++ip) {
+    {
+      std::unique_lock<std::mutex> lock(m);
+      cv.wait(lock, [&] { return slots[ip].ready; });
     }
-    std::unordered_map<uint32_t, secred::ResEq> solmap;
-    auto t_fwd0 = std::chrono::steady_clock::now();
-    secred::forward_eliminate(res_eqs, sys_idx, p, solmap, nullptr, nullptr);
-    auto t_bwd0 = std::chrono::steady_clock::now();
-    secred::backward_eliminate(solmap, p, nullptr, &bwd_chain);
-    auto t_bwd1 = std::chrono::steady_clock::now();
-    double fwd_s = std::chrono::duration<double>(t_bwd0 - t_fwd0).count();
-    double bwd_s = std::chrono::duration<double>(t_bwd1 - t_bwd0).count();
-
-    std::fill(xout.get(), xout.get() + nparsout, ff::UInt(0));
-    for (unsigned i = 0; i < nndeps; ++i) {
-      auto it = solmap.find(dep_targets[i]);
-      if (it == solmap.end())
-        continue;
-      const secred::ResEq &red = it->second;
-      for (size_t k = 1; k < red.size(); ++k) {
-        auto mit = master_index.find(red[k].first);
-        if (mit != master_index.end())
-          xout[i * nnindeps + mit->second] = red[k].second;
-        else {
-          // Hard check: a non-master on a right-hand side means the selection or the
-          // bootstrap structure disagrees with the learn prime (cancelling columns
-          // dropping an equation, pivot drift), so xout would miss a term and the
-          // reconstructed coefficient would be wrong -- never emit a truncated reduction.
-          std::cerr << "finiteflow global reduction: prime " << p << ": target "
-                    << dep_targets[i] << " reduces to integral " << red[k].first
-                    << ", which is not a master (equation selection is stale "
-                       "for this prime); aborting instead of emitting a "
-                       "truncated reduction\n";
-          return false;
-        }
-      }
+    // The failure is reported in prime order, so a run that fails names the same prime
+    // and the same target it would have named serially: convergence at an earlier prime
+    // stops the loop before a later failure is ever looked at.
+    if (!slots[ip].ok) {
+      std::cerr << "finiteflow global reduction: prime "
+                << ff::BIG_UINT_PRIMES[ip % ff::BIG_UINT_PRIMES_SIZE] << ": target "
+                << slots[ip].fail_target << " reduces to integral "
+                << slots[ip].fail_integral
+                << ", which is not a master (equation selection is stale for this "
+                   "prime); aborting instead of emitting a truncated reduction\n";
+      break;
     }
-    auto t_elim1 = std::chrono::steady_clock::now();
-    double elim_s = std::chrono::duration<double>(t_elim1 - t_elim0).count();
+
+    ff::Mod mod(ff::BIG_UINT_PRIMES[ip % ff::BIG_UINT_PRIMES_SIZE]);
+    const ff::UInt *xout = slots[ip].xout.data();
     if (elim_seconds)
-      *elim_seconds += elim_s;
+      *elim_seconds += slots[ip].seconds;
 
     // CRT (as in algorithm_reconstruct_numeric).
-    auto t_rest0 = std::chrono::steady_clock::now();
+    const auto t_rest0 = std::chrono::steady_clock::now();
     bool converged = false;
     bool failed = false;
     if (ip == 0) {
@@ -168,7 +322,7 @@ bool reconstruct_ffred(const std::vector<secred::Eq> &system,
       if (!failed && consistent.load())
         converged = true;
       else if (!failed && ip == max_primes)
-        return false;
+        break;
       else if (!failed) {
         ff::chinese_remainder_coeffs(totmod, mod.n(), c1, c2, totmod);
         parallel_for(nthreads, nparsout, [&](unsigned j) {
@@ -178,28 +332,33 @@ bool reconstruct_ffred(const std::vector<secred::Eq> &system,
         });
       }
     }
-    auto t_rest1 = std::chrono::steady_clock::now();
-    double rest_s = std::chrono::duration<double>(t_rest1 - t_rest0).count();
+    const auto t_rest1 = std::chrono::steady_clock::now();
+    const double rest_s =
+        std::chrono::duration<double>(t_rest1 - t_rest0).count();
 
     std::cout << "  " << secred::kFlowTag << " reconstruct: prime " << ip + 1 << "/"
               << max_primes << " evaluated (elimination "
-              << secred::format_duration(elim_s) << " [fwd " << secred::format_duration(fwd_s)
-              << " + bwd " << secred::format_duration(bwd_s) << "], CRT/rat_rec "
+              << secred::format_duration(slots[ip].seconds) << ", CRT/rat_rec "
               << secred::format_duration(rest_s) << ")\n"
               << std::flush;
 
     if (failed)
-      return false;
+      break;
     if (converged) {
       std::cout << "  " << secred::kFlowTag << " reconstruct: converged after "
                 << ip + 1 << " prime(s)\n";
-      return true;
+      ok = true;
+      break;
     }
-
-    prime_i = (prime_i + 1) % ff::BIG_UINT_PRIMES_SIZE;
+    // The slot has been consumed; give its output back before the next prime's arrives.
+    std::vector<ff::UInt>().swap(slots[ip].xout);
   }
 
-  return false;
+  stop.store(true, std::memory_order_relaxed);
+  cv.notify_all();
+  for (auto &t : workers)
+    t.join();
+  return ok;
 }
 
 } // namespace
@@ -474,7 +633,20 @@ GlobalReductionResult reduce_global_finiteflow(
   std::cout << "\n  " << secred::kFlowTag << " reconstruct (rational reconstruction, up to "
             << max_primes << " primes, " << nthreads << " threads)...\n";
   const auto t2 = std::chrono::steady_clock::now();
-  bool ok = reconstruct_ffred(system, needed_eq_idx, bwd_chain, dep_targets, masters,
+  // The hoisted table: the rows the selection kept, their coefficients, and the order
+  // the elimination will follow.  Built once; every prime reuses it.
+  const auto tplan0 = std::chrono::steady_clock::now();
+  NumericEvalPlan plan;
+  plan.build(system, needed_eq_idx);
+  const auto tplan1 = std::chrono::steady_clock::now();
+  std::cout << "  " << secred::kFlowTag << " reconstruction plan: " << plan.n_rows()
+            << " rows, " << plan.terms.size() << " terms, " << plan.n_slots()
+            << " distinct coefficient(s) ("
+            << secred::format_duration(
+                   std::chrono::duration<double>(tplan1 - tplan0).count())
+            << ")\n"
+            << std::flush;
+  bool ok = reconstruct_ffred(plan, bwd_chain, dep_targets, masters,
                               master_index, nthreads, max_primes, resmp.get(),
                               &elim_seconds);
   const auto t3 = std::chrono::steady_clock::now();

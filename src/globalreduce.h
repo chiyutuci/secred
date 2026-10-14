@@ -16,8 +16,9 @@
 
 #include <ginac/ginac.h>
 
-#include "run_report.h" // format_duration, the statistics blocks
-#include "sector.h"     // RawIntegral, GlobalEquation
+#include "ffred_solver.h" // Eq, FwdPlan, SymRowTable, FwdStore, rat_mod_u64
+#include "run_report.h"   // format_duration, the statistics blocks
+#include "sector.h"       // RawIntegral, GlobalEquation
 
 struct GlobalReductionResult {
   std::vector<RawIntegral> masters;                            // masters
@@ -42,6 +43,62 @@ struct GlobalReductionResult {
   // high-water mark would otherwise hide the global stage's memory.
   std::uint64_t child_peak_bytes = 0;
 };
+
+// The numeric reconstruction's system, hoisted out of the per-prime loop.
+//
+// The numeric path solves the selected subset of one vector<Eq> once per prime, and the
+// prime only changes the *values*: the rows, their order and their pivots are properties
+// of the structure, exactly as they are on the symbolic side (§5.9 of ARCHITECTURE.md).
+// Materialising a ResEq per equation per prime and re-deriving the order through an
+// unordered_map therefore repeats, 31 times at F234's size, work the structure already
+// answers — and each of the 31 primes is independent of the other 30.
+//
+// This holds what is prime-independent: every term of the selected rows as
+// (integral id, coefficient slot), the distinct rational coefficients those slots name,
+// and the forward plan built from the table.  A prime then costs one `fill_values` and
+// one planned elimination.
+//
+// Ids stay descending within a row, as the spill reader wrote them.
+struct NumericEvalPlan {
+  std::vector<std::pair<std::uint32_t, std::uint32_t>> terms; // (integral id, slot)
+  std::vector<std::uint32_t> eq_begin;                        // n_rows + 1 boundaries
+  std::vector<secred::Rat64> coeffs;                          // slot -> num/den
+  secred::FwdPlan plan;
+  std::vector<std::uint32_t> sys_idx; // row -> raw equation index (the order's last key)
+  std::size_t store_ids = 0;          // one past the largest integral id in the table
+
+  // Rows of `eq_idx`, in that order, with identically zero coefficients dropped — the
+  // terms `reduce_mod` would keep at every prime.  `eq_idx` must be the raw indices into
+  // `system` of the equations the selection kept, and is what the plan's `sys_idx` gets.
+  void build(const std::vector<secred::Eq> &system,
+             const std::vector<std::uint32_t> &eq_idx);
+
+  std::size_t n_rows() const { return sys_idx.size(); }
+  std::size_t n_slots() const { return coeffs.size(); }
+
+  // The table as the planned elimination reads it.  Built on demand rather than stored,
+  // so the plan stays movable: the pointers would dangle through a move.
+  secred::SymRowTable rows() const;
+
+  // `values[s]` = coefficient s modulo p, for every slot.  Exactly what reduce_mod would
+  // compute term by term, once per distinct coefficient instead of once per term.
+  void fill_values(std::uint64_t p, std::vector<std::uint64_t> &values) const;
+};
+
+// One prime's solution of the planned elimination: the residues of the target x master
+// block, flattened as xout[i * nnindeps + j] (i over dep_targets, j over masters).
+//
+// Fails when a target's right-hand side carries an integral the master table does not
+// know, which means the selection is stale at this prime; the caller reports it rather
+// than emit a truncated reduction.  `fail_target` / `fail_integral` name the pair.
+bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
+                         const std::vector<std::uint32_t> &bwd_chain,
+                         const std::vector<unsigned> &dep_targets,
+                         const std::vector<unsigned> &masters,
+                         const std::unordered_map<unsigned, unsigned> &master_index,
+                         secred::FwdStore &store, std::vector<std::uint64_t> &values,
+                         std::vector<std::uint64_t> &xout,
+                         std::uint32_t &fail_target, std::uint32_t &fail_integral);
 
 // Pure-numeric in-process global reduction: the elimination runs on FiniteFlow's
 // sparse solver and the coefficients are reconstructed as rational numbers with

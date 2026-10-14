@@ -17,6 +17,7 @@ set(TEST_SOURCES
     test_sector_engine.cpp
     test_forward_selector.cpp
     test_global_order.cpp
+    test_globalreduce.cpp
     test_spill_reader.cpp
     test_sym_coeff.cpp
     test_symbolic_evaluator.cpp
