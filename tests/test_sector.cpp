@@ -388,7 +388,8 @@ TEST(global_equation_typedef_construction) {
 TEST(reduction_context_global_equations_initially_empty) {
   ReductionContext ctx;
   REQUIRE(ctx.globalEquationsCount.load() == 0u);
-  REQUIRE(ctx.distinctIntegrals.empty());
+  REQUIRE(ctx.spillIntegrals.empty());
+  REQUIRE(ctx.spillCoeffs.empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -579,17 +580,31 @@ TEST(memory_headroom_does_not_ream_below_threshold) {
 }
 
 // ---------------------------------------------------------------------------
-// ReductionContext raw-equation spill — appendRawEquation + distinctIntegrals
+// ReductionContext raw-equation spill — the binary frame and its tables
 // ---------------------------------------------------------------------------
 
 static void open_raw_spill(ReductionContext &ctx, const std::string &path) {
   ctx.rawEquationsPath = path;
-  ctx.rawEqOut = std::make_unique<std::ofstream>(path, std::ios::trunc);
+  ctx.openSpill();
+}
+
+// The whole file, so a test can read the framing back.
+static std::string slurp(const std::string &path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
+
+// "SRSP" + version 1, little-endian.
+static bool has_spill_header(const std::string &bytes) {
+  return bytes.size() >= 8 && bytes.compare(0, 4, "SRSP") == 0 &&
+         bytes[4] == '\x01' && bytes[5] == '\0' && bytes[6] == '\0' &&
+         bytes[7] == '\0';
 }
 
 TEST(append_raw_equation_spills_to_file) {
   ReductionContext ctx;
-  const std::string path = "/tmp/secred_test_raw_eqs.txt";
+  const std::string path = "/tmp/secred_test_raw_eqs.bin";
   open_raw_spill(ctx, path);
 
   GlobalEquation eq;
@@ -597,25 +612,95 @@ TEST(append_raw_equation_spills_to_file) {
   eq.emplace_back(RI({1, 0}), "-1");
   ctx.appendRawEquation(eq);
 
-  ctx.rawEqOut.reset();  // close before reading back
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);  // closes the file
   REQUIRE(ctx.globalEquationsCount.load() == 1u);
-  REQUIRE(ctx.distinctIntegrals.size() == 2u);
-  REQUIRE(ctx.distinctIntegrals.count(RI({1, 1})) == 1u);
+  // The tables keep every distinct integral and coefficient once, in first-seen
+  // order -- the reader rebuilds the system from the term stream through them.
+  REQUIRE(integrals.size() == 2u);
+  REQUIRE(integrals[0] == RI({1, 1}));
+  REQUIRE(integrals[1] == RI({1, 0}));
+  REQUIRE(ctx.spillCoeffs.size() == 2u);
+  REQUIRE(ctx.spillCoeffs[0] == "2");
+  REQUIRE(ctx.spillCoeffs[1] == "-1");
 
-  std::ifstream in(path);
-  std::string line;
-  std::getline(in, line);
-  REQUIRE(line == "[1, 1]\t2");
-  std::getline(in, line);
-  REQUIRE(line == "[1, 0]\t-1");
-  std::getline(in, line);
-  REQUIRE(line.empty());  // blank equation separator
+  const std::string bytes = slurp(path);
+  REQUIRE(has_spill_header(bytes));
+  // header(8) + one equation: n_terms = 2, then two (integral, coefficient) pairs.
+  REQUIRE(bytes.size() > 8u + 4u + 16u);
+  REQUIRE(bytes[8] == '\x02');
+  REQUIRE(bytes[9] == '\0');
+  REQUIRE(bytes[12] == '\0');  // first term's integral index
+  REQUIRE(bytes[16] == '\0');  // first term's coefficient index
+  REQUIRE(bytes[20] == '\x01');  // second term's integral index
+  REQUIRE(bytes[24] == '\x01');  // second term's coefficient index
+  // Both tables and the footer follow the term stream.
+  REQUIRE(bytes.compare(bytes.size() - 4, 4, "SRSP") == 0);
   std::filesystem::remove(path);
+}
+
+// The tables intern: a coefficient a system spells out a million times is stored once.
+TEST(append_raw_equation_interns_repeated_terms) {
+  ReductionContext ctx;
+  const std::string path = "/tmp/secred_test_raw_eqs_intern.bin";
+  open_raw_spill(ctx, path);
+
+  GlobalEquation a;
+  a.emplace_back(RI({1, 1}), "-2");
+  a.emplace_back(RI({0, 1}), "3/2");
+  GlobalEquation b;
+  b.emplace_back(RI({0, 1}), "3/2");
+  b.emplace_back(RI({1, 1}), "-2");
+  ctx.appendRawEquation(a);
+  ctx.appendRawEquation(b);
+
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);
+  REQUIRE(ctx.globalEquationsCount.load() == 2u);
+  REQUIRE(integrals.size() == 2u);
+  REQUIRE(ctx.spillCoeffs.size() == 2u);
+  std::filesystem::remove(path);
+}
+
+// One lock for a whole batch must write exactly what one lock per equation writes:
+// the frames are concatenated in the same order and the tables are filled by the
+// same first-seen rule.
+TEST(append_raw_equations_batch_matches_single_appends) {
+  std::vector<GlobalEquation> eqs(3);
+  eqs[0].emplace_back(RI({1, 1}), "-2");
+  eqs[0].emplace_back(RI({0, 1}), "3/2");
+  eqs[1].emplace_back(RI({2, 1}), "1");
+  eqs[2].emplace_back(RI({0, 1}), "3/2");
+  eqs[2].emplace_back(RI({2, 1}), "-1/3");
+  eqs[2].emplace_back(RI({1, 1}), "-2");
+
+  const std::string p1 = "/tmp/secred_test_raw_eqs_batch.bin";
+  const std::string p2 = "/tmp/secred_test_raw_eqs_single.bin";
+  {
+    ReductionContext ctx;
+    open_raw_spill(ctx, p1);
+    ctx.appendRawEquations(eqs);
+    std::vector<RawIntegral> integrals;
+    ctx.finishSpill(integrals);
+    REQUIRE(ctx.globalEquationsCount.load() == 3u);
+    REQUIRE(integrals.size() == 3u);
+  }
+  {
+    ReductionContext ctx;
+    open_raw_spill(ctx, p2);
+    for (const GlobalEquation &eq : eqs)
+      ctx.appendRawEquation(eq);
+    std::vector<RawIntegral> integrals;
+    ctx.finishSpill(integrals);
+  }
+  REQUIRE(slurp(p1) == slurp(p2));
+  std::filesystem::remove(p1);
+  std::filesystem::remove(p2);
 }
 
 TEST(append_raw_equation_thread_safe) {
   ReductionContext ctx;
-  const std::string path = "/tmp/secred_test_raw_eqs_thread.txt";
+  const std::string path = "/tmp/secred_test_raw_eqs_thread.bin";
   open_raw_spill(ctx, path);
 
   const unsigned N = 200;
@@ -628,9 +713,12 @@ TEST(append_raw_equation_thread_safe) {
     });
   }
   for (auto &t : ts) t.join();
-  ctx.rawEqOut.reset();
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);
 
   REQUIRE(ctx.globalEquationsCount.load() == N);
+  REQUIRE(integrals.size() == 7u);  // the seven distinct integrals, once each
+  REQUIRE(ctx.spillCoeffs.size() == 1u);
   std::filesystem::remove(path);
 }
 

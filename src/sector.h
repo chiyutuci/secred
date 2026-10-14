@@ -5,15 +5,17 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <numeric>
 #include <queue>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "arith/ffint.h"
@@ -282,6 +284,23 @@ struct SectorTiming {
 // One row of sector_timing.csv: "sector,expanded,probe_s,full_s".
 std::string format_timing_row(const SectorTiming &t);
 
+// Little-endian putters for the spill frame.  The format is read back by
+// src/spill_reader.cpp, which is byte-order independent for the same reason.
+inline void spill_put_u32(std::string &out, std::uint32_t v) {
+  for (unsigned i = 0; i < 4; ++i)
+    out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+}
+
+inline void spill_put_u64(std::string &out, std::uint64_t v) {
+  for (unsigned i = 0; i < 8; ++i)
+    out.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+}
+
+// "SRSP" + u32 version 1, written by openSpill and recognised by the reader.
+inline constexpr char kSpillMagic[4] = {'S', 'R', 'S', 'P'};
+inline constexpr std::uint32_t kSpillVersion = 1;
+inline constexpr std::uint64_t kSpillHeaderBytes = 8;
+
 // Shared reduction state passed to each Sector during parallel execution.
 // Owned by Reduce; Sector methods receive it by reference.
 struct ReductionContext {
@@ -301,30 +320,167 @@ struct ReductionContext {
   unsigned totalSectors = 0;
   unsigned completedSectors = 0;
   std::mutex progressMutex;
-  // Incremental disk spill of the selected equations from all sectors. They are
-  // appended to a raw file (RawIntegral + coefficient text per line, blank line
-  // between equations) instead of accumulating in RAM; only the distinct
-  // integral set is kept resident, for global ID assignment in
-  // _run_global_reduction.
+  // Incremental disk spill of the selected equations from all sectors.
+  //
+  // The equations never accumulate in RAM: each sector appends its settling
+  // round's equations to one file, which the global stage reads back through
+  // src/spill_reader.h.  The file is the 8-byte header, one frame per equation
+  // (u32 n_terms, then (u32 integral index, u32 coefficient index) per term, all
+  // little-endian), the two interned tables -- the distinct integrals and the
+  // distinct coefficient texts, each stored once -- and a footer with the table
+  // offsets and the two counters.
+  //
+  // Interning is what makes a term 8 bytes: on F234, 4.8 M spilled terms carry
+  // 7,276 distinct coefficients (57 KB of text) and 330 k distinct integrals, so
+  // the text this replaced was 2.35 GB of mostly repetition.
   std::string rawEquationsPath;
   std::unique_ptr<std::ofstream>
       rawEqOut; // append stream, guarded by globalEqMutex
-  std::unordered_set<RawIntegral>
-      distinctIntegrals; // resident distinct-integral set
+  std::vector<RawIntegral>
+      spillIntegrals; // distinct integrals, in first-seen order
+  std::vector<std::string>
+      spillCoeffs; // distinct coefficient texts, in first-seen order
   std::atomic<std::size_t> globalEquationsCount{0}; // equations spilled so far
   std::mutex globalEqMutex;
 
-  // Append one equation to the spill file and record its integrals. Thread-safe
-  // (guarded by globalEqMutex). `rawEqOut` must have been opened beforehand.
+  // Open the spill at `rawEquationsPath` for writing, creating its directory, and
+  // write the header.  Called once per run, before the sector phase; a path that
+  // cannot be opened is a hard failure (the global stage cannot run without it).
+  void openSpill() {
+    if (rawEquationsPath.empty())
+      throw std::runtime_error("the raw-equation spill has no path");
+    const std::size_t slash = rawEquationsPath.find_last_of('/');
+    if (slash != std::string::npos)
+      std::filesystem::create_directories(rawEquationsPath.substr(0, slash));
+    rawEqOut = std::make_unique<std::ofstream>(
+        rawEquationsPath, std::ios::binary | std::ios::trunc);
+    if (!*rawEqOut)
+      throw std::runtime_error("cannot open the raw-equation spill at " +
+                               rawEquationsPath);
+    spillIntegrals.clear();
+    spillCoeffs.clear();
+    spillIntegralIndex.clear();
+    spillCoeffIndex.clear();
+    spillBuf.clear();
+    spillBytes = kSpillHeaderBytes;
+    spillTerms = 0;
+    globalEquationsCount.store(0, std::memory_order_relaxed);
+    std::string header(kSpillMagic, sizeof kSpillMagic);
+    spill_put_u32(header, kSpillVersion);
+    rawEqOut->write(header.data(), static_cast<std::streamsize>(header.size()));
+  }
+
+  // Append one equation to the spill and record its integrals. Thread-safe
+  // (guarded by globalEqMutex). `rawEqOut` must have been opened by openSpill.
   void appendRawEquation(const GlobalEquation &eq) {
     std::lock_guard<std::mutex> lk(globalEqMutex);
-    for (const auto &[integ, coeff] : eq) {
-      distinctIntegrals.insert(integ);
-      *rawEqOut << integ << '\t' << coeff << '\n';
-    }
-    *rawEqOut << '\n';
-    globalEquationsCount.fetch_add(1, std::memory_order_relaxed);
+    spillBuf.clear();
+    spill_frame(eq);
+    spill_commit_locked(1);
   }
+
+  // Append a whole burst of equations under one lock.  A sector's settling round
+  // produces thousands of equations at once, and the lock used to be taken once per
+  // equation -- 931,597 acquisitions on F234, ~11 us each, which was most of the
+  // sector phase's wall time.  One acquisition per burst, and interning inside it,
+  // is what removes that serialisation: the frames written are byte-identical to
+  // the per-equation ones (`append_raw_equations_batch_matches_single_appends`).
+  void appendRawEquations(const std::vector<GlobalEquation> &eqs) {
+    if (eqs.empty())
+      return;
+    std::lock_guard<std::mutex> lk(globalEqMutex);
+    spillBuf.clear();
+    for (const GlobalEquation &eq : eqs)
+      spill_frame(eq);
+    spill_commit_locked(eqs.size());
+  }
+
+  // Close the spill: write the two interned tables and the footer, flush, release
+  // the stream, and hand the caller the distinct integrals.  Their order here is
+  // the first-seen one; the numbering order is imposed by
+  // `order_global_integrals` (global_order.h), which is a total order on the
+  // integrals themselves, so no property of this order can reach the result.
+  void finishSpill(std::vector<RawIntegral> &integrals) {
+    if (!rawEqOut)
+      return;
+    const std::uint64_t integral_offset = spillBytes;
+    spillBuf.clear();
+    spill_put_u64(spillBuf, spillIntegrals.size());
+    for (const RawIntegral &integ : spillIntegrals) {
+      spillBuf.push_back(
+          static_cast<char>(static_cast<std::uint8_t>(integ.size())));
+      for (unsigned i = 0; i < integ.size(); ++i)
+        spillBuf.push_back(static_cast<char>(static_cast<std::int8_t>(integ[i])));
+    }
+    const std::uint64_t coeff_offset = integral_offset + spillBuf.size();
+    spill_put_u64(spillBuf, spillCoeffs.size());
+    for (const std::string &coeff : spillCoeffs) {
+      spill_put_u32(spillBuf, static_cast<std::uint32_t>(coeff.size()));
+      spillBuf += coeff;
+    }
+    spill_put_u64(spillBuf, integral_offset);
+    spill_put_u64(spillBuf, coeff_offset);
+    spill_put_u64(spillBuf, globalEquationsCount.load(std::memory_order_relaxed));
+    spill_put_u64(spillBuf, spillTerms);
+    spillBuf.append(kSpillMagic, sizeof kSpillMagic);
+    rawEqOut->write(spillBuf.data(), static_cast<std::streamsize>(spillBuf.size()));
+    rawEqOut->flush();
+    rawEqOut.reset();
+    spillBuf.clear();
+    spillBuf.shrink_to_fit();
+    integrals.swap(spillIntegrals);
+  }
+
+  // The run spilled nothing: close the stream and remove the header-only file.
+  void discardSpill() {
+    if (rawEqOut)
+      rawEqOut->flush();
+    rawEqOut.reset();
+    if (!rawEquationsPath.empty())
+      std::filesystem::remove(rawEquationsPath);
+  }
+
+  // The index of `integ` in the interned table, appending it on first use.  Called
+  // with the lock held, so the table and the index cannot disagree.
+  std::uint32_t spill_integral_index(const RawIntegral &integ) {
+    const auto it = spillIntegralIndex.try_emplace(
+        integ, static_cast<std::uint32_t>(spillIntegrals.size()));
+    if (it.second)
+      spillIntegrals.push_back(integ);
+    return it.first->second;
+  }
+
+  std::uint32_t spill_coeff_index(const std::string &coeff) {
+    const auto it = spillCoeffIndex.try_emplace(
+        coeff, static_cast<std::uint32_t>(spillCoeffs.size()));
+    if (it.second)
+      spillCoeffs.push_back(coeff);
+    return it.first->second;
+  }
+
+  // One equation's frame into spillBuf.  Called with the lock held.
+  void spill_frame(const GlobalEquation &eq) {
+    spill_put_u32(spillBuf, static_cast<std::uint32_t>(eq.size()));
+    for (const auto &[integ, coeff] : eq) {
+      spill_put_u32(spillBuf, spill_integral_index(integ));
+      spill_put_u32(spillBuf, spill_coeff_index(coeff));
+    }
+    spillTerms += eq.size();
+  }
+
+  // Write the frames spillBuf holds and count them.  Called with the lock held.
+  void spill_commit_locked(std::size_t n_equations) {
+    rawEqOut->write(spillBuf.data(), static_cast<std::streamsize>(spillBuf.size()));
+    spillBytes += spillBuf.size();
+    globalEquationsCount.fetch_add(n_equations, std::memory_order_relaxed);
+  }
+
+  // Interner state.  Guarded by globalEqMutex like the stream itself.
+  std::unordered_map<RawIntegral, std::uint32_t> spillIntegralIndex;
+  std::unordered_map<std::string, std::uint32_t> spillCoeffIndex;
+  std::string spillBuf;            // one burst's frames, reused across bursts
+  std::uint64_t spillBytes = 0;    // header + frames written so far
+  std::uint64_t spillTerms = 0;    // terms written so far
 
   // Per-sector seed-range narrowing statistics (updated atomically by worker
   // threads). narrowingSuccess: sectors where the initial depth/rank bounds

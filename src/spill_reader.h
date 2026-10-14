@@ -1,13 +1,20 @@
 // Direct scanner over the global stage's raw-equation spill file.
 //
-// The spill is written by one function (`appendRawEquation`, sector.h:320-330) as
-// "<RawIntegral>\t<coefficient>\n" per term, a blank line after each equation, and the
-// coefficient text comes from one printer (`print_row_poly`, row_coeff.h) whose grammar
-// is closed.  The global stage used to re-read that file -- 2.35 GB on F234 -- with
-// std::getline plus a GiNaC parse per coefficient, and paid 231 s for it.
+// The spill is written by `ReductionContext` (sector.h: `openSpill`, `appendRawEquation`
+// / `appendRawEquations`, `finishSpill`).  Two formats are read:
 //
-// This file maps the spill read-only and parses every line in place: no line copy, no
-// per-line allocation, no GiNaC on the fast path.  Anything outside the strict grammar
+//   * the binary frame every current run writes -- "SRSP" + version, one frame per
+//     equation, the interned integral and coefficient tables, a footer.  A term is
+//     8 bytes and a coefficient is stored once, so F234's 2.35 GB text spill becomes
+//     8 B per term plus its tables;
+//   * the text format the earlier versions wrote ("<RawIntegral>\t<coefficient>\n" per
+//     term, a blank line between equations), kept because the frozen bench spills under
+//     bench/ are in it and because it is the reference the binary reader is
+//     differentially tested against (tests/test_spill_reader.cpp).
+//
+// Either way the file is mapped read-only and parsed in place: no line copy, no
+// per-line allocation, no GiNaC on the fast path.  The coefficient text comes from one
+// printer (`print_row_poly`, row_coeff.h) whose grammar is closed; anything outside it
 // (an integral `RawIntegral::from_text` would accept but the strict parser refuses, a
 // coefficient outside the printer's spelling) falls back to the original parser and is
 // counted in SpillReadStats, so the fast path is never a silent reinterpretation.
@@ -48,8 +55,10 @@ bool parse_spill_coeff(const char *b, const char *e,
 
 // Read `path` and append every equation whose integrals are all known to `system`.
 // False and a message in `error` on a hard failure (unreadable file, a coefficient that
-// does not fit in int64).  `stats.fallbacks` is the number of coefficients the strict
-// grammar refused.
+// does not fit in int64, a binary file that is truncated or from another version).
+// `stats.fallbacks` is the number of coefficients the strict grammar refused -- per
+// occurrence, the coefficient table's entries being what the binary format repeats
+// least.
 bool read_spill_numeric(const std::string &path,
                         const std::unordered_map<RawIntegral, unsigned> &integral_id,
                         std::vector<Eq> &system, SpillReadStats &stats,
@@ -76,6 +85,11 @@ bool read_spill_symbolic(const std::string &path,
 // (8 B per term) plus one object per *distinct* coefficient.  The equations, their term
 // order and their slots are exactly what `build_sym_coeff_pool` would produce from the
 // materialised system -- that equality is what `intern_sym_system` in the tests pins.
+//
+// On a binary spill the coefficient table is parsed once per entry (a `fallback` GiNaC
+// parse included) and a row takes pointers into that cache, so `stats.fallbacks` counts
+// the *entries* the grammar refused rather than their occurrences, as the text reader
+// above it does.
 bool read_spill_interned(const std::string &path,
                          const std::unordered_map<RawIntegral, unsigned> &integral_id,
                          const std::vector<GiNaC::possymbol> &symbols,

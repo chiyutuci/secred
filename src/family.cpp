@@ -44,17 +44,11 @@ constexpr unsigned kNumPrimeSubs = sizeof(kPrimeSubs) / sizeof(kPrimeSubs[0]);
 GiNaC::symtab Family::symtab;
 
 void Family::run_reduce(Reduce &reduce) {
-  // Open the incremental equation spill file. Each sector appends its selected
+  // Open the incremental equation spill. Each sector appends its selected
   // equations here (instead of accumulating them in RAM), so the global system
   // never stays resident through the sector phase.
-  {
-    namespace fs = std::filesystem;
-    fs::create_directories(_cache_dir + "/global");
-    reduce._ctx.rawEquationsPath = _cache_dir + "/global/raw_equations";
-    reduce._ctx.rawEqOut =
-        std::make_unique<std::ofstream>(reduce._ctx.rawEquationsPath,
-                                        std::ios::trunc);
-  }
+  reduce._ctx.rawEquationsPath = _cache_dir + "/global/raw_equations";
+  reduce._ctx.openSpill();
 
   // Fresh per-sector ATPS timing table: a header line here, then one row per
   // sector appended by the worker threads once its full pass has finished.
@@ -157,10 +151,8 @@ void Family::run_reduce(Reduce &reduce) {
   GlobalReductionResult globalResult;
   if (reduce._ctx.globalEquationsCount.load() > 0)
     globalResult = _run_global_reduction(reduce);
-  else {
-    reduce._ctx.rawEqOut.reset();
-    std::filesystem::remove(reduce._ctx.rawEquationsPath);
-  }
+  else
+    reduce._ctx.discardSpill(); // nothing spilled: no file to read back
   const double globalSeconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - global_t0)
           .count();
@@ -366,17 +358,12 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
 GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
   auto &ctx = reduce._ctx;
 
-  // Close the spill stream: all sectors have appended their equations.
-  if (ctx.rawEqOut) {
-    ctx.rawEqOut->flush();
-    ctx.rawEqOut.reset();
-  }
-
-  // Build the distinct-integral table from the resident set and sort it into
-  // global IDs (simpler first → lower ID, the masters-first convention).
-  std::vector<RawIntegral> all_integrals(ctx.distinctIntegrals.begin(),
-                                         ctx.distinctIntegrals.end());
-  ctx.distinctIntegrals.clear();  // free the set (contents now in the vector)
+  // Close the spill: all sectors have appended their equations, so its interned
+  // tables go to disk and it hands back the distinct integrals, which the sort
+  // below turns into global IDs (simpler first → lower ID, the masters-first
+  // convention).
+  std::vector<RawIntegral> all_integrals;
+  ctx.finishSpill(all_integrals);
 
   // The order is fixed by src/global_order.h: sector popcount first, then either
   // the (depth, rank) key (Normal) or the balance key, with the sector mask and

@@ -693,10 +693,11 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
        << (ffred_sel.fallback ? "yes" : "no") << ")\n";
 
   // Regenerate each selected equation from its (seed, ibp) record and spill
-  // it to the raw equation file (ctx.appendRawEquation) for the global
-  // reduction. Subsector master integrals are forwarded by the master
-  // propagation above (the sweep result); the subsector filter keeps the top
-  // layer in the columns, so nothing extra needs to be forwarded here.
+  // the whole round to the raw equation file (ctx.appendRawEquations, one
+  // lock for the burst) for the global reduction. Subsector master integrals
+  // are forwarded by the master propagation above (the sweep result); the
+  // subsector filter keeps the top layer in the columns, so nothing extra
+  // needs to be forwarded here.
   {
     std::vector<GlobalEquation> local_eqs;
     std::vector<RawIntegral> new_uptargets;
@@ -887,8 +888,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
             }
           }
         }
-        for (auto &eq : sym_eqs)
-          ctx.appendRawEquation(eq);
+        ctx.appendRawEquations(sym_eqs);
       }
     }
 
@@ -907,8 +907,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
             std::cerr << "sector " << _id
                       << ": symmetry image missing from the local system\n";
     }
-    for (auto &eq : local_eqs)
-      ctx.appendRawEquation(eq);
+    ctx.appendRawEquations(local_eqs);
   }
 
   return 0;

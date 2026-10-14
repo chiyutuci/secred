@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -543,4 +544,258 @@ TEST(spill_interned_reports_an_unparsable_coefficient) {
   std::string error;
   REQUIRE(!secred::read_spill_interned(p, ids, symbols, pool, stats, error));
   REQUIRE(error.find("cannot parse coefficient") != std::string::npos);
+}
+
+// --- the binary spill (Task 5) --------------------------------------------------
+
+namespace {
+
+// The same system through the production writer, so what the reader is tested against
+// is the file a run actually leaves behind.
+std::string write_binary_spill(const std::string &name,
+                               const std::vector<GlobalEquation> &eqs) {
+  const std::string path = "/tmp/secred_test_spill_" + name + ".bin";
+  ReductionContext ctx;
+  ctx.rawEquationsPath = path;
+  ctx.openSpill();
+  ctx.appendRawEquations(eqs);
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);
+  return path;
+}
+
+// The same system in the text format, which the reader still reads: what
+// `appendRawEquation` wrote before the binary frame.  The two files must read back
+// term for term -- that is the whole claim of the format change.
+std::string write_text_spill(const std::string &name,
+                             const std::vector<GlobalEquation> &eqs) {
+  std::string text;
+  for (const GlobalEquation &eq : eqs) {
+    for (const auto &[integ, coeff] : eq) {
+      std::vector<int> v(integ.size());
+      for (unsigned i = 0; i < integ.size(); ++i)
+        v[i] = integ[i];
+      text += term_line(v, coeff);
+    }
+    text += "\n";
+  }
+  return write_spill(name, text);
+}
+
+// A rational system with every branch of the numeric reader in it: an integral the id
+// map knows and two it does not (one of them an equation's only term, which leaves no
+// equation behind), an unreduced fraction, a zero coefficient -- which this reader
+// keeps, as the text one does -- and a coefficient repeated across equations, which
+// the binary tables intern.
+std::vector<GlobalEquation> numeric_fixture() {
+  std::vector<GlobalEquation> eqs(4);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "3");
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{0, 1}), "1/2");
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{2, 2}), "7");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{7, 7}), "-2");  // unknown
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{1, 0}), "4/6");
+  eqs[2].emplace_back(RawIntegral(std::vector<int>{0, 0}), "0");
+  eqs[2].emplace_back(RawIntegral(std::vector<int>{0, 1}), "1/2");
+  eqs[3].emplace_back(RawIntegral(std::vector<int>{5, 5}), "9");  // unknown, alone
+  return eqs;
+}
+
+// A symbolic system: the strict grammar's spellings, a coefficient the grammar
+// refuses (the GiNaC fallback, which the binary reader parses once per table entry),
+// a re-spelled repeat that must intern to the first spelling's slot, and a zero.
+std::vector<GlobalEquation> symbolic_fixture() {
+  std::vector<GlobalEquation> eqs(5);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "3/2*d+1/2");
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{0, 1}), "(d-2)/(2*m^2)");
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{2, 2}), "7");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{1, 0}), "d");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{0, 0}), "3/2*d+1/2");
+  eqs[2].emplace_back(RawIntegral(std::vector<int>{0, 0}), "(d-2)*(d+1)/(2*m^2)");
+  eqs[3].emplace_back(RawIntegral(std::vector<int>{1, 0}), "0");  // a zero term
+  eqs[4].emplace_back(RawIntegral(std::vector<int>{0, 0}), "1/3*s-2/5");
+  eqs[4].emplace_back(RawIntegral(std::vector<int>{1, 0}), "(d-2)/(2*m^2)");
+  return eqs;
+}
+
+}  // namespace
+
+TEST(spill_binary_numeric_matches_the_text_reader) {
+  const std::vector<GlobalEquation> eqs = numeric_fixture();
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}, {2, 2}});
+  const std::string txt = write_text_spill("numdiff", eqs);
+  const std::string bin = write_binary_spill("numdiff", eqs);
+
+  std::vector<Eq> theirs;
+  SpillReadStats tstats;
+  std::string error;
+  REQUIRE(secred::read_spill_numeric(txt, ids, theirs, tstats, error));
+  std::vector<Eq> ours;
+  SpillReadStats ostats;
+  REQUIRE(secred::read_spill_numeric(bin, ids, ours, ostats, error));
+
+  REQUIRE_EQ(ours.size(), theirs.size());
+  for (std::size_t i = 0; i < ours.size(); ++i) {
+    REQUIRE_EQ(ours[i].size(), theirs[i].size());
+    for (std::size_t j = 0; j < ours[i].size(); ++j) {
+      REQUIRE_EQ(ours[i][j].first, theirs[i][j].first);
+      REQUIRE_EQ(ours[i][j].second.num, theirs[i][j].second.num);
+      REQUIRE_EQ(ours[i][j].second.den, theirs[i][j].second.den);
+    }
+  }
+  REQUIRE_EQ(ostats.equations, tstats.equations);
+  REQUIRE_EQ(ostats.terms, tstats.terms);
+  REQUIRE_EQ(ostats.skipped_unknown, tstats.skipped_unknown);
+  REQUIRE_EQ(ostats.skipped_unknown, std::uint64_t(2));
+  // `4/6` and `1/2` stay unreduced in both: the readers normalise only the sign of the
+  // denominator, and the solver reduces mod p later.
+  REQUIRE_EQ(ours[1][0].second.den, int64_t(6));
+  // The zero coefficient of the third equation is kept, after the term with the higher
+  // id -- this reader drops it in the solver (`reduce_mod`), not on the way in.
+  REQUIRE_EQ(ours[2].size(), std::size_t(2));
+  REQUIRE_EQ(ours[2][0].second.num, int64_t(1));
+  REQUIRE_EQ(ours[2][0].second.den, int64_t(2));
+  REQUIRE_EQ(ours[2][1].second.num, int64_t(0));
+}
+
+TEST(spill_binary_symbolic_matches_the_text_reader) {
+  const std::vector<GlobalEquation> eqs = symbolic_fixture();
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}, {2, 2}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"), GiNaC::possymbol("s"),
+                                                 GiNaC::possymbol("t"), GiNaC::possymbol("m")};
+  const std::string txt = write_text_spill("symdiff", eqs);
+  const std::string bin = write_binary_spill("symdiff", eqs);
+
+  std::vector<secred::SymEq> theirs;
+  SpillReadStats tstats;
+  std::string error;
+  REQUIRE(secred::read_spill_symbolic(txt, ids, symbols, theirs, tstats, error));
+  std::vector<secred::SymEq> ours;
+  SpillReadStats ostats;
+  REQUIRE(secred::read_spill_symbolic(bin, ids, symbols, ours, ostats, error));
+
+  REQUIRE_EQ(ours.size(), theirs.size());
+  for (std::size_t i = 0; i < ours.size(); ++i) {
+    REQUIRE_EQ(ours[i].size(), theirs[i].size());
+    for (std::size_t j = 0; j < ours[i].size(); ++j) {
+      REQUIRE_EQ(ours[i][j].first, theirs[i][j].first);
+      REQUIRE(::sym_poly_equal(ours[i][j].second.num, theirs[i][j].second.num));
+      REQUIRE(::sym_poly_equal(ours[i][j].second.den, theirs[i][j].second.den));
+    }
+  }
+  REQUIRE_EQ(ostats.equations, tstats.equations);
+  REQUIRE_EQ(ostats.terms, tstats.terms);
+  REQUIRE_EQ(ostats.skipped_unknown, tstats.skipped_unknown);
+  // The one coefficient outside the strict grammar, written once in this fixture, so
+  // the per-entry binary count and the per-occurrence text count agree.
+  REQUIRE_EQ(ostats.fallbacks, std::uint64_t(1));
+  REQUIRE_EQ(tstats.fallbacks, std::uint64_t(1));
+}
+
+// The production reader against the one the binary file is meant to reproduce: the
+// pool's rows, boundaries and slots must be the ones a text read followed by
+// `intern_sym_system` assigns, which is what the learn and the evaluator expect.
+TEST(spill_binary_interned_matches_the_text_reader) {
+  const std::vector<GlobalEquation> eqs = symbolic_fixture();
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}, {2, 2}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"), GiNaC::possymbol("s"),
+                                                 GiNaC::possymbol("t"), GiNaC::possymbol("m")};
+  const std::string txt = write_text_spill("symintern", eqs);
+  const std::string bin = write_binary_spill("symintern", eqs);
+
+  secred::SymCoeffPool reference;
+  secred::SpillReadStats tstats;
+  std::string error;
+  REQUIRE(secred::read_spill_interned(txt, ids, symbols, reference, tstats, error));
+
+  secred::SymCoeffPool pool;
+  secred::SpillReadStats ostats;
+  REQUIRE(secred::read_spill_interned(bin, ids, symbols, pool, ostats, error));
+
+  REQUIRE(pool.terms == reference.terms);
+  REQUIRE(pool.eq_begin == reference.eq_begin);
+  REQUIRE_EQ(pool.coeffs.size(), reference.coeffs.size());
+  REQUIRE_EQ(ostats.equations, tstats.equations);
+  REQUIRE_EQ(ostats.terms, tstats.terms);
+  REQUIRE_EQ(ostats.skipped_unknown, tstats.skipped_unknown);
+  REQUIRE_EQ(pool.n_equations(), std::size_t(5));
+  // Eight terms over six functions: `3/2*d+1/2` and `(d-2)/(2*m^2)` each occur twice and
+  // intern to their first slot, in the binary read as in the text one, and the equation
+  // whose only coefficient is zero still has its row -- empty.
+  REQUIRE_EQ(pool.n_terms(), std::size_t(8));
+  REQUIRE_EQ(pool.coeffs.size(), std::size_t(6));
+  REQUIRE_EQ(pool.eq_begin.size(), std::size_t(6));
+  REQUIRE_EQ(pool.eq_begin[3], pool.eq_begin[4]);
+  REQUIRE_EQ(pool.terms[1].second, pool.terms[4].second);
+  REQUIRE_EQ(pool.terms[2].second, pool.terms[6].second);
+}
+
+// A coefficient the grammar refuses and GiNaC cannot read is a hard error, as it is
+// for the text reader -- the table is parsed through the same function.
+TEST(spill_binary_unparsable_coefficient_is_an_error) {
+  std::vector<GlobalEquation> eqs(1);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "d +");
+  const std::string bin = write_binary_spill("symbad", eqs);
+  const auto ids = ids_of({{0, 0}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d")};
+  secred::SymCoeffPool pool;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_interned(bin, ids, symbols, pool, stats, error));
+  REQUIRE(error.find("cannot parse coefficient") != std::string::npos);
+}
+
+// The numeric reader's own hard failure, reached through the table.
+TEST(spill_binary_numeric_overflow_is_a_hard_failure) {
+  std::vector<GlobalEquation> eqs(1);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "99999999999999999999");
+  const std::string bin = write_binary_spill("numoverflow", eqs);
+  const auto ids = ids_of({{1, 1}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_numeric(bin, ids, system, stats, error));
+  REQUIRE(error.find("does not fit in int64") != std::string::npos);
+}
+
+// A file that starts as a binary spill and stops before its footer is a hard error:
+// the term stream cannot be read without the tables the footer points at, and a run
+// that died half-way must not look like a short system.
+TEST(spill_binary_truncated_is_an_error) {
+  const std::string bin = write_binary_spill("truncated", numeric_fixture());
+  std::filesystem::resize_file(bin, 16);  // header and half an equation
+  const auto ids = ids_of({{0, 0}, {1, 0}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_numeric(bin, ids, system, stats, error));
+  REQUIRE(error.find("truncated") != std::string::npos);
+}
+
+// The magic is checked, not assumed: a later version's file is refused rather than
+// read as this one.
+TEST(spill_binary_version_is_checked) {
+  std::string bytes = "SRSP";
+  bytes += '\x02';  // version 2
+  bytes += std::string(4, '\0');
+  const std::string p = write_spill("badversion", bytes);
+  const auto ids = ids_of({{0, 0}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_numeric(p, ids, system, stats, error));
+  REQUIRE(error.find("version") != std::string::npos);
+}
+
+// An empty file is what a run that spilled nothing leaves behind (the stream is opened
+// and truncated, and `Family` removes it only after the sector phase).  It is not a
+// binary spill and scans as the empty text system, exactly as it did before.
+TEST(spill_binary_empty_file_scans_as_text) {
+  const std::string p = write_spill("emptybinary", "");
+  const auto ids = ids_of({{0, 0}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(secred::read_spill_numeric(p, ids, system, stats, error));
+  REQUIRE_EQ(system.size(), std::size_t(0));
+  REQUIRE_EQ(stats.equations, std::uint64_t(0));
 }
