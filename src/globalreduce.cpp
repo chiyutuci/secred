@@ -647,13 +647,15 @@ GlobalReductionResult reduce_global_finiteflow(
                                    &dep_targets);
     };
     GlobalSelection gsel =
-        select_global_forward(eq_index, fwd_deps, learn_solmap, dep_targets,
+        select_global_forward(eq_index, fwd_deps, bwd_deps, learn_solmap, dep_targets,
                               master_index, solve_at_learn);
     if (gsel.fallback) {
       std::cerr << "finiteflow global reduction: forward selection did not "
                    "converge, falling back to the legacy closure\n";
     } else {
       use_forward = true;
+      // Logged before the moves: the decision line quotes the selection's own row count.
+      log_selection("finiteflow global reduction: ", gsel);
       needed_eq_idx = std::move(gsel.needed_eq_idx);
       bwd_chain = std::move(gsel.bwd_chain);
     }

@@ -90,11 +90,13 @@ struct SectorCtx {
                              /*want_bwd=*/false);
   }
 
-  GlobalSelection select(unsigned max_rounds = 64) const {
+  GlobalSelection select(unsigned max_rounds = 64,
+                         unsigned min_gain_pct = kRepairMinGainPct) const {
     return select_global_forward(
-        learn.eq_index, learn.fwd_deps, learn.solmap, dep_targets, master_index,
+        learn.eq_index, learn.fwd_deps, learn.bwd_deps, learn.solmap, dep_targets,
+        master_index,
         [&](const std::vector<uint32_t> &idx, SubSolve &out) { solve(idx, out); },
-        max_rounds);
+        max_rounds, min_gain_pct);
   }
 };
 
@@ -217,7 +219,7 @@ TEST(sector_selection_forward_then_repair) {
   GlobalSelection fwd_only = c.select(0u);
   REQUIRE(!fwd_only.ok);
   REQUIRE(fwd_only.fallback);
-  REQUIRE_EQ(fwd_only.n_fwd_only, 2u);
+  REQUIRE_EQ(fwd_only.n_fwd_rows, 2u);
   REQUIRE(fwd_only.needed_eq_idx == (std::vector<uint32_t>{0u, 1u}));
   SubSolve sub_fwd;
   c.solve(fwd_only.needed_eq_idx, sub_fwd);
@@ -252,7 +254,7 @@ TEST(sector_selection_deterministic) {
   REQUIRE(a.needed_eq_idx == b.needed_eq_idx);
   REQUIRE_EQ(a.n_repair_rounds, b.n_repair_rounds);
   REQUIRE_EQ(a.n_repair_added, b.n_repair_added);
-  REQUIRE_EQ(a.n_fwd_only, b.n_fwd_only);
+  REQUIRE_EQ(a.n_fwd_rows, b.n_fwd_rows);
 
   const auto ea = derived_fixture();
   const auto eb = derived_fixture();

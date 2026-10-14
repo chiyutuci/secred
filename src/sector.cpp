@@ -661,13 +661,17 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   for (std::size_t j = 0; j < needed_indep.size(); ++j)
     master_index[ncols - 1 - needed_indep[j]] = j;
 
+  // kRepairAlways: the guard that keeps the global stage from repairing (see
+  // global_select.h) has no purchase here -- a sector's sub-solve is milliseconds and the
+  // spill it shrinks is what the global stage reads.
   ffred_sel = select_global_forward(
-      ffred_learn.eq_index, ffred_learn.fwd_deps, ffred_learn.solmap,
-      ffred_dep_targets, master_index,
+      ffred_learn.eq_index, ffred_learn.fwd_deps, ffred_learn.bwd_deps,
+      ffred_learn.solmap, ffred_dep_targets, master_index,
       [&](const std::vector<uint32_t> &idx, secred::SubSolve &out) {
         secred::solve_res_subset(res_eqs, idx, learn_prime, out,
                                  /*want_fwd=*/true, /*want_bwd=*/false);
-      });
+      },
+      /*max_repair_rounds=*/64u, kRepairAlways);
   // The selection names res_eqs rows; downstream wants eqrecord/alg.rinfo rows.
   std::vector<unsigned> sel_idx;
   if (ffred_sel.fallback) {
@@ -688,8 +692,8 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
 
   file << "\n remained equations: " << selected_eqs.size() << '\n';
   file << " selection: forward (repair rounds " << ffred_sel.n_repair_rounds
-       << ", +" << ffred_sel.n_repair_added << " added; fwd-only "
-       << ffred_sel.n_fwd_only << "; fallback "
+       << ", +" << ffred_sel.n_repair_added << " added; fwd closure "
+       << ffred_sel.n_fwd_rows << " equations; fallback "
        << (ffred_sel.fallback ? "yes" : "no") << ")\n";
 
   // Regenerate each selected equation from its (seed, ibp) record and spill

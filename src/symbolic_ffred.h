@@ -476,13 +476,16 @@ SymbolicGlobalLearn symbolic_global_learn(
       solve_res_eqs(res_eqs, sys_idx, learn_prime, sub);
     };
     GlobalSelection gsel = select_global_forward(
-        eq_index, fwd_deps, learn_solmap, out.dep_targets, out.master_index,
+        eq_index, fwd_deps, bwd_deps, learn_solmap, out.dep_targets, out.master_index,
         solve_at_learn);
     if (gsel.fallback) {
       std::cerr << tag << " forward selection did not converge, falling back to the "
                    "legacy closure\n";
     } else {
       use_forward = true;
+      // Logged before the moves: the decision line quotes the selection's own row count.
+      std::cout << "\n";
+      log_selection(std::string(tag) + " ", gsel);
       out.needed_eq_idx = std::move(gsel.needed_eq_idx);
       out.bwd_chain = std::move(gsel.bwd_chain);
     }

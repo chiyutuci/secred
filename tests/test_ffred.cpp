@@ -9,6 +9,8 @@
 #include <initializer_list>
 #include <random>
 #include <set>
+#include <sstream>
+#include <string>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
@@ -345,13 +347,14 @@ bool rhs_only_masters(
   return true;
 }
 
-GlobalSelection run_selection(const LearnCtx &c, unsigned max_rounds = 64) {
+GlobalSelection run_selection(const LearnCtx &c, unsigned max_rounds = 64,
+                              unsigned min_gain_pct = kRepairMinGainPct) {
   return select_global_forward(
-      c.eq_index, c.fwd_deps, c.solmap, c.dep_targets, c.master_index,
+      c.eq_index, c.fwd_deps, c.bwd_deps, c.solmap, c.dep_targets, c.master_index,
       [&](const std::vector<uint32_t> &idx, secred::SubSolve &sub) {
         solve_at_learn(c.system, P, idx, sub);
       },
-      max_rounds);
+      max_rounds, min_gain_pct);
 }
 
 } // namespace
@@ -376,7 +379,7 @@ REQUIRE(c.bwd_deps.find(125u) == c.bwd_deps.end()); // 125 is reachable only thr
   GlobalSelection fwd_only = run_selection(c, 0u);
   REQUIRE(!fwd_only.ok);
   REQUIRE(fwd_only.fallback);
-  REQUIRE_EQ(fwd_only.n_fwd_only, 2u);
+  REQUIRE_EQ(fwd_only.n_fwd_rows, 2u);
   REQUIRE(fwd_only.needed_eq_idx == (std::vector<uint32_t>{0u, 1u}));
   secred::SubSolve sub_fwd;
   solve_at_learn(c.system, P, fwd_only.needed_eq_idx, sub_fwd);
@@ -417,7 +420,7 @@ TEST(global_forward_selection_is_deterministic) {
   REQUIRE(a.bwd_chain == b.bwd_chain);
   REQUIRE_EQ(a.n_repair_rounds, b.n_repair_rounds);
   REQUIRE_EQ(a.n_repair_added, b.n_repair_added);
-  REQUIRE_EQ(a.n_fwd_only, b.n_fwd_only);
+  REQUIRE_EQ(a.n_fwd_rows, b.n_fwd_rows);
 }
 
 // Hitting the repair round cap sets fallback explicitly (the caller then returns to the
@@ -428,7 +431,7 @@ TEST(global_forward_repair_cap_falls_back) {
   GlobalSelection capped = run_selection(c, 0u);
   REQUIRE(!capped.ok);
   REQUIRE(capped.fallback);
-  REQUIRE_EQ(capped.n_fwd_only, 2u);
+  REQUIRE_EQ(capped.n_fwd_rows, 2u);
   REQUIRE_EQ(capped.n_repair_rounds, 0u);
   REQUIRE_EQ(capped.n_repair_added, 0u);
   REQUIRE(capped.needed_eq_idx == (std::vector<uint32_t>{0u, 1u}));
@@ -440,26 +443,30 @@ TEST(global_forward_repair_cap_falls_back) {
 // the loop would burn every one of its 64 rounds on it before falling back.  The guard
 // recognises the stall after that one solve and returns to the legacy closure at once.
 // The counter is the observable; the stub solver is what makes the stall reachable at unit
-// scale (a real elimination settles this fixture inside round 0).
+// scale (a real elimination settles this fixture inside round 0).  min_gain_pct = 0 forces
+// the repair on a system the production policy would not repair at all (whose two closures
+// coincide), so that this test observes the repair loop and not the policy in front of it.
 TEST(global_forward_repair_stall_skips_resolve) {
   // Forward closure of I_127 = {127, 126, 125}: all three equations are already selected,
   // and I_125 is a reducible integral (a full-system pivot), so the repair adds it as a
   // seed and nothing changes.
   std::unordered_map<uint32_t, uint32_t> eq_index{{127u, 1u}, {126u, 0u}, {125u, 3u}};
   std::unordered_map<uint32_t, std::vector<uint32_t>> fwd_deps{{127u, {126u, 125u}}};
+  std::unordered_map<uint32_t, std::vector<uint32_t>> bwd_deps; // no backward edges
   std::unordered_map<uint32_t, ResEq> full_pivots{{126u, {}}, {127u, {}}, {125u, {}}};
   std::vector<unsigned> dep_targets{127u};
   std::unordered_map<unsigned, unsigned> master_index{{1u, 0u}};
   unsigned calls = 0;
 
   GlobalSelection sel = select_global_forward(
-      eq_index, fwd_deps, full_pivots, dep_targets, master_index,
+      eq_index, fwd_deps, bwd_deps, full_pivots, dep_targets, master_index,
       [&](const std::vector<uint32_t> &idx, secred::SubSolve &sub) {
         ++calls;
         REQUIRE(idx == (std::vector<uint32_t>{0u, 1u, 3u}));
         // I_127 = I_125: the right-hand side keeps a non-master the subset cannot remove.
         sub.solmap[127u] = ResEq{{127u, 1u}, {125u, 1u}};
-      });
+      },
+      /*max_repair_rounds=*/64u, /*min_gain_pct=*/0u);
 
   REQUIRE_EQ(calls, 1u); // solved once, then the stall is recognised
   REQUIRE(!sel.ok);
@@ -472,13 +479,96 @@ TEST(global_forward_repair_stall_skips_resolve) {
   LearnCtx c;
   unsigned real_calls = 0;
   GlobalSelection real_sel = select_global_forward(
-      c.eq_index, c.fwd_deps, c.solmap, c.dep_targets, c.master_index,
+      c.eq_index, c.fwd_deps, c.bwd_deps, c.solmap, c.dep_targets, c.master_index,
       [&](const std::vector<uint32_t> &idx, secred::SubSolve &sub) {
         ++real_calls;
         solve_at_learn(c.system, P, idx, sub);
       });
   REQUIRE(real_sel.ok);
   REQUIRE_EQ(real_calls, 2u);
+}
+
+// The policy in front of the repair: the two closures are free to compute and the repair's
+// entire prize is their difference, so a system whose backward edges stay inside the
+// forward closure never gets a sub-solve -- no matter how many rounds are allowed, and
+// whatever the repair would have found.  The stall test's own fixture (its backward closure
+// is empty, so the closures coincide, so the prize is zero), and the row set handed back is
+// the legacy one.
+TEST(global_selection_skips_repair_when_legacy_is_close) {
+  std::unordered_map<uint32_t, uint32_t> eq_index{{127u, 1u}, {126u, 0u}, {125u, 3u}};
+  std::unordered_map<uint32_t, std::vector<uint32_t>> fwd_deps{{127u, {126u, 125u}}};
+  std::unordered_map<uint32_t, std::vector<uint32_t>> bwd_deps;
+  std::unordered_map<uint32_t, ResEq> full_pivots{{126u, {}}, {127u, {}}, {125u, {}}};
+  std::vector<unsigned> dep_targets{127u};
+  std::unordered_map<unsigned, unsigned> master_index{{1u, 0u}};
+  unsigned calls = 0;
+
+  GlobalSelection sel = select_global_forward(
+      eq_index, fwd_deps, bwd_deps, full_pivots, dep_targets, master_index,
+      [&](const std::vector<uint32_t> &idx, secred::SubSolve &sub) { ++calls; });
+
+  REQUIRE_EQ(calls, 0u); // the whole point: not even the first round runs
+  REQUIRE(sel.ok);
+  REQUIRE(!sel.fallback);
+  REQUIRE(sel.skipped_repair);
+  REQUIRE_EQ(sel.n_fwd_rows, 3u);
+  REQUIRE_EQ(sel.n_legacy_rows, 3u);
+  REQUIRE_EQ(sel.n_repair_rounds, 0u);
+  REQUIRE_EQ(sel.n_repair_added, 0u);
+  REQUIRE(sel.needed_eq_idx == (std::vector<uint32_t>{0u, 1u, 3u}));
+  // The chain is the targets' backward closure -- the same walk the repair's converged
+  // branch makes, on the graph the full-system learn recorded.
+  REQUIRE(sel.bwd_chain == (std::vector<uint32_t>{127u}));
+
+  // The check is a threshold, not a switch: the derived fixture's backward edge leaves the
+  // forward closure (125 is reachable only through bwd_deps[127]), which is a 50 % prize,
+  // so the production threshold repairs it.
+  LearnCtx c;
+  GlobalSelection wide = run_selection(c);
+  REQUIRE(wide.ok);
+  REQUIRE(!wide.skipped_repair);
+  REQUIRE_EQ(wide.n_repair_rounds, 1u);
+  REQUIRE(wide.needed_eq_idx == (std::vector<uint32_t>{0u, 1u, 2u}));
+}
+
+// The decision line.  Every run states the guard's premise -- both closure sizes and their
+// ratio -- and what the guard did with it, on both branches: a repair that succeeds prints
+// nothing of its own, which in a run's log is indistinguishable from a binary that predates
+// the guard.  The row count has to be read before the caller moves the vector out, or the
+// line quotes a moved-from selection ("0 selected").
+TEST(global_selection_logs_its_decision) {
+  auto capture = [](const GlobalSelection &s) {
+    std::ostringstream out;
+    std::streambuf *old = std::cout.rdbuf(out.rdbuf());
+    log_selection("[test] ", s);
+    std::cout.rdbuf(old);
+    return out.str();
+  };
+
+  LearnCtx c;
+  GlobalSelection repaired = run_selection(c); // the derived fixture: repair, 1 round
+  REQUIRE(!repaired.skipped_repair);
+  const std::string rep = capture(repaired);
+  REQUIRE(rep.find("[test] selection: repaired (") != std::string::npos);
+  REQUIRE(rep.find(std::to_string(repaired.n_repair_rounds) + " round(s), +" +
+                   std::to_string(repaired.n_repair_added) + " integral(s)") !=
+          std::string::npos);
+  REQUIRE(rep.find("forward closure " + std::to_string(repaired.n_fwd_rows) +
+                   " equations") != std::string::npos);
+  REQUIRE(rep.find("legacy closure " + std::to_string(repaired.n_legacy_rows) + " (") !=
+          std::string::npos);
+  REQUIRE(rep.find(std::to_string(repaired.needed_eq_idx.size()) + " selected)") !=
+          std::string::npos);
+  REQUIRE(rep.find("0 selected") == std::string::npos);
+
+  GlobalSelection skipped;
+  skipped.skipped_repair = true;
+  skipped.n_fwd_rows = 3;
+  skipped.n_legacy_rows = 3;
+  const std::string skp = capture(skipped);
+  REQUIRE(skp.find("[test] selection: legacy closure without repair (") !=
+          std::string::npos);
+  REQUIRE(skp.find("3 equations, 0 % over the forward closure)") != std::string::npos);
 }
 
 // Chain invariants: bwd_chain lies among the subset solmap's keys (INV-1) and is closed
