@@ -546,15 +546,16 @@ using secred::SymEq;
 // the per-thread scratch stays an fflow::AlgorithmData around the evaluator's scratch.
 class SymbolicFFRedAlgorithm : public fflow::Algorithm {
 public:
-  SymbolicFFRedAlgorithm(std::vector<SymEq> system,
+  SymbolicFFRedAlgorithm(secred::SymCoeffPool pool,
                          std::vector<uint32_t> eq_idx,
                          std::vector<uint32_t> bwd_chain,
                          std::vector<unsigned> dep_targets,
                          std::unordered_map<unsigned, unsigned> master_index,
-                         unsigned nnindeps, std::vector<GiNaC::ex> symbols)
-      : ev_(std::move(system), std::move(eq_idx), std::move(bwd_chain),
+                         unsigned nnindeps, secred::ReductionItems items,
+                         std::vector<GiNaC::ex> symbols)
+      : ev_(std::move(pool), std::move(eq_idx), std::move(bwd_chain),
             std::move(dep_targets), std::move(master_index), nnindeps,
-            std::move(symbols)) {
+            std::move(items), std::move(symbols)) {
     nparsin.push_back(ev_.n_params());
     nparsout = ev_.n_outputs();
   }
@@ -571,6 +572,8 @@ public:
   void reduce_for_prime(uint64_t p, unsigned nthreads) { ev_.reduce_for_prime(p, nthreads); }
 
   std::size_t n_equations() const { return ev_.n_equations(); }
+  std::size_t n_coefficient_terms() const { return ev_.n_coefficient_terms(); }
+  std::size_t n_distinct_coeffs() const { return ev_.n_distinct_coeffs(); }
 
   fflow::Ret evaluate(fflow::Context *, fflow::AlgInput xin[], fflow::Mod mod,
                       fflow::AlgorithmData *data,
@@ -598,6 +601,14 @@ private:
       std::cerr << "finiteflow symbolic global reduction: coefficients were not "
                    "reduced for prime "
                 << p << "; aborting instead of evaluating the wrong modulus\n";
+    } else if (r == secred::SymbolicFFEvaluator::PointResult::MissingItem) {
+      // The right-hand side carries a master the learn point did not, so the selection
+      // is stale and the item list has no slot for that term.
+      std::cerr << "finiteflow symbolic global reduction: target "
+                << scratch->scratch.fail_target << " reduces to integral "
+                << scratch->scratch.fail_integral
+                << ", a master the learn point did not carry (equation selection is "
+                   "stale); aborting instead of emitting a truncated reduction\n";
     } else {
       // Hard check (as in the numeric path): a non-master on a right-hand side means
       // the selection is stale at this sample point and prime, so the output would
@@ -641,17 +652,18 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   std::cout << "\n  " << secred::kFlowTag << " reading spill file, building symbolic "
                "system...\n";
 
-  // 1) Read the spill file into vector<SymEq> (descending (id, symbolic polynomial)).
-  std::vector<SymEq> system;
+  // 1) Read the spill file into an interned pool: descending (integral id, coefficient
+  // slot) rows over the distinct coefficients, never a system of per-term objects.
+  secred::SymCoeffPool pool;
   secred::SpillReadStats stats;
   std::string read_error;
-  if (!secred::read_spill_symbolic(raw_equations_path, integral_id, symbols, system,
-                                   stats, read_error)) {
+  if (!secred::read_spill_interned(raw_equations_path, integral_id, symbols, pool, stats,
+                                   read_error)) {
     std::cerr << "finiteflow symbolic global reduction: " << read_error << "\n";
     res.ok = false;
     return res;
   }
-  const unsigned neqs = system.size();
+  const unsigned neqs = static_cast<unsigned>(pool.n_equations());
   if (neqs == 0) {
     std::cerr << "finiteflow symbolic global reduction: empty system\n";
     return res;
@@ -685,7 +697,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
   // the masters, the mark-and-sweep selection and both report blocks (symbolic_ffred.h).
   const uint64_t learn_prime = ff::BIG_UINT_PRIMES[0];
   secred::SymbolicGlobalLearn learn = secred::symbolic_global_learn(
-      system, target_ids, all_integrals, symbols, learn_prime, masters_final_path,
+      pool, target_ids, all_integrals, symbols, learn_prime, masters_final_path,
       secred::kFlowTag, narrowing_success, narrowing_fail, raw_equations_total,
       global_equations_count);
   if (!learn.ok) {
@@ -705,15 +717,20 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
 
   // `dep_targets` is copied, not moved: the output assembly below still needs it to map
   // a target id to its row of the reconstructed matrix.
-  SymbolicFFRedAlgorithm alg(std::move(system), std::move(learn.needed_eq_idx),
+  SymbolicFFRedAlgorithm alg(std::move(pool), std::move(learn.needed_eq_idx),
                              std::move(learn.bwd_chain), learn.dep_targets,
-                             std::move(learn.master_index), nnindeps,
+                             std::move(learn.master_index), nnindeps, learn.items,
                              std::move(symbol_ex));
 
   const unsigned nparsout = alg.nparsout;
-  std::cout << "\n  " << secred::kFlowTag << " reconstruct (rational-function, "
-            << nparsout << " outputs = " << nndeps << " targets x " << nnindeps
-            << " masters)...\n";
+  std::cout << "\n  " << secred::kFlowTag << " reconstruct (rational-function): "
+            << nparsout << " function(s) will be interpolated (the non-zero entries of a "
+            << nndeps << " x " << nnindeps << " target x master block)\n";
+  // Kira accounts for the same system as "Parsed N functions of which M are distinct";
+  // ours are interned the same way, so the per-point cost is the distinct count.
+  std::cout << "  " << secred::kFlowTag << " " << alg.n_coefficient_terms()
+            << " function(s) to evaluate per sample point, of which "
+            << alg.n_distinct_coeffs() << " are distinct\n";
 
   ff::ReconstructionOptions opt;
   opt.max_primes = 5; // CRT prime cap for the coefficient reconstruction
@@ -912,12 +929,12 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     if (dit == dep_index.end())
       continue; // the target is itself a master
     unsigned i = dit->second;
-    for (unsigned j = 0; j < nnindeps; ++j) {
-      const ff::MPReconstructedRatFun &r = recf[(std::size_t)i * nnindeps + j];
+    for (unsigned q = learn.items.begin[i]; q < learn.items.begin[i + 1]; ++q) {
+      const ff::MPReconstructedRatFun &r = recf[q];
       if (r.numerator().size() == 0)
-        continue; // zero coefficient
-      res.reductions.emplace_back(all_integrals[learn.masters[j]],
-                                  r.to_str(varnames.data()));
+        continue; // zero coefficient: not a term of the reduction
+      res.reductions.emplace_back(
+          all_integrals[learn.masters[learn.items.col[q]]], r.to_str(varnames.data()));
     }
   }
 

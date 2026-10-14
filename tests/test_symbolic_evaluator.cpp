@@ -38,28 +38,57 @@ secred::SymCoeff coeff(const std::string &text,
 
 }  // namespace
 
-// The system the evaluator tests share, with the master set given by `masters`
-// (master id -> column).  The default is the correct one: [0,0] alone.
-secred::SymbolicFFEvaluator evaluator_of(
-    std::unordered_map<unsigned, unsigned> master_index = {{0, 0}}) {
+// The item table the learn builds for one target: an entry for every master on the
+// target's right-hand side, in descending id, with the row boundaries in `begin`.
+secred::ReductionItems items_of(
+    const std::unordered_map<unsigned, unsigned> &master_index) {
+  secred::ReductionItems items;
+  items.begin.push_back(0);
+  if (master_index.count(0)) {
+    items.master.push_back(0);
+    items.col.push_back(master_index.at(0));
+  }
+  items.begin.push_back(static_cast<std::uint32_t>(items.master.size()));
+  return items;
+}
+
+// The system the evaluator tests share, kept separate from the evaluator so the tests
+// can drive the per-entry evaluation path over the same equations.
+std::vector<secred::SymEq> raw_system() {
   const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"),
                                                  GiNaC::possymbol("s")};
-  std::vector<secred::SymEq> system = {
+  return {
       eq_of({{3, coeff("1", symbols)}, {1, coeff("(-2+d)/d", symbols)},
              {2, coeff("1/d", symbols)}, {0, coeff("3", symbols)}}),
       eq_of({{2, coeff("1", symbols)}, {0, coeff("(d-4)/s", symbols)}}),
       eq_of({{1, coeff("1", symbols)}, {0, coeff("(2*d)/s", symbols)}}),
   };
+}
+
+// The same system with the master set given by `masters` (master id -> column).  The
+// default is the correct one: [0,0] alone.  `carry_items` false gives the target an
+// empty item row -- the table a learn point that carried nothing on that right-hand
+// side would leave behind.
+secred::SymbolicFFEvaluator evaluator_of(
+    std::unordered_map<unsigned, unsigned> master_index = {{0, 0}},
+    bool carry_items = true) {
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"),
+                                                 GiNaC::possymbol("s")};
+  std::vector<secred::SymEq> system = raw_system();
   std::vector<std::uint32_t> eq_idx = {0, 1, 2};
   std::vector<std::uint32_t> bwd_chain = {1, 2, 3};
   std::vector<unsigned> dep_targets = {3};
   std::vector<GiNaC::ex> symbol_ex = {GiNaC::ex(symbols[0]), GiNaC::ex(symbols[1])};
   const unsigned nnindeps = master_index.empty() ? 1u
                              : static_cast<unsigned>(master_index.size());
-  return secred::SymbolicFFEvaluator(std::move(system), std::move(eq_idx),
+  secred::ReductionItems items = carry_items ? items_of(master_index)
+                                             : secred::ReductionItems{{}, {}, {0, 0}};
+  secred::SymCoeffPool pool;   // the whole system; eq_idx names the rows to keep
+  secred::intern_sym_system(system, pool);
+  return secred::SymbolicFFEvaluator(std::move(pool), std::move(eq_idx),
                                      std::move(bwd_chain), std::move(dep_targets),
                                      std::move(master_index), nnindeps,
-                                     std::move(symbol_ex));
+                                     std::move(items), std::move(symbol_ex));
 }
 
 // One target one symbol-power deeper than `evaluator_of()`'s system:
@@ -72,8 +101,10 @@ secred::SymbolicFFEvaluator big_evaluator() {
   std::vector<secred::SymEq> system = {
       eq_of({{1, coeff("1", symbols)}, {0, coeff("d^4/s", symbols)}})};
   std::vector<GiNaC::ex> symbol_ex = {GiNaC::ex(symbols[0]), GiNaC::ex(symbols[1])};
-  return secred::SymbolicFFEvaluator(std::move(system), {0}, {1}, {1}, {{0, 0}}, 1,
-                                     std::move(symbol_ex));
+  secred::SymCoeffPool pool;
+  secred::intern_sym_system(system, pool);
+  return secred::SymbolicFFEvaluator(std::move(pool), {0}, {1}, {1}, {{0, 0}}, 1,
+                                     items_of({{0, 0}}), std::move(symbol_ex));
 }
 
 TEST(symbolic_evaluator_flattens_the_target_reduction) {
@@ -192,6 +223,113 @@ TEST(symbolic_evaluator_reports_a_non_master_rhs) {
   REQUIRE_EQ(scratch.fail_integral, 0u);
 }
 
+// A master with a non-zero coefficient that the learn point did not carry on that
+// right-hand side: the item list has no slot for the term, so the output would be a
+// truncated reduction.  Reported, never silently dropped.
+TEST(symbolic_evaluator_reports_an_item_the_learn_point_missed) {
+  secred::SymbolicFFEvaluator ev =
+      evaluator_of({{0, 0}}, /*carry_items=*/false);   // [0,0] is a master, but no item
+  REQUIRE_EQ(ev.n_outputs(), 0u);
+  const std::uint64_t p = 1125899906842597ULL;
+  ev.reduce_for_prime(p, 1);
+  secred::SymbolicFFEvaluator::Scratch scratch;
+  const std::uint64_t x[2] = {5, 7};
+  std::uint64_t out[1] = {0};
+  REQUIRE(ev.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::MissingItem);
+  REQUIRE_EQ(scratch.fail_target, 3u);
+  REQUIRE_EQ(scratch.fail_integral, 0u);
+}
+
+// The output block is the item list, not the target x master block: n_outputs() is its
+// length, and an empty list means the reconstruction has nothing to do.  (Every cell the
+// item list leaves out is a structurally zero coefficient, which FireFly would otherwise
+// interpolate an explicit zero for.)
+TEST(symbolic_evaluator_outputs_are_the_item_list) {
+  REQUIRE_EQ(evaluator_of().n_outputs(), 1u);                     // one master, one item
+  REQUIRE_EQ(evaluator_of({{0, 0}}, false).n_outputs(), 0u);      // no items
+}
+
+// The three per-phase counters the driver turns into its Kira-style "probe solution
+// steps" line.  A scratch outlives one evaluator, so the counters accumulate and the
+// caller reads deltas.
+TEST(symbolic_evaluator_counts_the_three_probe_phases) {
+  secred::SymbolicFFEvaluator ev = evaluator_of();
+  const std::uint64_t p = 1125899906842597ULL;
+  ev.reduce_for_prime(p, 1);
+  secred::SymbolicFFEvaluator::Scratch scratch;
+  const std::uint64_t x[2] = {5, 7};
+  std::uint64_t out[1] = {0};
+  REQUIRE_EQ(scratch.eval_seconds, 0.0);
+  REQUIRE_EQ(scratch.fwd_seconds, 0.0);
+  REQUIRE_EQ(scratch.bwd_seconds, 0.0);
+  REQUIRE(ev.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  REQUIRE(scratch.eval_seconds > 0.0);   // fill + substitute + reduce
+  REQUIRE(scratch.fwd_seconds > 0.0);    // forward elimination
+  REQUIRE(scratch.bwd_seconds > 0.0);    // back substitution
+  const double first = scratch.eval_seconds;
+  REQUIRE(ev.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  REQUIRE(scratch.eval_seconds > first);   // the second point adds to the same counters
+}
+
+// The reconstruction evaluates each *distinct* function once per sample point and reads
+// every other entry out of the table (Kira's model: "Parsed 8040387 functions of which
+// 1617 are distinct"), so the evaluator reports what the table costs: one entry per
+// equation term, one slot per distinct function.  The tiny system has 8 terms -- the
+// constant `1` stands in all three equations -- and six distinct functions.
+TEST(symbolic_evaluator_interns_the_system_coefficients) {
+  secred::SymbolicFFEvaluator ev = evaluator_of();
+  REQUIRE_EQ(ev.n_equations(), std::size_t(3));
+  REQUIRE_EQ(ev.n_coefficient_terms(), std::size_t(8));
+  REQUIRE_EQ(ev.n_distinct_coeffs(), std::size_t(6));
+}
+
+// The interned path must be the per-entry path: the table holds exactly the residues the
+// entries would evaluate, and the elimination that reads them solves to the same map.
+TEST(symbolic_evaluator_matches_the_per_entry_evaluation) {
+  const std::uint64_t p = 1125899906842597ULL;
+  const std::uint64_t x[2] = {5, 7};
+
+  // Reference: every entry evaluated on its own, eliminated, back-substituted.
+  std::vector<secred::SymEq> raw = raw_system();
+  secred::reduce_sym_system(raw, p);
+  const std::vector<std::vector<uint64_t>> pw = secred::make_powers(raw, x, 2, p);
+  std::vector<secred::ResEq> res_eqs;
+  std::vector<std::uint32_t> sys_idx;
+  REQUIRE(secred::eval_sym_eqs_mod(raw, {0u, 1u, 2u}, GiNaC::exmap(), pw, p, res_eqs,
+                                   sys_idx));
+  std::unordered_map<std::uint32_t, secred::ResEq> want;
+  secred::forward_eliminate(res_eqs, sys_idx, p, want, nullptr, nullptr);
+  const std::vector<std::uint32_t> chain = {1, 2, 3};   // the evaluator's bwd_chain_
+  secred::backward_eliminate(want, p, nullptr, &chain);
+
+  secred::SymbolicFFEvaluator ev = evaluator_of();
+  ev.reduce_for_prime(p, 1);
+  secred::SymbolicFFEvaluator::Scratch scratch;
+  std::uint64_t out[1] = {0};
+  REQUIRE(ev.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  // Same pivots, same right-hand sides: the evaluator's store against the reference map.
+  std::size_t n_rows = 0;
+  for (std::uint32_t id = 0; id < 4u; ++id) {
+    const auto it = want.find(id);
+    REQUIRE_EQ(scratch.store.has_row(id), it != want.end());
+    if (it == want.end())
+      continue;
+    ++n_rows;
+    secred::ResEq row;
+    for (std::uint32_t i = 0; i < scratch.store.row_size(id); ++i)
+      row.emplace_back(scratch.store.row_ids(id)[i], scratch.store.row_vals(id)[i]);
+    REQUIRE(row == it->second);
+  }
+  REQUIRE_EQ(n_rows, want.size());
+  // The point holds one residue per distinct function -- the pool's -- and no numeric copy
+  // of the system: the elimination reads the rows out of the pool's table.
+  REQUIRE_EQ(scratch.values.size(), ev.n_distinct_coeffs());
+}
+
 TEST(symbolic_global_learn_picks_the_same_selection_every_time) {
   const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"),
                                                  GiNaC::possymbol("s")};
@@ -207,11 +345,14 @@ TEST(symbolic_global_learn_picks_the_same_selection_every_time) {
                                               RawIntegral(std::vector<int>{0, 1}),
                                               RawIntegral(std::vector<int>{1, 1})};
   std::vector<secred::SymEq> a = build(), b = build();
+  secred::SymCoeffPool pa, pb;
+  secred::intern_sym_system(a, pa);
+  secred::intern_sym_system(b, pb);
   const secred::SymbolicGlobalLearn la =
-      secred::symbolic_global_learn(a, {3}, integrals, symbols, 1125899906842597ULL,
+      secred::symbolic_global_learn(pa, {3}, integrals, symbols, 1125899906842597ULL,
                                     "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
   const secred::SymbolicGlobalLearn lb =
-      secred::symbolic_global_learn(b, {3}, integrals, symbols, 1125899906842597ULL,
+      secred::symbolic_global_learn(pb, {3}, integrals, symbols, 1125899906842597ULL,
                                     "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
   REQUIRE(la.ok);
   REQUIRE_EQ(la.nnindeps, 1u);                        // one master: [0,0]
@@ -220,16 +361,51 @@ TEST(symbolic_global_learn_picks_the_same_selection_every_time) {
   REQUIRE_EQ(la.masters, lb.masters);                 // deterministic, no clock, no rng
   REQUIRE_EQ(la.needed_eq_idx, lb.needed_eq_idx);
   REQUIRE_EQ(la.bwd_chain, lb.bwd_chain);
+  REQUIRE(la.items.master == lb.items.master);
+  REQUIRE(la.items.col == lb.items.col);
+  REQUIRE(la.items.begin == lb.items.begin);
+}
+
+// The item table the learn leaves for the reconstruction: one entry per master on the
+// target's reduced right-hand side, at the learning point, read straight off the solved
+// map the selection check already built.  Its length is what the driver reconstructs.
+TEST(symbolic_global_learn_builds_the_item_list) {
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"),
+                                                 GiNaC::possymbol("s")};
+  std::vector<secred::SymEq> system = {
+      eq_of({{3, coeff("1", symbols)}, {1, coeff("(-2+d)/d", symbols)},
+             {2, coeff("1/d", symbols)}, {0, coeff("3", symbols)}}),
+      eq_of({{2, coeff("1", symbols)}, {0, coeff("(d-4)/s", symbols)}}),
+      eq_of({{1, coeff("1", symbols)}, {0, coeff("(2*d)/s", symbols)}})};
+  secred::SymCoeffPool pool;
+  secred::intern_sym_system(system, pool);
+  const std::vector<RawIntegral> integrals = {RawIntegral(std::vector<int>{0, 0}),
+                                              RawIntegral(std::vector<int>{1, 0}),
+                                              RawIntegral(std::vector<int>{0, 1}),
+                                              RawIntegral(std::vector<int>{1, 1})};
+  const secred::SymbolicGlobalLearn l =
+      secred::symbolic_global_learn(pool, {3}, integrals, symbols, 1125899906842597ULL,
+                                    "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
+  REQUIRE(l.ok);
+  REQUIRE_EQ(l.dep_targets.size(), std::size_t(1));
+  REQUIRE_EQ(l.items.begin.size(), l.dep_targets.size() + 1);   // one row boundary each
+  REQUIRE_EQ(l.items.size(), std::size_t(1));   // [1,1] reduces to [0,0] alone
+  REQUIRE_EQ(l.items.master[0], 0u);
+  REQUIRE_EQ(l.items.col[0], 0u);               // the column [0,0] has in the basis
+  REQUIRE_EQ(l.items.begin[0], 0u);
+  REQUIRE_EQ(l.items.begin[1], 1u);
 }
 
 TEST(symbolic_global_learn_reports_a_target_that_is_a_master) {
   const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d")};
   std::vector<secred::SymEq> system = {eq_of({{1, coeff("1", symbols)},
                                               {0, coeff("d", symbols)}})};
+  secred::SymCoeffPool pool;
+  secred::intern_sym_system(system, pool);
   const std::vector<RawIntegral> integrals = {RawIntegral(std::vector<int>{0}),
                                               RawIntegral(std::vector<int>{1})};
   const secred::SymbolicGlobalLearn l =
-      secred::symbolic_global_learn(system, {0}, integrals, symbols, 1125899906842597ULL,
+      secred::symbolic_global_learn(pool, {0}, integrals, symbols, 1125899906842597ULL,
                                     "/tmp/secred_test_masters_final", "[test]", 0, 0, 0, 0);
   REQUIRE(l.ok);
   REQUIRE_EQ(l.dep_targets.size(), std::size_t(0));   // [0] never becomes a pivot

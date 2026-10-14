@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "ffred_solver.h"
+#include "sector.h"  // RawIntegral
 
 namespace secred {
 
@@ -93,6 +94,25 @@ inline std::vector<unsigned> sector_masters(const SubSolve &learn,
       m.insert(it->second[k].first);
   }
   return std::vector<unsigned>(m.rbegin(), m.rend()); // descending id = ascending column
+}
+
+// Stage B's seed set: the sector's own masters, in the order `needed_indep` fixes.
+// Only a relation carrying a master can cut a redundant master in the global stage,
+// so those are the seeds the symmetry expansion walks -- the admitted-seed set the
+// IBP system is built on would expand every seed a second time for relations the
+// reduction never reads.  A needed independent variable at or above `nvars` is a
+// subsector integral, not a seed of this sector: it travels up through
+// ctx.uptargets, and it carries no relation here.  A master is `needed_indep[i] <
+// nvars` and lives in `seeds` at rank `nvars - 1 - id`.
+inline std::vector<RawIntegral> symmetry_seed_masters(
+    const std::vector<std::size_t> &needed_indep,
+    const std::vector<RawIntegral> &seeds, unsigned nvars) {
+  std::vector<RawIntegral> out;
+  out.reserve(needed_indep.size());
+  for (std::size_t id : needed_indep)
+    if (id < nvars)
+      out.push_back(seeds[nvars - 1 - id]);
+  return out;
 }
 
 // Legacy closure (the counterpart of fflow mark_and_sweep_eqs): BFS from the seeds along

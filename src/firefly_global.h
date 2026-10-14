@@ -80,6 +80,7 @@ public:
   std::vector<FFTemp> operator()(const std::vector<FFTemp> &x) {
     using Lane = FireFlyLane<FFTemp>;
     probes_.fetch_add(1, std::memory_order_relaxed);
+    points_.fetch_add(Lane::lanes, std::memory_order_relaxed);
     std::vector<FFTemp> out(n_outputs());
     if (hard_failure_.load(std::memory_order_relaxed))
       return out; // zeros
@@ -106,19 +107,29 @@ public:
             ev_.evaluate_point(p, point.data(), scratch,
                                &values[static_cast<std::size_t>(l) * n]);
         if (r != SymbolicFFEvaluator::PointResult::Ok) {
-          // NotReduced cannot happen with the tables right; NonMasterRhs is the hard
-          // failure the driver reports after reconstruct() returns.  Either way the
-          // answer would be wrong, so no later probe is allowed to produce one.
+          // NotReduced cannot happen with the tables right; NonMasterRhs and MissingItem
+          // are the hard failures the driver reports after reconstruct() returns.  Either
+          // way the answer would be wrong, so no later probe is allowed to produce one.
           hard_failure_.store(true, std::memory_order_relaxed);
+          fail_reason_.store(static_cast<int>(r), std::memory_order_relaxed);
           fail_target_.store(scratch.fail_target, std::memory_order_relaxed);
           fail_integral_.store(scratch.fail_integral, std::memory_order_relaxed);
           return out;
         }
         // `Scratch::zero_dens` accumulates over the scratch's whole life, so count the
-        // delta: the reported figure is a number of sample points, not a running sum.
+        // delta: the reported figure counts (point, distinct coefficient) pairs, not a
+        // running sum.
         std::uint64_t &reported = reported_zero_dens();
         bad_points_.fetch_add(scratch.zero_dens - reported, std::memory_order_relaxed);
         reported = scratch.zero_dens;
+        // The per-phase timers accumulate the same way.
+        PhaseSeconds &rep = reported_phase();
+        eval_ns_.fetch_add(ns_since(rep.eval, scratch.eval_seconds),
+                           std::memory_order_relaxed);
+        fwd_ns_.fetch_add(ns_since(rep.fwd, scratch.fwd_seconds),
+                          std::memory_order_relaxed);
+        bwd_ns_.fetch_add(ns_since(rep.bwd, scratch.bwd_seconds),
+                          std::memory_order_relaxed);
       }
       for (unsigned i = 0; i < n; ++i)
         out[i] = Lane::make(&values[static_cast<std::size_t>(i)], n); // lane-major read
@@ -127,9 +138,22 @@ public:
   }
 
   std::uint64_t probes() const { return probes_.load(std::memory_order_relaxed); }
+  std::uint64_t points() const { return points_.load(std::memory_order_relaxed); }
   std::uint64_t bad_points() const { return bad_points_.load(std::memory_order_relaxed); }
   std::uint64_t primes() const { return primes_.load(std::memory_order_relaxed); }
+  // Seconds spent in each step of the per-point solve, summed over every lane of every
+  // probe: what the driver turns into the Kira-style "probe solution steps" line.
+  double eval_seconds() const { return eval_ns_.load(std::memory_order_relaxed) * 1e-9; }
+  double fwd_seconds() const { return fwd_ns_.load(std::memory_order_relaxed) * 1e-9; }
+  double bwd_seconds() const { return bwd_ns_.load(std::memory_order_relaxed) * 1e-9; }
   bool hard_failure() const { return hard_failure_.load(std::memory_order_relaxed); }
+  // Which PointResult stopped the run, as its own enum (0 == Ok): the driver needs to
+  // tell "a right-hand side carried a master we never learned" (MissingItem, a stale or
+  // incomplete learn) from "a right-hand side carried a non-master" (NonMasterRhs).
+  SymbolicFFEvaluator::PointResult fail_reason() const {
+    return static_cast<SymbolicFFEvaluator::PointResult>(
+        fail_reason_.load(std::memory_order_relaxed));
+  }
   unsigned fail_target() const { return fail_target_.load(std::memory_order_relaxed); }
   unsigned fail_integral() const { return fail_integral_.load(std::memory_order_relaxed); }
 
@@ -157,15 +181,35 @@ private:
     return reported;
   }
 
+  struct PhaseSeconds {
+    double eval, fwd, bwd;
+  };
+  static PhaseSeconds &reported_phase() {
+    thread_local PhaseSeconds reported{0.0, 0.0, 0.0};
+    return reported;
+  }
+  // The scratch accumulates for its whole life, so this probe's contribution is the
+  // difference from what the previous probe at this thread reported.
+  static std::uint64_t ns_since(double &reported, double now) {
+    const double d = now - reported;
+    reported = now;
+    return d > 0.0 ? static_cast<std::uint64_t>(d * 1e9) : 0;
+  }
+
   SymbolicFFEvaluator &ev_;
   unsigned nthreads_;
   std::shared_mutex mutex_;
   std::atomic<std::uint64_t> cur_prime_{0};
   std::atomic<std::uint64_t> reduced_prime_{0};
   std::atomic<std::uint64_t> probes_{0};
+  std::atomic<std::uint64_t> points_{0};
   std::atomic<std::uint64_t> bad_points_{0};
+  std::atomic<std::uint64_t> eval_ns_{0};
+  std::atomic<std::uint64_t> fwd_ns_{0};
+  std::atomic<std::uint64_t> bwd_ns_{0};
   std::atomic<std::uint64_t> primes_{0};
   std::atomic<bool> hard_failure_{false};
+  std::atomic<int> fail_reason_{0}; // SymbolicFFEvaluator::PointResult, 0 == Ok
   std::atomic<unsigned> fail_target_{0};
   std::atomic<unsigned> fail_integral_{0};
 };

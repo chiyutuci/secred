@@ -324,8 +324,8 @@ bool round_trip(const secred::RowNum &num, std::uint32_t q, const secred::RowVar
   secred::SymCoeff got;
   if (!secred::parse_spill_coeff(text.data(), text.data() + text.size(), sym_index, got))
     return false;
-  return got.precompiled && sym_poly_equal(got.num, want_num) &&
-         sym_poly_equal(got.den, want_den);
+  return got.precompiled && ::sym_poly_equal(got.num, want_num) &&
+         ::sym_poly_equal(got.den, want_den);
 }
 
 }  // namespace
@@ -454,7 +454,7 @@ TEST(spill_symbolic_falls_back_to_ginac_and_counts_it) {
   REQUIRE_EQ(system.size(), std::size_t(1));
   REQUIRE_EQ(system[0].size(), std::size_t(1));
   REQUIRE_EQ(stats.fallbacks, std::uint64_t(1));
-  REQUIRE(sym_poly_equal(system[0][0].second.num,
+  REQUIRE(::sym_poly_equal(system[0][0].second.num,
                          secred::SymPoly{{{cln::cl_I(1), {{0, 2}}},
                                           {cln::cl_I(-1), {{0, 1}}},
                                           {cln::cl_I(-2), {}}}}));
@@ -499,10 +499,66 @@ TEST(spill_symbolic_matches_the_reference_reader) {
     REQUIRE_EQ(ours[i].size(), theirs[i].size());
     for (std::size_t j = 0; j < ours[i].size(); ++j) {
       REQUIRE_EQ(ours[i][j].first, theirs[i][j].first);
-      REQUIRE(sym_poly_equal(ours[i][j].second.num, theirs[i][j].second.num));
-      REQUIRE(sym_poly_equal(ours[i][j].second.den, theirs[i][j].second.den));
+      REQUIRE(::sym_poly_equal(ours[i][j].second.num, theirs[i][j].second.num));
+      REQUIRE(::sym_poly_equal(ours[i][j].second.den, theirs[i][j].second.den));
     }
   }
   REQUIRE_EQ(stats.fallbacks, std::uint64_t(1));
   REQUIRE_EQ(stats.terms, their_terms);
+}
+
+// The production reader against the reader it is built from: interning during the scan
+// must assign exactly the rows and the slots a scan followed by `intern_sym_system`
+// assigns, over a file with a zero term (dropped), a fallback coefficient, a re-spelled
+// repeat and an equation whose coefficient all vanish.  Anything less and a pool read
+// during the scan would not be the pool the learn and the evaluator expect.
+TEST(spill_interned_matches_the_materialising_reader_term_for_term) {
+  const std::string p = write_spill("symintern",
+      term_line({1, 1}, "3/2*d+1/2") + term_line({0, 1}, "(d-2)/(2*m^2)") +
+          term_line({2, 2}, "7") + "\n" +
+      term_line({1, 0}, "d") + term_line({0, 0}, "3/2*d+1/2") + "\n" +
+      term_line({0, 0}, "(d-2)*(d+1)/(2*m^2)") + "\n" +   // outside the fast grammar
+      term_line({1, 0}, "0") + "\n" +                     // a zero term leaves a row behind
+      term_line({0, 0}, "1/3*s-2/5") + term_line({1, 0}, "(d-2)/(2*m^2)") + "\n" + "\n");
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d"), GiNaC::possymbol("s"),
+                                                 GiNaC::possymbol("t"), GiNaC::possymbol("m")};
+
+  std::vector<secred::SymEq> system;
+  secred::SpillReadStats materialising;
+  std::string error;
+  REQUIRE(secred::read_spill_symbolic(p, ids, symbols, system, materialising, error));
+  secred::SymCoeffPool reference;
+  secred::intern_sym_system(system, reference);
+
+  secred::SymCoeffPool pool;
+  secred::SpillReadStats interned;
+  REQUIRE(secred::read_spill_interned(p, ids, symbols, pool, interned, error));
+
+  REQUIRE(pool.terms == reference.terms);
+  REQUIRE(pool.eq_begin == reference.eq_begin);
+  REQUIRE_EQ(pool.coeffs.size(), reference.coeffs.size());
+  REQUIRE_EQ(interned.equations, materialising.equations);
+  REQUIRE_EQ(interned.terms, materialising.terms);
+  REQUIRE_EQ(interned.fallbacks, materialising.fallbacks);
+  REQUIRE_EQ(interned.skipped_unknown, materialising.skipped_unknown);
+  // The repeated `3/2*d+1/2` and `(d-2)/(2*m^2)` intern to the slots their first
+  // occurrences took, which is what makes the whole system cost 8 B per term.
+  REQUIRE_EQ(pool.n_equations(), std::size_t(5));
+  REQUIRE_EQ(pool.n_terms(), std::size_t(7));
+  REQUIRE_EQ(pool.coeffs.size(), std::size_t(5));   // seven entries, five functions
+  REQUIRE_EQ(pool.terms[0].second, pool.terms[3].second);
+  REQUIRE_EQ(pool.terms[1].second, pool.terms[5].second);
+}
+
+// The interned reader errors out on the same input the materialising one does.
+TEST(spill_interned_reports_an_unparsable_coefficient) {
+  const std::string p = write_spill("syminternbad", term_line({1, 1}, "d +") + "\n");
+  const auto ids = ids_of({{0, 0}, {1, 1}});
+  const std::vector<GiNaC::possymbol> symbols = {GiNaC::possymbol("d")};
+  secred::SymCoeffPool pool;
+  secred::SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_interned(p, ids, symbols, pool, stats, error));
+  REQUIRE(error.find("cannot parse coefficient") != std::string::npos);
 }

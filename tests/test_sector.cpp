@@ -1,5 +1,6 @@
 #include "test_runner.h"
 #include "sector.h"
+#include "sector_engine.h"
 
 #include <algorithm>
 #include <array>
@@ -1635,4 +1636,52 @@ TEST(round_action_treats_a_lone_repair_hint_as_a_report) {
   // not be taken for one that settled.
   REQUIRE(round_action(0, 4) == RoundAction::Widen);
   REQUIRE(round_action(kMaxRounds - 1, 4) == RoundAction::GiveUp);
+}
+
+// ---------------------------------------------------------------------------
+// Stage B: which seeds the symmetry expansion walks.  The relations exist to cut
+// redundant masters in the global stage, so the seed set is this sector's own
+// masters -- not the admitted seed set the IBP system is built on, which expands
+// every seed a second time for relations nothing reads.
+// ---------------------------------------------------------------------------
+
+using secred::symmetry_seed_masters;
+
+TEST(symmetry_seed_masters_keeps_only_the_sectors_own_masters) {
+  // Rank r of a sector's seed list is seeds[nvars-1-r], so with nvars = 5 the ids
+  // 4..0 name seeds 0..4.  needed_indep arrives descending in id, the order
+  // sector_masters leaves it in.
+  const std::vector<RawIntegral> seeds = {RI({1, 0, 0, 0}), RI({0, 1, 0, 0}),
+                                          RI({0, 0, 1, 0}), RI({0, 0, 0, 1}),
+                                          RI({1, 1, 0, 0})};
+  // id 6 is at or above nvars: a subsector integral, which travels up through
+  // ctx.uptargets and carries no relation of this sector.
+  const std::vector<RawIntegral> got =
+      symmetry_seed_masters({6u, 3u, 1u, 0u}, seeds, 5u);
+  REQUIRE(got.size() == 3u);
+  REQUIRE(got[0] == seeds[1]);  // id 3
+  REQUIRE(got[1] == seeds[3]);  // id 1
+  REQUIRE(got[2] == seeds[4]);  // id 0
+
+  // The seeds the local reduction already expressed carry no relation.  This
+  // exclusion is the rule, so pin it, not only the ids that do come through.
+  REQUIRE(std::find(got.begin(), got.end(), seeds[0]) == got.end());
+  REQUIRE(std::find(got.begin(), got.end(), seeds[2]) == got.end());
+}
+
+TEST(symmetry_seed_masters_follows_needed_indep_order) {
+  const std::vector<RawIntegral> seeds = {RI({1, 0}), RI({0, 1}), RI({1, 1})};
+  const std::vector<RawIntegral> got =
+      symmetry_seed_masters({1u, 0u, 2u}, seeds, 3u);
+  REQUIRE(got.size() == 3u);
+  REQUIRE(got[0] == seeds[1]);
+  REQUIRE(got[1] == seeds[2]);
+  REQUIRE(got[2] == seeds[0]);
+}
+
+TEST(symmetry_seed_masters_is_empty_when_no_master_is_a_seed) {
+  const std::vector<RawIntegral> seeds = {RI({1, 0}), RI({0, 1})};
+  REQUIRE(symmetry_seed_masters({}, seeds, 2u).empty());
+  // Every entry at or above nvars: subsector integrals only.
+  REQUIRE(symmetry_seed_masters({3u, 2u}, seeds, 2u).empty());
 }

@@ -303,11 +303,36 @@ struct DumSink {
   }
 };
 
-// The symbolic sink: the strict grammar first, the GiNaC parser (with the expand +
-// zero-drop + make_sym_coeff pipeline the old reader ran) only for what it refuses.
-// `started` keeps the old reader's equation bookkeeping: it pushed an equation as soon
-// as one of its terms had a known integral, even when every coefficient then turned out
-// to be zero -- such an equation stays in the system, empty.
+// Read one coefficient span the way both sinks need it: the strict grammar first, the
+// GiNaC parser (with the expand + make_sym_coeff pipeline the old reader ran) only for
+// what it refuses.  `Zero` is the grammar's spelling of a zero polynomial -- the reader
+// drops such a term, as the old one did -- and `Fail` means neither parse worked, with
+// `error` set.
+enum class CoeffText { Ok, Zero, Fail };
+
+CoeffText parse_coeff_text(const char *b, const char *e,
+                           const std::unordered_map<std::string, unsigned> &sym_index,
+                           GiNaC::parser &parser, SymCoeff &out, SpillReadStats &stats,
+                           std::string &error) {
+  if (parse_spill_coeff(b, e, sym_index, out))
+    return out.num.terms.empty() ? CoeffText::Zero : CoeffText::Ok;
+  ++stats.fallbacks;
+  try {
+    GiNaC::ex ex = parser(std::string(b, e));
+    ex = ex.expand();
+    if (ex.is_zero())
+      return CoeffText::Zero;
+    out = make_sym_coeff(ex, sym_index);
+  } catch (const std::exception &ex2) {
+    error = "cannot parse coefficient '" + std::string(b, e) + "': " + ex2.what();
+    return CoeffText::Fail;
+  }
+  return CoeffText::Ok;
+}
+
+// The symbolic sink: `started` keeps the old reader's equation bookkeeping.  It pushed
+// an equation as soon as one of its terms had a known integral, even when every
+// coefficient then turned out to be zero -- such an equation stays in the system, empty.
 struct SymbolicSink {
   std::vector<SymEq> &system;
   const std::unordered_map<std::string, unsigned> &sym_index;
@@ -320,21 +345,11 @@ struct SymbolicSink {
   bool term(unsigned id, const char *b, const char *e) {
     started = true;
     SymCoeff c;
-    if (!parse_spill_coeff(b, e, sym_index, c)) {
-      ++stats.fallbacks;
-      try {
-        GiNaC::ex ex = parser(std::string(b, e));
-        ex = ex.expand();
-        if (ex.is_zero())
-          return true;
-        c = make_sym_coeff(ex, sym_index);
-      } catch (const std::exception &ex2) {
-        error = "cannot parse coefficient '" + std::string(b, e) + "': " + ex2.what();
-        return false;
-      }
-    } else if (c.num.terms.empty()) {
-      return true; // the empty sum prints as `0`
-    }
+    const CoeffText r = parse_coeff_text(b, e, sym_index, parser, c, stats, error);
+    if (r == CoeffText::Fail)
+      return false;
+    if (r == CoeffText::Zero)
+      return true;
     eq.emplace_back(id, std::move(c));
     return true;
   }
@@ -353,6 +368,48 @@ struct SymbolicSink {
     stats.equations += 1;
     stats.terms += out.size();
     system.push_back(std::move(out));
+  }
+};
+
+// The interned sink: the same scan and the same equation bookkeeping, but a term keeps
+// only its slot.  A coefficient is interned the moment it is parsed, so the system is
+// the pool's term table plus one object per distinct function -- for F234, 8 B per term
+// against a `SymCoeff` per term.  The row order, the row boundaries and the slots are
+// the ones `build_sym_coeff_pool` assigns to the same system, so an interned read and a
+// read followed by interning produce the same pool.
+struct InternedSink {
+  SymCoeffInterner &in;
+  const std::unordered_map<std::string, unsigned> &sym_index;
+  GiNaC::parser &parser;
+  SpillReadStats &stats;
+  std::string &error;
+  std::vector<std::pair<unsigned, SymCoeff>> eq;
+  bool started = false;
+
+  bool term(unsigned id, const char *b, const char *e) {
+    started = true;
+    SymCoeff c;
+    const CoeffText r = parse_coeff_text(b, e, sym_index, parser, c, stats, error);
+    if (r == CoeffText::Fail)
+      return false;
+    if (r == CoeffText::Zero)
+      return true;
+    eq.emplace_back(id, std::move(c));
+    return true;
+  }
+
+  void end_equation() {
+    if (!started)
+      return;
+    started = false;
+    std::sort(eq.begin(), eq.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    stats.equations += 1;
+    stats.terms += eq.size();
+    in.begin_row();
+    for (auto &pr : eq)
+      in.add_term(pr.first, pr.second);
+    eq.clear(); // the coefficients were interned: only their slots survive
   }
 };
 
@@ -627,6 +684,26 @@ bool read_spill_symbolic(const std::string &path,
   GiNaC::parser parser(symtab);
   SymbolicSink sink{system, sym_index, parser, stats, error};
   return scan_spill(path, sink, integral_id, /*flush_at_eof=*/true, stats, error);
+}
+
+bool read_spill_interned(const std::string &path,
+                         const std::unordered_map<RawIntegral, unsigned> &integral_id,
+                         const std::vector<GiNaC::possymbol> &symbols, SymCoeffPool &pool,
+                         SpillReadStats &stats, std::string &error) {
+  GiNaC::symtab symtab;
+  std::unordered_map<std::string, unsigned> sym_index;
+  for (unsigned i = 0; i < symbols.size(); ++i) {
+    symtab[symbols[i].get_name()] = symbols[i];
+    sym_index[symbols[i].get_name()] = i;
+  }
+  GiNaC::parser parser(symtab);
+  SymCoeffInterner in;
+  InternedSink sink{in, sym_index, parser, stats, error};
+  if (!scan_spill(path, sink, integral_id, /*flush_at_eof=*/true, stats, error))
+    return false;
+  in.finish();
+  pool = std::move(in.pool);
+  return true;
 }
 
 unsigned scan_spill_dum(const std::string &path,

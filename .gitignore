@@ -1,5 +1,6 @@
 # build tree
 build/
+build-prof/
 
 # local-only notes and benchmark records (not part of the released package)
 ARCHITECTURE.md
@@ -15,6 +16,7 @@ tmp/
 sectormappings/
 kira.log
 kira_*.log
+firefly.log
 
 # editor / OS noise
 *.swp

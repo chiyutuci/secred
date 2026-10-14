@@ -60,11 +60,26 @@ bool read_spill_numeric(const std::string &path,
 // GiNaC reader did.  `symbols` are the rational function's parameters in index order:
 // the reader derives the name -> index map, and builds a GiNaC parser from the same
 // table for coefficients the strict grammar refuses (counted in `stats.fallbacks`).
+//
+// This is the materialising reader: every term of every kept equation owns a `SymCoeff`,
+// which at F234's size is what makes the read cost gigabytes.  The production path reads
+// through `read_spill_interned` instead; this one stays as the reference it is measured
+// and verified against.
 bool read_spill_symbolic(const std::string &path,
                          const std::unordered_map<RawIntegral, unsigned> &integral_id,
                          const std::vector<GiNaC::possymbol> &symbols,
                          std::vector<SymEq> &system, SpillReadStats &stats,
                          std::string &error);
+
+// The production reader: the same scan, but each coefficient is interned as it is parsed
+// instead of being stored per term, so the system exists only as the pool's term table
+// (8 B per term) plus one object per *distinct* coefficient.  The equations, their term
+// order and their slots are exactly what `build_sym_coeff_pool` would produce from the
+// materialised system -- that equality is what `intern_sym_system` in the tests pins.
+bool read_spill_interned(const std::string &path,
+                         const std::unordered_map<RawIntegral, unsigned> &integral_id,
+                         const std::vector<GiNaC::possymbol> &symbols,
+                         SymCoeffPool &pool, SpillReadStats &stats, std::string &error);
 
 // Index of the equation in `path` whose largest known integral id is smallest, i.e. the
 // equation with the simplest leading term (`select_dum_eq_from_file`'s rule).  Never

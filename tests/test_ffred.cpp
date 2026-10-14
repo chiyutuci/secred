@@ -5,10 +5,14 @@
 #include <algorithm>
 #include <cstdint>
 #include <initializer_list>
+#include <random>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include <fflow/primes.hh>
 
 namespace {
 
@@ -471,5 +475,438 @@ TEST(subsolve_chain_invariant) {
     for (uint32_t k : sel.bwd_chain)
       REQUIRE(restr.at(k) == full.at(k));
     REQUIRE(restr.at(127u) == full.at(127u));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The sample-point path: plan + flat store + Shoup products
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// The store's row for `id` as a ResEq.
+bool store_row(const secred::FwdStore &store, uint32_t id, ResEq &out) {
+  if (!store.has_row(id))
+    return false;
+  const uint32_t *ids = store.row_ids(id);
+  const uint64_t *vals = store.row_vals(id);
+  const uint32_t n = store.row_size(id);
+  ResEq row;
+  row.reserve(n);
+  for (uint32_t i = 0; i < n; ++i)
+    row.emplace_back(ids[i], vals[i]);
+  out = std::move(row);
+  return true;
+}
+
+// Every row of the reference solmap must be a row of the store, term for term.
+void compare_rows(const std::unordered_map<uint32_t, ResEq> &ref,
+                  const secred::FwdStore &store, std::size_t n_ids) {
+  ResEq row;
+  for (const auto &kv : ref) {
+    REQUIRE(store.has_row(kv.first));
+    REQUIRE(store_row(store, kv.first, row));
+    REQUIRE(row == kv.second);
+  }
+  // ... and no row the reference does not have (a rewritten chain row replaces the row it
+  // came from, so the count is the pivot count either way).
+  std::size_t n = 0;
+  for (uint32_t id = 0; id < n_ids; ++id)
+    n += store.has_row(id) ? 1 : 0;
+  REQUIRE_EQ(n, ref.size());
+}
+
+// The pool's term table for `system` at one prime: every system term gets its own slot and
+// the slot's value is that term's residue -- 0 for a coefficient that vanished here, which
+// is how the elimination drops it.  The table holds the *unreduced* rows, as the
+// coefficient pool does, so it is what the plan was built from.
+void pool_of(const std::vector<Eq> &system, uint64_t p,
+             std::vector<std::pair<uint32_t, uint32_t>> &terms,
+             std::vector<uint32_t> &eq_begin, std::vector<uint64_t> &values,
+             std::vector<uint32_t> &sys_idx) {
+  terms.clear();
+  eq_begin.assign(1, 0u);
+  values.clear();
+  sys_idx.clear();
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i]) {
+      terms.emplace_back(t.first, static_cast<uint32_t>(values.size()));
+      values.push_back(secred::rat_mod_u64(t.second.num, t.second.den, p));
+    }
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+}
+
+// Run the reference and the planned path over the same reduced subsystem and compare
+// every pivot and every row, before and after back substitution.  The plan is built from
+// the *unreduced* system's structure (as the coefficient pool's term table holds it),
+// since a plan that followed the residues would differ between primes.
+void compare_paths(const std::vector<Eq> &system, uint64_t p, std::size_t n_ids,
+                   const std::vector<uint32_t> *only_keys) {
+  // The pool's row order is the system's, dropping nothing: rows that evaluate to zero at
+  // this prime are empty in the plan's input and sort last there, and the reference drops
+  // them outright -- the surviving rows keep their relative order in both.
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin, sys_idx;
+  std::vector<uint64_t> values;
+  pool_of(system, p, terms, eq_begin, values, sys_idx);
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  REQUIRE_EQ(plan.order.size(), system.size());
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  std::vector<ResEq> ref_eqs;
+  std::vector<uint32_t> ref_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    ResEq re;
+    secred::reduce_mod(system[i], p, re);
+    if (!re.empty()) {
+      ref_eqs.push_back(std::move(re));
+      ref_idx.push_back(static_cast<uint32_t>(i));
+    }
+  }
+
+  std::unordered_map<uint32_t, ResEq> ref;
+  secred::forward_eliminate(ref_eqs, ref_idx, p, ref, nullptr, nullptr);
+
+  secred::FwdStore store;
+  store.reset(n_ids);
+  secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+  REQUIRE_EQ(store.rows(), ref.size());
+  compare_rows(ref, store, n_ids);
+
+// Back substitution: restricted to the given chain, or over every pivot (as the
+// reference does with only_keys == nullptr).
+  if (only_keys) {
+    secred::backward_eliminate_planned(store, p, *only_keys);
+  } else {
+    std::vector<uint32_t> all_keys(ref.size());
+    std::size_t k = 0;
+    for (uint32_t id = 0; id < n_ids; ++id)
+      if (store.has_row(id))
+        all_keys[k++] = id;
+    all_keys.resize(k);
+    secred::backward_eliminate_planned(store, p, all_keys);
+  }
+  secred::backward_eliminate(ref, p, nullptr, only_keys);
+  compare_rows(ref, store, n_ids);
+}
+
+const std::vector<Eq> &planned_fixture() {
+  static const std::vector<Eq> system = [] {
+    std::vector<Eq> s;
+    s.push_back(eq({{126, {1, 1}}, {0, {-1, 1}}}));
+    s.push_back(eq({{127, {1, 1}}, {126, {-1, 1}}, {125, {-2, 1}}, {0, {-1, 1}}}));
+    s.push_back(eq({{127, {1, 1}}, {126, {-1, 1}}, {125, {-1, 1}}, {1, {-1, 1}}}));
+    s.push_back(eq({{128, {1, 1}}, {127, {-1, 1}}, {0, {-1, 1}}}));
+    return s;
+  }();
+  return system;
+}
+
+} // namespace
+
+// Shoup's division-free product must equal the plain 128-bit product at every prime the
+// reconstruction draws, for arbitrary residues.
+TEST(ffred_shoup_mul_matches_reference_product) {
+  std::mt19937_64 rng(12345);
+  for (unsigned pi = 1; pi <= 4; ++pi) {
+    const uint64_t p = fflow::BIG_UINT_PRIMES[pi];
+    for (int k = 0; k < 2000; ++k) {
+      const uint64_t c = rng() % p;
+      const uint64_t x = rng() % p;
+      const uint64_t cp = secred::shoup_precomp(c, p);
+      const uint64_t want =
+          static_cast<uint64_t>((static_cast<unsigned __int128>(x) * c) % p);
+      REQUIRE_EQ(secred::shoup_mul(x, c, cp, p), want);
+    }
+    // The second factor may be anything below 2^64, not only a residue.
+    const uint64_t c = p - 1, cp = secred::shoup_precomp(c, p);
+    for (uint64_t x : {uint64_t(0), uint64_t(1), ~uint64_t(0), ~uint64_t(0) - 1, p}) {
+      const uint64_t want =
+          static_cast<uint64_t>((static_cast<unsigned __int128>(x) * c) % p);
+      REQUIRE_EQ(secred::shoup_mul(x, c, cp, p), want);
+    }
+  }
+}
+
+// The plan is structure only: rows order by front id, then length, then the id list, then
+// sys_idx -- and rows that are structurally empty sort last (the elimination skips them).
+TEST(ffred_fwd_plan_is_structure_order) {
+  // Two rows with the same front and length but different ids, two identical in structure
+  // (tie broken by sys_idx), one shorter row with the same front, one empty row.
+  std::vector<Eq> system = planned_fixture();
+  system.push_back(eq({{127, {1, 1}}, {126, {-1, 1}}, {125, {-3, 1}}, {0, {-1, 1}}}));
+  // An equation with no terms at all: an empty row in the pool.
+  system.push_back(Eq{});
+
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin{0u}, sys_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i])
+      terms.emplace_back(t.first, 0u);
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  REQUIRE_EQ(plan.order.size(), 6u);
+
+  // Rows 0..3 are the fixture, row 4 is a second front-127 row with rows 1's exact ids
+  // (and a different coefficient), row 5 is empty:
+  //   front 126 first, then the front-127 rows -- ids decide rows 1/4 against row 2, and
+  //   sys_idx decides rows 1 and 4 against each other -- then front 128, empty last.
+  const std::vector<uint32_t> want{0u, 1u, 4u, 2u, 3u, 5u};
+  REQUIRE(plan.order == want);
+}
+
+// The plan is built once and shared by every prime and every point, so a point's pivots
+// must not depend on the residues: two primes that differ in the coefficients give the
+// same pivot set (the reference's coefficient tie-break never fires on these systems).
+TEST(ffred_planned_pivots_are_prime_independent) {
+  const std::vector<Eq> &system = planned_fixture();
+  // One pool, one plan, three primes: only the slot values change between the rounds, as
+  // they do between the sample points of one reconstruction.
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin, sys_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i])
+      terms.emplace_back(t.first, static_cast<uint32_t>(terms.size()));
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+  eq_begin.insert(eq_begin.begin(), 0u);
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  std::vector<uint32_t> first;
+  std::vector<uint64_t> values(terms.size(), 0);
+  for (unsigned pi = 1; pi <= 3; ++pi) {
+    const uint64_t p = fflow::BIG_UINT_PRIMES[pi];
+    std::size_t v = 0;
+    for (const Eq &e : system)
+      for (const auto &t : e)
+        values[v++] = secred::rat_mod_u64(t.second.num, t.second.den, p);
+
+    secred::FwdStore store;
+    store.reset(129u);
+    secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+    std::vector<uint32_t> pivots;
+    for (uint32_t id = 0; id < 129u; ++id)
+      if (store.has_row(id))
+        pivots.push_back(id);
+    if (first.empty())
+      first = pivots;
+    REQUIRE(pivots == first);
+  }
+  REQUIRE_EQ(first.size(), 4u); // 125, 126, 127, 128
+}
+
+// Forward and back substitution on the planned path must reproduce the reference pivots
+// and rows exactly, at several primes, with and without a restricted back substitution.
+TEST(ffred_planned_matches_reference) {
+  const std::vector<Eq> &system = planned_fixture();
+  const uint64_t primes[] = {P, 1000000009ULL, 998244353ULL, fflow::BIG_UINT_PRIMES[1]};
+  const std::vector<uint32_t> chain{1u, 125u, 126u, 127u};
+  for (uint64_t p : primes) {
+    compare_paths(system, p, 129u, nullptr);
+    compare_paths(system, p, 129u, &chain);
+  }
+}
+
+// The whole path on random systems: many structures, many primes, both directions.  The
+// plan is shared between the primes, as it is in production.
+TEST(ffred_planned_matches_reference_on_random_systems) {
+  std::mt19937_64 rng(987654321ULL);
+  const uint64_t primes[] = {P, 1000000009ULL, fflow::BIG_UINT_PRIMES[2]};
+  for (int trial = 0; trial < 24; ++trial) {
+    std::vector<Eq> system;
+    const unsigned nrows = 4 + static_cast<unsigned>(rng() % 10);
+    const uint32_t n_ids = 40;
+    for (unsigned r = 0; r < nrows; ++r) {
+      const uint32_t front = 1 + static_cast<uint32_t>(rng() % (n_ids - 1));
+      Eq e;
+      e.emplace_back(front, Rat64{1, 1});
+      std::unordered_set<uint32_t> used{front};
+      const unsigned tail = 1 + static_cast<unsigned>(rng() % 4);
+      std::vector<uint32_t> ids;
+      for (unsigned k = 0; k < tail; ++k) {
+        const uint32_t id = static_cast<uint32_t>(rng() % front);
+        if (used.insert(id).second)
+          ids.push_back(id);
+      }
+      std::sort(ids.begin(), ids.end(), std::greater<uint32_t>()); // descending, as the reader emits
+      for (uint32_t id : ids) {
+        const int64_t num = 1 + static_cast<int64_t>(rng() % 7);
+        e.emplace_back(id, Rat64{rng() % 2 ? num : -num, 1});
+      }
+      system.push_back(std::move(e));
+    }
+    for (uint64_t p : primes)
+      compare_paths(system, p, n_ids, nullptr);
+    // Restricted back substitution over an ascending chain of the fixture's ids.
+    const std::vector<uint32_t> chain{1u, 2u, 3u, 5u, 8u, 13u, 21u};
+    for (uint64_t p : primes)
+      compare_paths(system, p, n_ids, &chain);
+  }
+}
+
+// A coefficient that vanishes at the prime drops out of its row, so the row the reference
+// orders is not the pool row the plan was built from.  The planned path must notice and
+// order the rows the reference's way -- otherwise it eliminates in a different order, and
+// the chain-restricted back substitution then leaves a pivot on a chain row's right-hand
+// side where the reference leaves none (in production: a NonMasterRhs abort reporting a
+// stale selection that is fine).
+TEST(ffred_planned_reorders_rows_when_a_coefficient_vanishes) {
+  // The last row's front coefficient is 7/1, i.e. 0 at p = 7: its evaluated row is {0, -3}
+  // where the pool row is {5, 0}.  Every other coefficient is below 7 in absolute value,
+  // so this is the only vanishing one.
+  std::vector<Eq> system;
+  system.push_back(eq({{3, {1, 1}}, {2, {-1, 1}}}));
+  system.push_back(eq({{3, {1, 1}}, {2, {3, 1}}, {0, {-3, 1}}}));
+  system.push_back(eq({{5, {7, 1}}, {0, {-3, 1}}}));
+  const uint64_t p = 7;
+  const std::size_t n_ids = 8u;
+
+  // The two orders really do differ here, so the fallback is what this test exercises.
+  secred::FwdPlan plan;
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin{0u}, sys_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i])
+      terms.emplace_back(t.first, 0u);
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  std::vector<ResEq> rows(system.size());
+  for (std::size_t i = 0; i < system.size(); ++i)
+    secred::reduce_mod(system[i], p, rows[i]);
+  std::vector<uint32_t> from_rows;
+  secred::fwd_order_from_rows(rows, sys_idx, from_rows);
+  REQUIRE_EQ(rows[2].size(), 1u); // the vanishing coefficient left {0, -3}
+  REQUIRE(plan.order != from_rows);
+
+  // Both passages must still agree with the reference, with and without a restricted chain.
+  compare_paths(system, p, n_ids, nullptr);
+  const std::vector<uint32_t> chain{3u};
+  compare_paths(system, p, n_ids, &chain);
+}
+
+// The plan check reads the slot array, not the rows, so it must catch a coefficient that
+// two rows share -- one slot, two rows reordered, which is what interning produces: at
+// F234's size 7.2M terms are 1329 distinct functions, and a row's stored form is never
+// materialised just to be checked against the plan.
+TEST(ffred_planned_sees_a_vanishing_shared_coefficient) {
+  // Row 0's front and row 1's second term are the *same* pool slot, 7/1, i.e. 0 at p = 7:
+  // both rows are shorter there, and row 0's front moves from 6 down to 4, which swaps the
+  // two rows in the reference's order.
+  std::vector<Eq> system;
+  system.push_back(eq({{6, {7, 1}}, {4, {-1, 1}}}));
+  system.push_back(eq({{5, {1, 1}}, {4, {7, 1}}}));
+  const uint64_t p = 7;
+  const std::size_t n_ids = 8u;
+
+  // The pool: one slot for the shared 7/1, one for each of the other two coefficients.
+  const std::vector<std::pair<uint32_t, uint32_t>> terms{{6u, 0u}, {4u, 1u},
+                                                         {5u, 2u}, {4u, 0u}};
+  const std::vector<uint32_t> eq_begin{0u, 2u, 4u};
+  const std::vector<uint32_t> sys_idx{0u, 1u};
+  const std::vector<uint64_t> values{secred::rat_mod_u64(7, 1, p),
+                                     secred::rat_mod_u64(-1, 1, p),
+                                     secred::rat_mod_u64(1, 1, p)};
+  REQUIRE_EQ(values[0], uint64_t(0)); // the shared coefficient vanishes here
+
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  // What the reference orders at this point: both rows lost the shared term.
+  std::vector<ResEq> rows(system.size());
+  std::vector<uint32_t> from_rows;
+  for (std::size_t i = 0; i < system.size(); ++i)
+    secred::reduce_mod(system[i], p, rows[i]);
+  REQUIRE_EQ(rows[0].size(), std::size_t(1));
+  REQUIRE_EQ(rows[1].size(), std::size_t(1));
+  secred::fwd_order_from_rows(rows, sys_idx, from_rows);
+  REQUIRE(plan.order != from_rows); // the two orders really do differ here
+
+  secred::FwdStore store;
+  store.reset(n_ids);
+  secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+  REQUIRE(store.order == from_rows);
+
+  // The reference over the same evaluated rows: same pivots, same rows, term for term.
+  std::vector<ResEq> ref_eqs;
+  std::vector<uint32_t> ref_idx;
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    if (!rows[i].empty()) {
+      ref_eqs.push_back(rows[i]);
+      ref_idx.push_back(static_cast<uint32_t>(i));
+    }
+  }
+  std::unordered_map<uint32_t, ResEq> ref;
+  secred::forward_eliminate(ref_eqs, ref_idx, p, ref, nullptr, nullptr);
+  compare_rows(ref, store, n_ids);
+
+  // ... and the same table at a prime where nothing vanishes replays the plan, unchanged.
+  const uint64_t q = fflow::BIG_UINT_PRIMES[1];
+  const std::vector<uint64_t> clean{secred::rat_mod_u64(7, 1, q),
+                                    secred::rat_mod_u64(-1, 1, q),
+                                    secred::rat_mod_u64(1, 1, q)};
+  secred::FwdStore at_plan;
+  at_plan.reset(n_ids);
+  secred::forward_eliminate_planned(table, clean.data(), clean.size(), plan, q, at_plan);
+  REQUIRE(at_plan.order == plan.order);
+
+  // Both passages agree with the reference, with and without a restricted chain.
+  compare_paths(system, p, n_ids, nullptr);
+  const std::vector<uint32_t> chain{3u};
+  compare_paths(system, p, n_ids, &chain);
+}
+
+// A store must forget every row on reset: a second point at another prime may not see the
+// first point's memberships.
+TEST(ffred_planned_store_reset_forgets_rows) {
+  const std::vector<Eq> &system = planned_fixture();
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin{0u}, sys_idx;
+  for (std::size_t i = 0; i < system.size(); ++i) {
+    for (const auto &t : system[i])
+      terms.emplace_back(t.first, static_cast<uint32_t>(terms.size()));
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    sys_idx.push_back(static_cast<uint32_t>(i));
+  }
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  std::vector<uint64_t> values(terms.size(), 0);
+  secred::FwdStore store;
+  for (uint64_t p : {fflow::BIG_UINT_PRIMES[1], P}) {
+    std::size_t v = 0;
+    for (const Eq &e : system)
+      for (const auto &t : e)
+        values[v++] = secred::rat_mod_u64(t.second.num, t.second.den, p);
+    store.reset(129u);
+    REQUIRE(!store.has_row(127u));
+    secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, store);
+    REQUIRE(store.has_row(127u));
+
+    secred::FwdStore fresh;
+    fresh.reset(129u);
+    secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p, fresh);
+    REQUIRE_EQ(store.rows(), fresh.rows());
+    ResEq a, b;
+    for (uint32_t id = 0; id < 129u; ++id) {
+      REQUIRE_EQ(store.has_row(id), fresh.has_row(id));
+      if (store.has_row(id)) {
+        REQUIRE(store_row(store, id, a));
+        REQUIRE(store_row(fresh, id, b));
+        REQUIRE(a == b);
+      }
+    }
   }
 }

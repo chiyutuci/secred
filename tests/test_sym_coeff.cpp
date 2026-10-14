@@ -303,3 +303,239 @@ TEST(reduced_system_is_read_only_during_evaluation) {
   for (unsigned k = 0; k < npts; ++k)
     REQUIRE(got[k] == want[k]);
 }
+
+// ---------------------------------------------------------------------------
+// Coefficient interning
+// ---------------------------------------------------------------------------
+//
+// A global system spells the same rational function out again and again: Kira's own log
+// for F234 reads "Parsed 8040387 functions of which 1617 are distinct".  Evaluating each
+// of the reconstructed system's ~11 million (integral, coefficient) entries at every
+// sample point -- with a modular inverse each -- is what makes a point cost seconds, so
+// the reconstruction evaluates each *distinct* function once and lets the entries read
+// the answer out of the table.
+TEST(sym_coeff_pool_interns_equal_coefficients) {
+  const std::vector<SymEq> sys = {
+      SymEq{{3u, coeff(1 - d / s)}, {1u, coeff(d / (2 * s * t))}},
+      SymEq{{2u, coeff(d / (2 * s * t))}, {0u, coeff(6 * t * m)}},
+      SymEq{{1u, coeff(1 - d / s)}},
+  };
+  secred::SymCoeffPool pool;
+  secred::build_sym_coeff_pool(sys, {0u, 1u, 2u}, pool);
+
+  REQUIRE_EQ(pool.n_equations(), std::size_t(3));
+  REQUIRE_EQ(pool.n_terms(), std::size_t(5));
+  REQUIRE_EQ(pool.coeffs.size(), std::size_t(3)); // five entries, three functions
+  REQUIRE_EQ(pool.eq_begin, (std::vector<uint32_t>{0u, 2u, 4u, 5u}));
+  REQUIRE_EQ(pool.terms[0].second, pool.terms[4].second); // 1 - d/s, two equations
+  REQUIRE_EQ(pool.terms[1].second, pool.terms[2].second); // d/(2*s*t), two equations
+  REQUIRE(pool.terms[3].second != pool.terms[0].second);  // 6*t*m is its own function
+  REQUIRE(pool.terms[3].second != pool.terms[1].second);
+  // the pool keeps each equation's terms in the system's descending-id order
+  REQUIRE_EQ(pool.terms[0].first, 3u);
+  REQUIRE_EQ(pool.terms[1].first, 1u);
+  REQUIRE_EQ(pool.terms[4].first, 1u);
+  REQUIRE_EQ(pool.terms[3].first, 0u);
+}
+
+// The strict grammar and GiNaC's parser order a monomial's factors their own way, so the
+// same function has to intern whichever spelling produced it.
+TEST(sym_coeff_pool_interns_a_monomial_spelled_another_way) {
+  const SymCoeff a = coeff(d * s);
+  REQUIRE_EQ(a.num.terms[0].vars.size(), std::size_t(2));
+  SymCoeff b = a;
+  std::swap(b.num.terms[0].vars[0], b.num.terms[0].vars[1]);
+
+  const std::vector<SymEq> sys = {SymEq{{1u, a}}, SymEq{{0u, b}}};
+  secred::SymCoeffPool pool;
+  secred::build_sym_coeff_pool(sys, {0u, 1u}, pool);
+  REQUIRE_EQ(pool.coeffs.size(), std::size_t(1));
+}
+
+// The row of `pool` at one point, gathered the way the elimination gathers it: the terms
+// whose coefficient did not vanish here, descending id.
+secred::ResEq gather_row(const secred::SymCoeffPool &pool, std::size_t e,
+                         const std::vector<uint64_t> &values) {
+  secred::ResEq row;
+  for (std::size_t k = pool.eq_begin[e]; k < pool.eq_begin[e + 1]; ++k) {
+    const uint64_t v = values[pool.terms[k].second];
+    if (v)
+      row.emplace_back(pool.terms[k].first, v);
+  }
+  return row;
+}
+
+// A point fills the table once per distinct function: every residue must be exactly what
+// the per-entry evaluation produces, and a table reduced for another prime must be refused
+// rather than read.
+TEST(sym_coeff_pool_evaluates_every_distinct_function_once) {
+  const std::vector<SymEq> sys = {
+      SymEq{{3u, coeff(1 - d / s)}, {1u, coeff(d / (2 * s * t))}},
+      SymEq{{2u, coeff(d / (2 * s * t))}, {0u, coeff(6 * t * m)}},
+      SymEq{{1u, coeff(1 - d / s)}},
+  };
+  const std::vector<uint64_t> x{12345, 6789, 4321, 987};
+  const std::vector<std::vector<uint64_t>> pw =
+      secred::make_powers(sys, x.data(), 4, P64);
+
+  secred::SymCoeffPool pool;
+  secred::build_sym_coeff_pool(sys, {0u, 1u, 2u}, pool);
+  secred::reduce_pool_for_prime(pool, P64);
+
+  std::vector<uint64_t> values;
+  REQUIRE(secred::eval_pool_point(pool, subs_of(x), pw, P64, values));
+  REQUIRE_EQ(values.size(), pool.coeffs.size());
+
+  // Reference: the same equations through the per-entry path.
+  std::vector<SymEq> ref = sys;
+  secred::reduce_sym_system(ref, P64);
+  for (std::size_t e = 0; e < ref.size(); ++e) {
+    secred::ResEq want;
+    for (const auto &pr : ref[e]) {
+      uint64_t v = 0;
+      REQUIRE(secred::eval_sym_coeff_mod(pr.second, subs_of(x), pw, P64, v));
+      if (v)
+        want.emplace_back(pr.first, v);
+    }
+    REQUIRE(gather_row(pool, e, values) == want);
+  }
+  // The interned row really is read from the table: the shared coefficient d/(2*s*t)
+  // appears in two equations and takes the same residue in both.
+  REQUIRE_EQ(pool.terms[pool.eq_begin[0] + 1].second,
+             pool.terms[pool.eq_begin[1]].second);
+
+  std::vector<uint64_t> other_values;
+  REQUIRE(!secred::eval_pool_point(pool, subs_of(x), pw, P32, other_values));
+}
+
+// The slot array is rebuilt for every point, so a point never sees the previous point's
+// residues -- and a term whose coefficient vanishes here must simply be absent from the
+// gathered row rather than keep the value it had before.
+TEST(sym_coeff_pool_evaluates_each_point_from_scratch) {
+  const std::vector<SymEq> sys = {
+      SymEq{{2u, coeff(d / s)}, {1u, coeff(3 * t)}},
+      SymEq{{0u, coeff(m + 1)}},
+  };
+  secred::SymCoeffPool pool;
+  secred::build_sym_coeff_pool(sys, {0u, 1u}, pool);
+  secred::reduce_pool_for_prime(pool, P64);
+
+  std::vector<uint64_t> values;
+  // m = p - 1: the second equation is 0 = 0 at this point.
+  const std::vector<uint64_t> x1{2, 3, 4, P64 - 1}, x2{6, 7, 8, 9};
+  REQUIRE(secred::eval_pool_point(pool, subs_of(x1),
+                                  secred::make_powers(sys, x1.data(), 4, P64), P64,
+                                  values));
+  REQUIRE_EQ(gather_row(pool, 0, values).size(), std::size_t(2));
+  REQUIRE(gather_row(pool, 1, values).empty());
+
+  REQUIRE(secred::eval_pool_point(pool, subs_of(x2),
+                                  secred::make_powers(sys, x2.data(), 4, P64), P64,
+                                  values));
+  const secred::ResEq row0 = gather_row(pool, 0, values);
+  REQUIRE_EQ(row0.size(), std::size_t(2));
+  REQUIRE_EQ(row0[0].first, 2u); // d/s first: the system's descending id order
+  REQUIRE_EQ(row0[1].first, 1u);
+  const secred::ResEq row1 = gather_row(pool, 1, values);
+  REQUIRE_EQ(row1.size(), std::size_t(1));
+  REQUIRE_EQ(row1[0].first, 0u);
+}
+
+// Interning a whole system is the reader's other half: the reader interns term by term
+// as it parses, and this is the shape a caller that already holds a system gets.  Both
+// must assign the same slots in the same order, or a pool read one way would not be the
+// pool read the other -- which is the whole point of sharing the interner.
+TEST(sym_coeff_pool_interns_a_whole_system_the_way_the_reader_does) {
+  const std::vector<SymEq> sys = {
+      SymEq{{3u, coeff(1 - d / s)}, {1u, coeff(d / (2 * s * t))}},
+      SymEq{{2u, coeff(d / (2 * s * t))}, {0u, coeff(6 * t * m)}},
+      SymEq{{1u, coeff(1 - d / s)}},
+  };
+  secred::SymCoeffInterner in;
+  for (const SymEq &eq : sys) {
+    in.begin_row();
+    for (const auto &pr : eq)
+      in.add_term(pr.first, pr.second);
+  }
+  in.finish();
+
+  secred::SymCoeffPool whole;
+  secred::intern_sym_system(sys, whole);
+  REQUIRE(whole.terms == in.pool.terms);
+  REQUIRE(whole.eq_begin == in.pool.eq_begin);
+  REQUIRE_EQ(whole.coeffs.size(), in.pool.coeffs.size());
+
+  // And selecting rows out of the whole-system pool is what building the pool from the
+  // selection does, up to the slot numbering the selection implies.
+  secred::SymCoeffPool selected;
+  secred::build_sym_coeff_pool(sys, {1u, 2u}, selected);
+  REQUIRE_EQ(selected.eq_begin, (std::vector<uint32_t>{0u, 2u, 3u}));
+  REQUIRE_EQ(selected.n_terms(), std::size_t(3));
+}
+
+// Retaining a subset of the rows: the pool keeps those rows in the order the subset
+// names them, renumbers the surviving coefficients densely, and releases everything
+// else -- including the row boundaries of the rows it dropped and the coefficient tables
+// no remaining row reads.
+TEST(sym_coeff_pool_retains_only_the_named_rows) {
+  const std::vector<SymEq> sys = {
+      SymEq{{3u, coeff(1 - d / s)}, {1u, coeff(6 * t * m)}},
+      SymEq{{2u, coeff(d / (2 * s * t))}},
+      SymEq{{1u, coeff(1 - d / s)}, {0u, coeff(m + 1)}},
+  };
+  secred::SymCoeffPool pool;
+  secred::intern_sym_system(sys, pool);
+  REQUIRE_EQ(pool.coeffs.size(), std::size_t(4)); // four distinct functions
+
+  secred::retain_pool_rows(pool, {2u, 1u});
+  REQUIRE_EQ(pool.n_equations(), std::size_t(2));
+  REQUIRE_EQ(pool.eq_begin, (std::vector<uint32_t>{0u, 2u, 3u}));
+  REQUIRE_EQ(pool.n_terms(), std::size_t(3));
+  // Row 0 is the old row 2's, in its order, and row 1 the old row 1's -- read through
+  // the rows' own contents rather than their slots, since the slots were renumbered.
+  REQUIRE_EQ(pool.terms[0].first, 1u);
+  REQUIRE_EQ(pool.terms[1].first, 0u);
+  REQUIRE_EQ(pool.terms[2].first, 2u);
+  // The dropped rows' coefficients are gone: their slots named nothing that survives.
+  REQUIRE_EQ(pool.coeffs.size(), std::size_t(3));
+
+  const std::vector<uint64_t> x{12345, 6789, 4321, 987};
+  secred::reduce_pool_for_prime(pool, P64);
+  std::vector<uint64_t> values;
+  REQUIRE(secred::eval_pool_point(pool, subs_of(x),
+                                  secred::make_powers(pool, x.data(), 4, P64), P64,
+                                  values));
+  REQUIRE_EQ(gather_row(pool, 0, values).size(), std::size_t(2));
+  REQUIRE_EQ(gather_row(pool, 1, values).size(), std::size_t(1));
+}
+
+// The rows of a pool at one point, as numeric equations: the pool form of
+// `eval_sym_eqs_mod`, with the same rows in the same order and the same residues.
+TEST(sym_coeff_pool_rows_match_the_per_entry_evaluation) {
+  const std::vector<SymEq> sys = {
+      SymEq{{3u, coeff(1 - d / s)}, {1u, coeff(d / (2 * s * t))}},
+      SymEq{{2u, coeff(d / (2 * s * t))}, {0u, coeff(6 * t * m)}},
+      SymEq{{0u, coeff(m + 1)}},
+  };
+  const std::vector<uint64_t> x{12345, 6789, 4321, P64 - 1}; // row 2 vanishes
+  secred::SymCoeffPool pool;
+  secred::intern_sym_system(sys, pool);
+  secred::reduce_pool_for_prime(pool, P64);
+
+  std::vector<secred::ResEq> got;
+  std::vector<uint32_t> got_idx;
+  REQUIRE(secred::eval_pool_rows(pool, {0u, 1u, 2u}, subs_of(x),
+                                 secred::make_powers(pool, x.data(), 4, P64), P64, got,
+                                 got_idx));
+
+  std::vector<SymEq> ref = sys;
+  secred::reduce_sym_system(ref, P64);
+  std::vector<secred::ResEq> want;
+  std::vector<uint32_t> want_idx;
+  REQUIRE(secred::eval_sym_eqs_mod(ref, {0u, 1u, 2u}, subs_of(x),
+                                   secred::make_powers(ref, x.data(), 4, P64), P64, want,
+                                   want_idx));
+  REQUIRE(got == want);
+  REQUIRE(got_idx == want_idx);
+  REQUIRE_EQ(got_idx, (std::vector<uint32_t>{0u, 1u})); // the vanishing row is dropped
+}

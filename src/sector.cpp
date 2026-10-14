@@ -652,6 +652,10 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
 
   file << "\n masters: ";
   file << needed_indep.size() << '\n';
+  // The seeds Stage B expands (spec 5.2): the sector's own masters, and nothing
+  // else -- see symmetry_seed_masters.
+  const std::vector<RawIntegral> sym_seeds =
+      secred::symmetry_seed_masters(needed_indep, _seeds, nvars);
   for (unsigned i = 0; i < needed_indep.size(); ++i) {
     if (needed_indep[i] < nvars) {
       RawIntegral inte = _seeds[nvars - 1 - needed_indep[i]];
@@ -806,8 +810,16 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
            << " via GiNaC, " << slow_eqs << " equations via GiNaC\n";
 
     // Sector symmetry relations (spec 5.1-5.3).  One equation per prescription
-    // out of this sector, for every seed this round admitted -- the IBP seed set
-    // (_bound.admits), which is what Kira generates its relations on (spec 5.2).
+    // out of this sector, for every master this sector settled on (sym_seeds,
+    // spec 5.2).  The relations exist to cut redundant masters in the global
+    // stage, and only a relation that carries a master can do that: a seed the
+    // local reduction already expressed in terms of masters gives a relation the
+    // IBP equations already span.  Widening the seed set to every admitted seed
+    // (the IBP set, _bound.admits) is what the sector stage did before -- 703,005
+    // expansions on F234 against 309 masters -- and it left the global system 81 %
+    // symmetry equations, none of which the reduction reads.  The one place the
+    // narrow set costs a master is box under parallel_mode: layer, where the cross
+    // relation that cuts the ninth master has been dropped (ARCHITECTURE.md 5.11).
     // An image that is not a variable of this sector's own system is requested
     // from *its own* sector through the same uptargets push the IBP terms use;
     // the symmetry edge in _run_reduce_fine is what makes that sector run after
@@ -835,9 +847,9 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
             for (unsigned i = 0; i < p.c.rows(); ++i)
               c_ex[i] = p.c(i, 0);
             std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
-            for (const RawIntegral &seed : _seeds) {
-              if (!_bound.admits(seed))
-                continue;
+            // sym_seeds is admitted by construction: a master the boundary
+            // refused set refusalBits above and this pass returned there.
+            for (const RawIntegral &seed : sym_seeds) {
               std::vector<SymTerm<GiNaC::ex>> terms;
               if (!expand_prescription<GiNaC::ex>(p, f_ex, c_ex, seed, trivial, terms))
                 continue;
@@ -871,9 +883,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
                 sym_eqs.push_back(std::move(eq));
             }
           } else {
-            for (const RawIntegral &seed : _seeds) {
-              if (!_bound.admits(seed))
-                continue;
+            for (const RawIntegral &seed : sym_seeds) {
               std::vector<SymTerm<rational>> terms;
               if (!expand_prescription<rational>(p, p.f_num, p.c_num, seed, trivial, terms))
                 continue;

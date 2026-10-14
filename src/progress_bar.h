@@ -12,11 +12,16 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <iomanip>
 #include <ostream>
+#include <sstream>
 #include <string>
 #include <utility>
 
 #include <unistd.h>
+
+#include "run_report.h" // format_duration
 
 namespace secred {
 
@@ -87,6 +92,81 @@ class ProgressBar {
   bool interactive_;
   unsigned width_;
   unsigned last_pct_ = 0;
+  bool started_ = false;
+};
+
+// The live line for a phase whose total is not known while it runs: the FireFly
+// reconstruction, where the number of prime fields a rational function needs is decided by
+// the reconstruction itself.  FireFly publishes no counter of its own at SILENT verbosity,
+// and the ones it keeps are private and restart inside every prime field ("Done: 0 / 19950"
+// through the first half of the F234 run), so there is no total to divide by and the line
+// reports what the black box has actually finished -- prime fields re-reduced, probes
+// answered -- and the wall clock.  Completion is the driver's "reconstruction done in ..."
+// line, which carries the same counters once they are final.
+//
+// Rendering stays a pure function of those counters so it can be checked without a
+// terminal; the update rate is throttled the way ProgressBar's is, once a second on a
+// terminal and once every ten seconds in a log, with the first line held back until the
+// run has a second behind it.
+class ReconStatus {
+ public:
+  ReconStatus(std::string label, bool interactive = true)
+      : label_(std::move(label)), interactive_(interactive) {}
+
+  // "<label>: 1min12s elapsed, 7 prime field(s), 280 probe(s) (3.9/s)", with the rate
+  // left out before the first second and, once the probe count has stood still for
+  // `kIdleSeconds`, the stretch it has stood still for: between two prime fields the box
+  // is asked for nothing while the tables are rebuilt and FireFly interpolates, and an
+  // unexplained frozen counter reads as a stalled run.
+  std::string render(double elapsed, std::uint64_t primes, std::uint64_t probes,
+                     double idle) const {
+    std::ostringstream oss;
+    oss << label_ << ": " << format_duration(elapsed) << " elapsed, " << primes
+        << " prime field(s), " << probes << " probe(s)";
+    if (elapsed >= 1.0)
+      oss << " (" << std::fixed << std::setprecision(1)
+          << static_cast<double>(probes) / elapsed << "/s)";
+    if (idle >= kIdleSeconds)
+      oss << ", no probe for " << format_duration(idle);
+    return oss.str();
+  }
+
+  // Text to write for this update, or "" when it is throttled away.  `elapsed` is
+  // measured from the start of the phase by the caller's clock and must not go
+  // backwards; how long the counters have stood still is read off them here, so every
+  // call has to be made even when its line is throttled away.
+  std::string update(double elapsed, std::uint64_t primes, std::uint64_t probes) {
+    if (probes != last_probes_) {
+      last_probes_ = probes;
+      last_probe_at_ = elapsed;
+    }
+    const double step = interactive_ ? 1.0 : 10.0;
+    if (elapsed < (started_ ? last_print_ + step : 1.0))
+      return std::string();
+    started_ = true;
+    last_print_ = elapsed;
+    return decorate(render(elapsed, primes, probes, elapsed - last_probe_at_));
+  }
+
+  // Closes the redrawn line, a no-op when every line was a complete one.
+  std::string finish() const {
+    return started_ && interactive_ ? std::string("\n") : std::string();
+  }
+
+ private:
+  // Short enough that a live reconstruction never reaches it between two probes, long
+  // enough that a prime field's own work is not reported as a stall.
+  static constexpr double kIdleSeconds = 2.0;
+
+  std::string decorate(const std::string &line) const {
+    return interactive_ ? "\r" + line : line + "\n";
+  }
+
+  std::string label_;
+  bool interactive_;
+  double last_print_ = 0.0;
+  double last_probe_at_ = 0.0;
+  std::uint64_t last_probes_ = 0;
   bool started_ = false;
 };
 

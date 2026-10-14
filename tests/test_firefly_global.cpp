@@ -31,16 +31,16 @@ namespace {
 secred::SymbolicFFEvaluator
 evaluator_of(std::unordered_map<unsigned, unsigned> *masters_override = nullptr) {
   const std::string spill = tiny::write_spill("/tmp/secred_test_firefly_tiny");
-  std::vector<secred::SymEq> system;
+  secred::SymCoeffPool pool;
   secred::SpillReadStats stats;
   std::string error;
   const auto ids = tiny::integral_ids();
   const auto symbols = tiny::symbols();
   const auto integrals = tiny::integrals();
-  if (!secred::read_spill_symbolic(spill, ids, symbols, system, stats, error))
+  if (!secred::read_spill_interned(spill, ids, symbols, pool, stats, error))
     throw std::runtime_error(error);
   secred::SymbolicGlobalLearn learn =
-      secred::symbolic_global_learn(system, {3u}, integrals, symbols,
+      secred::symbolic_global_learn(pool, {3u}, integrals, symbols,
                                     1125899906842597ULL,
                                     "/tmp/secred_test_firefly_masters", "[test]", 0, 0, 0, 0);
   if (!learn.ok)
@@ -51,10 +51,13 @@ evaluator_of(std::unordered_map<unsigned, unsigned> *masters_override = nullptr)
   for (const auto &s : symbols)
     symbol_ex.push_back(GiNaC::ex(s));
   const unsigned nnindeps = masters_override ? 1u : learn.nnindeps;
-  return secred::SymbolicFFEvaluator(std::move(system), std::move(learn.needed_eq_idx),
+  // The item table comes from the learn exactly as the driver passes it; with overridden
+  // masters the learned one would not match, so the (single) learned item is kept as is.
+  secred::ReductionItems items = learn.items;
+  return secred::SymbolicFFEvaluator(std::move(pool), std::move(learn.needed_eq_idx),
                                      std::move(learn.bwd_chain), std::move(learn.dep_targets),
                                      std::move(master_index), nnindeps,
-                                     std::move(symbol_ex));
+                                     std::move(items), std::move(symbol_ex));
 }
 
 // `prime_changed()` reads `firefly::FFInt::p`, so the tests set the prime the way
@@ -80,8 +83,25 @@ TEST(firefly_box_returns_the_evaluators_values) {
           secred::SymbolicFFEvaluator::PointResult::Ok);
   REQUIRE_EQ(got[0].n, ref[0]);
   REQUIRE_EQ(box.probes(), std::uint64_t(1));
+  REQUIRE_EQ(box.points(), std::uint64_t(1));
   REQUIRE_EQ(box.primes(), std::uint64_t(1));
   REQUIRE(!box.hard_failure());
+  REQUIRE(box.fail_reason() == secred::SymbolicFFEvaluator::PointResult::Ok);
+}
+
+// The box adds each probe's share of the three solve phases (the scratch is thread-local
+// and outlives the probe, so what it reads is a delta), which the driver averages into
+// the Kira-style "probe solution steps" line.
+TEST(firefly_box_reports_the_probe_phase_seconds) {
+  secred::SymbolicFFEvaluator ev = evaluator_of();
+  secred::SecRedFireFlyBlackBox box(ev, 1);
+  box.prime_changed();
+  REQUIRE_EQ(box.eval_seconds(), 0.0);
+  const std::vector<firefly::FFInt> x = {firefly::FFInt(5), firefly::FFInt(7)};
+  box(x);
+  REQUIRE(box.eval_seconds() > 0.0);   // fill + substitute + reduce
+  REQUIRE(box.fwd_seconds() > 0.0);    // forward elimination
+  REQUIRE(box.bwd_seconds() > 0.0);    // back substitution
 }
 
 // The lane trait: a bunched call must return, lane by lane, what N single calls return.
@@ -182,6 +202,7 @@ TEST(firefly_box_reports_a_stale_selection_as_a_hard_failure) {
   const std::vector<firefly::FFInt> got = box(x);
   REQUIRE(box.hard_failure());
   REQUIRE_EQ(got[0].n, std::uint64_t(0));
+  REQUIRE(box.fail_reason() == secred::SymbolicFFEvaluator::PointResult::NonMasterRhs);
   REQUIRE_EQ(box.fail_target(), 3u);
   REQUIRE_EQ(box.fail_integral(), 0u);
 }
@@ -190,15 +211,15 @@ TEST(firefly_box_handles_a_zero_output_system) {
   // n_outputs() == 0 (every target is a master): the probe returns an empty vector and
   // the driver never constructs a Reconstructor with n == 0.
   const std::string spill = tiny::write_spill("/tmp/secred_test_firefly_zero");
-  std::vector<secred::SymEq> system;
+  secred::SymCoeffPool pool;
   secred::SpillReadStats stats;
   std::string error;
   const auto ids = tiny::integral_ids();
   const auto symbols = tiny::symbols();
   const auto integrals = tiny::integrals();
-  REQUIRE(secred::read_spill_symbolic(spill, ids, symbols, system, stats, error));
+  REQUIRE(secred::read_spill_interned(spill, ids, symbols, pool, stats, error));
   secred::SymbolicGlobalLearn learn =
-      secred::symbolic_global_learn(system, {0u}, integrals, symbols,
+      secred::symbolic_global_learn(pool, {0u}, integrals, symbols,
                                     1125899906842597ULL,
                                     "/tmp/secred_test_firefly_masters0", "[test]", 0, 0, 0, 0);
   REQUIRE(learn.ok);
@@ -206,9 +227,10 @@ TEST(firefly_box_handles_a_zero_output_system) {
   std::vector<GiNaC::ex> symbol_ex;
   for (const auto &s : symbols)
     symbol_ex.push_back(GiNaC::ex(s));
-  secred::SymbolicFFEvaluator ev(std::move(system), std::move(learn.needed_eq_idx),
+  secred::SymbolicFFEvaluator ev(std::move(pool), std::move(learn.needed_eq_idx),
                                  std::move(learn.bwd_chain), std::move(learn.dep_targets),
-                                 std::move(learn.master_index), 0u, std::move(symbol_ex));
+                                 std::move(learn.master_index), 0u,
+                                 std::move(learn.items), std::move(symbol_ex));
   REQUIRE_EQ(ev.n_outputs(), 0u);
   secred::SecRedFireFlyBlackBox box(ev, 1);
   box.prime_changed();

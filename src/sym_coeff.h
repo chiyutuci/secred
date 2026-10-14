@@ -341,4 +341,345 @@ inline bool eval_sym_eqs_mod(const std::vector<SymEq> &system,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Coefficient interning
+// ---------------------------------------------------------------------------
+//
+// A global system spells the same rational function out again and again: Kira's own log
+// for F234 reads "Parsed 8040387 functions of which 1617 are distinct".  Evaluating every
+// (integral, coefficient) entry of the reconstructed system at every sample point -- with
+// a modular inverse each, ~11 million of them for F234 -- was the dominant cost of a
+// point.  The pool evaluates each *distinct* function once per point and lets the entries
+// read the answer out of the table, which is Kira's model.
+
+// A term with more distinct symbols than this is not interned: a coefficient that wide is
+// unlikely to repeat, so the table slot would only be paid for and never shared.  A missed
+// intern costs one duplicate evaluation, never a wrong residue.
+inline constexpr std::size_t kSymCoeffMaxVars = 16;
+
+// The shape interning keys on: each term's (symbol, exponent) pairs sorted, then the terms
+// sorted.  One function can be spelled several ways -- the strict spill grammar
+// (spill_reader.cpp) and GiNaC's parser order a monomial's factors their own way -- and
+// the key must see through that: a miss costs a duplicate evaluation, while a wrong match
+// would hand an entry another function's residue.  The aligned `mod_vals` table is
+// dropped, because it belongs to a term order that no longer holds; `eval_sym_poly_mod`
+// refuses a table that was not reduced for the prime it is asked about, so the next
+// `reduce_pool_for_prime` is what refills it.
+inline bool sym_term_less(const SymTerm &a, const SymTerm &b) {
+  if (a.vars != b.vars)
+    return a.vars < b.vars;   // pairs compare by symbol index, then exponent
+  return a.coef < b.coef;
+}
+
+inline bool sym_poly_internable(const SymPoly &poly) {
+  for (const SymTerm &t : poly.terms)
+    if (t.vars.size() > kSymCoeffMaxVars)
+      return false;
+  return true;
+}
+
+// Canonical copy of one polynomial into `out`.  `out` is reused across coefficients, so
+// its buffers keep their capacity; only a coefficient that grows past the previous one
+// allocates.
+inline void sym_poly_canonical_into(const SymPoly &in, SymPoly &out) {
+  out.terms.resize(in.terms.size());
+  for (std::size_t i = 0; i < in.terms.size(); ++i) {
+    out.terms[i].coef = in.terms[i].coef;
+    out.terms[i].vars.assign(in.terms[i].vars.begin(), in.terms[i].vars.end());
+    std::sort(out.terms[i].vars.begin(), out.terms[i].vars.end());
+  }
+  std::sort(out.terms.begin(), out.terms.end(), sym_term_less);
+  out.mod_vals.clear();
+  out.mod_p = 0;
+}
+
+// Two canonical polynomials of the same function are equal term by term.  `cln::equal_
+// hashcode` is invariant under equal integers, so hashing may key on it.
+inline bool sym_poly_equal(const SymPoly &a, const SymPoly &b) {
+  if (a.terms.size() != b.terms.size())
+    return false;
+  for (std::size_t i = 0; i < a.terms.size(); ++i)
+    if (a.terms[i].vars != b.terms[i].vars || !(a.terms[i].coef == b.terms[i].coef))
+      return false;
+  return true;
+}
+
+inline void sym_hash_mix(std::uint64_t &h, std::uint64_t v) {
+  h ^= v;
+  h *= 1099511628211ULL; // FNV-1a
+}
+
+inline std::uint64_t hash_sym_poly(const SymPoly &poly) {
+  std::uint64_t h = 1469598103934665603ULL;
+  sym_hash_mix(h, poly.terms.size());
+  for (const SymTerm &t : poly.terms) {
+    sym_hash_mix(h, cln::equal_hashcode(t.coef));
+    sym_hash_mix(h, t.vars.size());
+    for (const auto &ve : t.vars)
+      sym_hash_mix(h, (static_cast<std::uint64_t>(ve.first) << 8) | ve.second);
+  }
+  return h;
+}
+
+// The interning key.  A coefficient the precompiler could not represent keeps its GiNaC
+// form and is keyed on that instead (`spill_reader.cpp`'s fast path never sets
+// `slow_num`/`slow_den`, so keying a precompiled coefficient on those would collapse every
+// one of them into a single slot -- a wrong residue, not a missed optimisation).
+struct SymCoeffHash {
+  std::size_t operator()(const SymCoeff &c) const {
+    std::uint64_t h = 1469598103934665603ULL;
+    if (!c.precompiled) {
+      sym_hash_mix(h, c.slow_num.gethash());
+      sym_hash_mix(h, c.slow_den.gethash());
+      return static_cast<std::size_t>(h);
+    }
+    sym_hash_mix(h, hash_sym_poly(c.num));
+    sym_hash_mix(h, hash_sym_poly(c.den));
+    return static_cast<std::size_t>(h);
+  }
+};
+
+struct SymCoeffEq {
+  bool operator()(const SymCoeff &a, const SymCoeff &b) const {
+    if (a.precompiled != b.precompiled)
+      return false;
+    if (!a.precompiled)
+      return a.slow_num.is_equal(b.slow_num) && a.slow_den.is_equal(b.slow_den);
+    return sym_poly_equal(a.num, b.num) && sym_poly_equal(a.den, b.den);
+  }
+};
+
+// The distinct coefficients of a selected system, with every equation term pointing at
+// one of them.  Built once, before the reconstruction; one prime's tables live in
+// `coeffs`, so a sample point evaluates `coeffs.size()` functions and the entries read the
+// rest out of the table.  `terms` and `eq_begin` are read-only during evaluation, so one
+// pool serves every thread.
+struct SymCoeffPool {
+  std::vector<SymCoeff> coeffs;                     // the distinct functions
+  std::vector<std::pair<uint32_t, uint32_t>> terms;  // (integral id, index into coeffs)
+  std::vector<uint32_t> eq_begin;                    // n_equations() + 1 row boundaries
+  std::size_t n_equations() const { return eq_begin.empty() ? 0 : eq_begin.size() - 1; }
+  std::size_t n_terms() const { return terms.size(); }
+};
+
+// The interning table itself, usable while a system is still being read.
+//
+// `build_sym_coeff_pool` fills a pool from a materialised system; the spill reader needs
+// the same key and the same slot assignment while it parses, so that a row appended
+// during the read is the row a second pass would have produced.  Both go through this
+// object, and neither can drift from the other.
+struct SymCoeffInterner {
+  SymCoeffPool pool;
+  std::unordered_map<SymCoeff, uint32_t, SymCoeffHash, SymCoeffEq> slot_of;
+  SymCoeff probe;   // one reused key: filling it allocates nothing after the first terms
+
+  // One equation's term table starts here.  Rows are appended in order, so a row is the
+  // half-open range [terms[eq_begin[i]], terms[eq_begin[i + 1]]).
+  void begin_row() { pool.eq_begin.push_back(static_cast<uint32_t>(pool.terms.size())); }
+
+  void add_term(uint32_t id, const SymCoeff &c) { pool.terms.emplace_back(id, intern(c)); }
+
+  // The pool's last row boundary.  Every `begin_row` needs one `finish` at the end of the
+  // last row, which is what makes `eq_begin` have n_rows + 1 entries.
+  void finish() {
+    pool.eq_begin.push_back(static_cast<uint32_t>(pool.terms.size()));
+  }
+
+  // The slot that evaluates `c`.  A coefficient the precompiler could not represent, or
+  // one too wide to be worth a table slot, is never interned: it takes its own slot, and
+  // a repeat of it costs one duplicate evaluation rather than a wrong residue.
+  std::uint32_t intern(const SymCoeff &c) {
+    bool internable = true;
+    if (c.precompiled) {
+      internable = sym_poly_internable(c.num) && sym_poly_internable(c.den);
+      if (internable) {
+        sym_poly_canonical_into(c.num, probe.num);
+        sym_poly_canonical_into(c.den, probe.den);
+      }
+    } else {
+      // Keyed on the GiNaC form; the partial monomial tables are not a key.
+      probe.num.terms.clear();
+      probe.den.terms.clear();
+    }
+    probe.precompiled = c.precompiled;
+    probe.slow_num = c.slow_num;
+    probe.slow_den = c.slow_den;
+
+    if (!internable) {
+      pool.coeffs.push_back(c); // never interned: it gets its own slot
+      return static_cast<std::uint32_t>(pool.coeffs.size() - 1);
+    }
+    const auto it = slot_of.find(probe);
+    if (it != slot_of.end())
+      return it->second;
+    pool.coeffs.push_back(probe);
+    const std::uint32_t slot = static_cast<std::uint32_t>(pool.coeffs.size() - 1);
+    slot_of.emplace(pool.coeffs.back(), slot);
+    return slot;
+  }
+};
+
+// Canonicalise the selected coefficients of `system`, intern them, and fill the pool.
+// Every equation keeps the system's term order (descending integral id, as the spill
+// reader wrote it) and every term points at the one slot that evaluates it.
+inline void build_sym_coeff_pool(const std::vector<SymEq> &system,
+                                 const std::vector<uint32_t> &eq_idx,
+                                 SymCoeffPool &pool) {
+  SymCoeffInterner in;
+  in.pool.eq_begin.reserve(eq_idx.size() + 1);
+  for (uint32_t i : eq_idx) {
+    in.begin_row();
+    for (const auto &pr : system[i])
+      in.add_term(pr.first, pr.second);
+  }
+  in.finish();
+  pool = std::move(in.pool);
+}
+
+// Intern a whole materialised system -- the shape `read_spill_symbolic` produces.  The
+// reader has its own interning sink (spill_reader.h) and never materialises one; this is
+// for the callers that already hold a system.
+inline void intern_sym_system(const std::vector<SymEq> &system, SymCoeffPool &pool) {
+  SymCoeffInterner in;
+  in.pool.eq_begin.reserve(system.size() + 1);
+  for (const SymEq &eq : system) {
+    in.begin_row();
+    for (const auto &pr : eq)
+      in.add_term(pr.first, pr.second);
+  }
+  in.finish();
+  pool = std::move(in.pool);
+}
+
+// Keep only the rows `eq_idx` names, in that order, and release the rest: both the term
+// table and the coefficient table shrink to what those rows touch, so a pool read as a
+// whole system (every equation the spill held) becomes the pool of the selection the
+// learn made, which is the only part the reconstruction evaluates.  A coefficient no
+// remaining row uses is dropped, and the surviving slots are renumbered densely; the
+// rows keep their order and their terms, so a row of `eq_idx[k]` is row `k` afterwards.
+inline void retain_pool_rows(SymCoeffPool &pool, const std::vector<uint32_t> &eq_idx) {
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin;
+  std::vector<uint32_t> remap(pool.coeffs.size(), UINT32_MAX);
+  std::vector<SymCoeff> coeffs;
+  std::size_t n_terms = 0;
+  for (uint32_t i : eq_idx)
+    n_terms += pool.eq_begin[i + 1] - pool.eq_begin[i];
+  terms.reserve(n_terms);
+  eq_begin.reserve(eq_idx.size() + 1);
+  for (uint32_t i : eq_idx) {
+    eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+    for (std::size_t t = pool.eq_begin[i], te = pool.eq_begin[i + 1]; t < te; ++t) {
+      uint32_t &slot = remap[pool.terms[t].second];
+      if (slot == UINT32_MAX) {
+        slot = static_cast<uint32_t>(coeffs.size());
+        coeffs.push_back(std::move(pool.coeffs[pool.terms[t].second]));
+      }
+      terms.emplace_back(pool.terms[t].first, slot);
+    }
+  }
+  eq_begin.push_back(static_cast<uint32_t>(terms.size()));
+  pool.coeffs = std::move(coeffs);
+  pool.terms = std::move(terms);
+  pool.eq_begin = std::move(eq_begin);
+}
+
+// Reduce one pool coefficient mod p (a coefficient the precompiler could not represent
+// carries no table; its GiNaC form is substituted at every point instead).
+inline void reduce_pool_coeff(SymCoeff &c, uint64_t p) {
+  if (!c.precompiled)
+    return;
+  reduce_sym_poly(c.num, p);
+  reduce_sym_poly(c.den, p);
+}
+
+// Reduce every distinct coefficient mod p.  One prime covers all the sample points that
+// share it, so this is the only place a pool coefficient is reduced.
+inline void reduce_pool_for_prime(SymCoeffPool &pool, uint64_t p) {
+  for (SymCoeff &c : pool.coeffs)
+    reduce_pool_coeff(c, p);
+}
+
+// Largest exponent each symbol carries anywhere in the pool's precompiled coefficients.
+inline std::vector<unsigned> sym_max_exps(const SymCoeffPool &pool, unsigned nvars) {
+  std::vector<unsigned> mx(nvars, 0);
+  for (const SymCoeff &c : pool.coeffs)
+    for (const SymPoly *poly : {&c.num, &c.den})
+      for (const SymTerm &t : poly->terms)
+        for (const auto &ve : t.vars)
+          mx[ve.first] = std::max<unsigned>(mx[ve.first], ve.second);
+  return mx;
+}
+
+// Power table sized for a pool's distinct coefficients and filled at one sample point --
+// the pool form of the overload above, and cheaper by the interning factor: the
+// exponents are read off the distinct functions (1329 of them at F234's size), not off
+// every entry of the system.
+inline std::vector<std::vector<uint64_t>>
+make_powers(const SymCoeffPool &pool, const fflow::UInt *x, unsigned nvars, uint64_t p) {
+  const std::vector<unsigned> mx = sym_max_exps(pool, nvars);
+  std::vector<std::vector<uint64_t>> powers(nvars, std::vector<uint64_t>(1, 1));
+  for (unsigned i = 0; i < nvars; ++i)
+    powers[i].resize(mx[i] + 1);
+  fill_powers(powers, x, p);
+  return powers;
+}
+
+// Evaluate one sample point: `values[i]` is the residue of `pool.coeffs[i]`, one entry per
+// distinct function.  The equations are not evaluated: every entry reads its coefficient
+// out of `values` through the pool's term table, which is what
+// forward_eliminate_planned's SymRowTable walks row by row, so a point holds one slot array
+// instead of a row per equation.  False when the tables were not reduced for `p` (see
+// reduce_pool_for_prime): the caller must not evaluate against the wrong modulus.
+inline bool eval_pool_point(const SymCoeffPool &pool, const GiNaC::exmap &subs,
+                            const std::vector<std::vector<uint64_t>> &powers,
+                            uint64_t p, std::vector<uint64_t> &values,
+                            std::uint64_t *zero_dens = nullptr) {
+  std::uint64_t zero_here = 0;
+  values.resize(pool.coeffs.size());
+  for (std::size_t i = 0; i < pool.coeffs.size(); ++i) {
+    bool zero_den = false;
+    if (!eval_sym_coeff_mod(pool.coeffs[i], subs, powers, p, values[i], &zero_den))
+      return false;
+    zero_here += zero_den ? 1 : 0;
+  }
+  // One count per distinct function, not per entry: the entries share the answer.
+  if (zero_dens)
+    *zero_dens += zero_here;
+  return true;
+}
+
+// The pool's `eq_idx` rows at one sample point, as numeric equations: the same result
+// `eval_sym_eqs_mod` produces from a materialised system, but with every distinct
+// coefficient evaluated once and each entry read out of the slot table.  `sys_idx[k]` is
+// the pool row `res_eqs[k]` came from, so a caller that indexes the system by the
+// learn's indices keeps working; a row whose coefficients all vanished is dropped, the
+// way the reference drops it.
+inline bool eval_pool_rows(const SymCoeffPool &pool, const std::vector<uint32_t> &eq_idx,
+                           const GiNaC::exmap &subs,
+                           const std::vector<std::vector<uint64_t>> &powers, uint64_t p,
+                           std::vector<ResEq> &res_eqs, std::vector<uint32_t> &sys_idx,
+                           std::uint64_t *zero_dens = nullptr) {
+  std::vector<uint64_t> values;
+  if (!eval_pool_point(pool, subs, powers, p, values, zero_dens))
+    return false;
+  res_eqs.clear();
+  sys_idx.clear();
+  res_eqs.reserve(eq_idx.size());
+  sys_idx.reserve(eq_idx.size());
+  for (uint32_t i : eq_idx) {
+    ResEq re;
+    for (std::size_t t = pool.eq_begin[i], te = pool.eq_begin[i + 1]; t < te; ++t) {
+      const uint64_t v = values[pool.terms[t].second];
+      if (v)
+        re.emplace_back(pool.terms[t].first, v);
+    }
+    if (!re.empty()) {
+      res_eqs.push_back(std::move(re));
+      sys_idx.push_back(i);
+    }
+  }
+  return true;
+}
+
 } // namespace secred
