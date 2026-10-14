@@ -74,14 +74,16 @@ void backward_eliminate(std::unordered_map<uint32_t, ResEq> &solmap, uint64_t p,
 // The sample-point path: one plan, one flat store, Shoup products
 // ---------------------------------------------------------------------------
 //
-// The learn, the numeric sufficiency repair and the sector stage solve a subset once, so
-// forward_eliminate's unordered_map<uint32_t, ResEq> is fine for them.  Reconstruction
-// solves the same subset at every sample point -- 547k pivots and ~20M terms per point at
-// F234's size, 1149 points -- and there the map costs one heap row and one hash entry per
-// pivot per point, plus a hash lookup per substituted term.  The three pieces below put
-// that path on a flat store, a precomputed order and a division-free product.  They
-// compute what forward_eliminate + backward_eliminate compute (tests/test_ffred.cpp pins
-// the two against each other row by row), only faster.
+// The sector stage solves a subset once, so forward_eliminate's unordered_map<uint32_t,
+// ResEq> is fine for it.  Reconstruction solves the same subset at every sample point --
+// 547k pivots and ~20M terms per point at F234's size, 1149 points -- and there the map
+// costs one heap row and one hash entry per pivot per point, plus a hash lookup per
+// substituted term.  The learn and the numeric sufficiency repair solve the whole system
+// too (the repair once per round, up to 64 of them), so they route through the same
+// pieces via solve_subset_planned (globalreduce.h).  The three pieces below put those
+// paths on a flat store, a precomputed order and a division-free product.  They compute
+// what forward_eliminate + backward_eliminate compute (tests/test_ffred.cpp pins the two
+// against each other row by row), only faster.
 
 // floor(c * 2^64 / p), the precomputed factor of shoup_mul: the merge multiplies one
 // coefficient c into a whole right-hand side, so the division that `c*x % p` needs is
@@ -259,19 +261,36 @@ struct FwdStore {
 // earlier prime) is dead weight -- one prime is seconds of work.  The call then returns
 // false with `store` holding whatever it had built so far; the caller is the reconstruction
 // worker, which drops the result instead of publishing it.
+//
+// `fwd_deps`, when given, receives the reference's own forward dependency map: for every
+// pivot registered, the pivots its row substituted on the way there (empty for a row that
+// substituted none, the way forward_eliminate records it).  The planned merge substitutes
+// the same sequence, so a caller holding the map -- the learn's cluster walk -- reads what
+// it would have read from the reference.  `row_src`, when given, receives the plan row
+// each registered solution came from, one entry per registration and in that order: a row
+// that reduced to zero registers nothing, so a solution's position in the store is not the
+// position it had in the order, and a caller that needs the latter (the learn's pivot ->
+// equation map) cannot recover it from the store alone.
 bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                std::size_t n_values, const FwdPlan &plan, uint64_t p,
                                FwdStore &store,
-                               const std::atomic<bool> *abort = nullptr);
+                               const std::atomic<bool> *abort = nullptr,
+                               std::unordered_map<uint32_t, std::vector<uint32_t>>
+                                   *fwd_deps = nullptr,
+                               std::vector<uint32_t> *row_src = nullptr);
 
 // backward_eliminate over `store`, restricted to `only_keys` (ascending; the lazy chain of
 // the reconstruction).  A rewritten row is appended as a new row and the key's row index
 // repointed: rows grow and shrink here, and the old row may still be read... it is not,
 // because keys ascend and every substituted id is smaller, so no reader is left behind.
-// `abort` is polled between keys, as above.
+// `abort` is polled between keys, as above.  `bwd_deps`, when given, receives the
+// reference's backward dependency map: per rewritten key, the derived ids it substituted
+// (keys that substituted none are left out, as backward_eliminate leaves them out).
 bool backward_eliminate_planned(FwdStore &store, uint64_t p,
                                 const std::vector<uint32_t> &only_keys,
-                                const std::atomic<bool> *abort = nullptr);
+                                const std::atomic<bool> *abort = nullptr,
+                                std::unordered_map<uint32_t, std::vector<uint32_t>>
+                                    *bwd_deps = nullptr);
 
 // Everything one subset solve produces: the solution map, the raw equation index of
 // each pivot, and the forward / backward dependencies.  Full-system learn, the numeric
@@ -285,7 +304,9 @@ struct SubSolve {
 
 // reduce_mod + forward_eliminate + backward_eliminate over the eq_idx subset of system.
 // want_fwd / want_bwd control whether eq_index+fwd_deps / bwd_deps are recorded;
-// only_keys follows backward_eliminate (ascending; nullptr = every reduction).
+// only_keys follows backward_eliminate (ascending; nullptr = every reduction).  The
+// learn and the numeric selection call solve_subset_planned (globalreduce.h) instead,
+// which materialises the same SubSolve through the flat store.
 void solve_subset(const std::vector<Eq> &system,
                   const std::vector<uint32_t> &eq_idx, uint64_t p,
                   SubSolve &out, bool want_fwd, bool want_bwd,

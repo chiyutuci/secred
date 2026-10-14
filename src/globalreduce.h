@@ -140,6 +140,21 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
 
 namespace secred {
 
+// solve_subset through the planned store: the same rows, the same pivots and the same
+// SubSolve, at the planned elimination's speed (2.4x the reference on one subset of
+// F234_N's size, measured).  The learn and the numeric selection read this instead; the
+// symbolic path and the reconstruction's per-prime solve keep their own entry points.
+//
+// `solmap_keys`, when given, restricts the materialised solution map to those ids -- the
+// caller's own read set, which for the selection is the targets' rows.  Materialising all
+// 570k of them per repair round is exactly what the flat store exists to avoid; nullptr
+// materialises every pivot, as solve_subset does.
+void solve_subset_planned(const std::vector<Eq> &system,
+                          const std::vector<std::uint32_t> &eq_idx, std::uint64_t p,
+                          SubSolve &out, bool want_fwd, bool want_bwd,
+                          const std::vector<std::uint32_t> *only_keys = nullptr,
+                          const std::vector<std::uint32_t> *solmap_keys = nullptr);
+
 // A global phase that did not complete (`ok == false`) leaves `reductions` empty or
 // truncated, so it is not a reduction table: writing one to cache/reductions and
 // exiting 0 would report a silently wrong result.  Every in-process caller checks the

@@ -4,6 +4,8 @@
 // reduce_mod + forward_eliminate + backward_eliminate, term for term.
 #include <algorithm>
 #include <cstdint>
+#include <sstream>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -287,5 +289,172 @@ TEST(numeric_plan_solves_concurrently) {
   for (std::size_t i = 0; i < primes.size(); ++i) {
     REQUIRE(!serial[i].empty());
     REQUIRE(parallel[i] == serial[i]);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Task 3: the subset solve through the planned store
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// A SubSolve flattened to sorted lines, one per entry of the four maps, so two solves
+// compare exactly -- including whether a key is present with an empty dependency list.
+std::vector<std::string> flattened(const secred::SubSolve &s) {
+  std::vector<std::string> out;
+  auto ids = [](const std::vector<std::uint32_t> &v) {
+    std::ostringstream oss;
+    for (std::uint32_t u : v)
+      oss << " " << u;
+    return oss.str();
+  };
+  for (const auto &kv : s.solmap) {
+    std::ostringstream oss;
+    oss << "solmap " << kv.first << ":";
+    for (const auto &t : kv.second)
+      oss << " " << t.first << "=" << t.second;
+    out.push_back(oss.str());
+  }
+  for (const auto &kv : s.eq_index)
+    out.push_back("eq_index " + std::to_string(kv.first) + "=" +
+                  std::to_string(kv.second));
+  for (const auto &kv : s.fwd_deps)
+    out.push_back("fwd_deps " + std::to_string(kv.first) + ":" + ids(kv.second));
+  for (const auto &kv : s.bwd_deps)
+    out.push_back("bwd_deps " + std::to_string(kv.first) + ":" + ids(kv.second));
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// A deterministic system wide enough for multi-step substitution chains: `nvars` ids,
+// `neqs` rows, each row a subset of the ids below a biased front, descending and unique,
+// with small rational coefficients (identically zero ones dropped, as the reader drops
+// them).  A numerator like 3 or -3 vanishes at p = 3, which is what drives the plan check
+// and the rebuilt order.
+std::vector<secred::Eq> generated_system(unsigned neqs, unsigned nvars,
+                                         std::uint64_t seed) {
+  std::uint64_t s = seed;
+  auto next = [&s]() {
+    s = s * 6364136223846793005ull + 1442695040888963407ull;
+    return s >> 33;
+  };
+  std::vector<secred::Eq> system(neqs);
+  for (unsigned e = 0; e < neqs; ++e) {
+    const unsigned front = nvars - 1 - static_cast<unsigned>(next() % (nvars / 2));
+    std::vector<std::pair<std::uint32_t, secred::Rat64>> row;
+    row.emplace_back(front, secred::Rat64{1, 1});
+    for (unsigned id = 0; id < front; ++id)
+      if (next() % 3 == 0)
+        row.emplace_back(id, secred::Rat64{static_cast<std::int64_t>(next() % 7) - 3,
+                                           static_cast<std::int64_t>(next() % 5) + 1});
+    row.erase(std::remove_if(row.begin(), row.end(),
+                             [](const auto &t) { return t.second.num == 0; }),
+              row.end());
+    std::sort(row.begin(), row.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    system[e] = std::move(row);
+  }
+  return system;
+}
+
+std::vector<std::uint32_t> all_idx(unsigned n) {
+  std::vector<std::uint32_t> idx(n);
+  for (unsigned i = 0; i < n; ++i)
+    idx[i] = i;
+  return idx;
+}
+
+// The first line where two flattened solves disagree, with what each side holds -- the
+// comparison is a whole-structure one, so a bare false says nothing about which map or
+// which pivot went its own way.
+std::string solve_difference(const secred::SubSolve &got,
+                             const secred::SubSolve &ref) {
+  const std::vector<std::string> a = flattened(got), b = flattened(ref);
+  for (std::size_t i = 0; i < a.size() && i < b.size(); ++i)
+    if (a[i] != b[i])
+      return "line " + std::to_string(i) + ": got [" + a[i] + "] want [" + b[i] + "]";
+  if (a.size() != b.size())
+    return "sizes " + std::to_string(a.size()) + " vs " + std::to_string(b.size());
+  return "equal";
+}
+
+} // namespace
+
+// solve_subset_planned must hand back exactly what solve_subset does -- the same solution
+// map, the same pivot -> equation index map and the same two dependency maps -- because
+// the learn and the selection read either interchangeably while the reconstruction keeps
+// solving through the store.  The primes include ones where a coefficient vanishes (3 and
+// 2 on the toy system), which is where the planned elimination leaves the hoisted order.
+TEST(planned_subset_solve_matches_solve_subset) {
+  const std::vector<secred::Eq> system = toy_system();
+  const std::vector<std::uint64_t> primes = {kBigPrime, 5, 3, 2};
+  const std::vector<std::pair<bool, bool>> wants = {
+      {true, true}, {true, false}, {false, true}, {false, false}};
+  for (std::uint64_t p : primes)
+    for (const auto &w : wants) {
+      secred::SubSolve ref, got;
+      secred::solve_subset(system, kEqIdx, p, ref, w.first, w.second, nullptr);
+      secred::solve_subset_planned(system, kEqIdx, p, got, w.first, w.second);
+      REQUIRE(flattened(got) == flattened(ref));
+    }
+}
+
+// The same equivalence on a generated system, so the comparison covers chains several
+// substitutions deep and rows a vanishing coefficient shortens.
+TEST(planned_subset_solve_matches_solve_subset_on_generated_systems) {
+  const std::vector<std::uint64_t> primes = {kBigPrime, 7, 5, 3};
+  for (std::uint64_t seed : {1ull, 2ull, 3ull}) {
+    const std::vector<secred::Eq> system = generated_system(40, 24, seed);
+    const std::vector<std::uint32_t> idx = all_idx(40);
+    for (std::uint64_t p : primes) {
+      secred::SubSolve ref, got;
+      secred::solve_subset(system, idx, p, ref, true, true, nullptr);
+      secred::solve_subset_planned(system, idx, p, got, true, true);
+      const std::string diff = solve_difference(got, ref);
+      REQUIRE_MSG(flattened(got) == flattened(ref),
+                  "seed " + std::to_string(seed) + " p " + std::to_string(p) + ": " +
+                      diff);
+      if (ref.solmap.empty())
+        continue; // nothing to restrict
+      // The reference's lazy chain (one pivot is enough to exercise the restriction),
+      // solved through both paths.
+      const std::vector<std::uint32_t> chain{ref.solmap.begin()->first};
+      secred::SubSolve ref_chain, got_chain;
+      secred::solve_subset(system, idx, p, ref_chain, false, true, &chain);
+      secred::solve_subset_planned(system, idx, p, got_chain, false, true, &chain);
+      REQUIRE(flattened(got_chain) == flattened(ref_chain));
+    }
+  }
+}
+
+// solmap_keys is the caller's own read set: only those pivots' rows are materialised, and
+// each of them is the row the reference solve holds.  The selection reads nothing else --
+// it looks a target up and walks bwd_deps -- so this is what keeps its two solves off the
+// 570k-row map.
+TEST(planned_subset_solve_restricts_the_solmap_to_the_read_set) {
+  const std::vector<secred::Eq> system = toy_system();
+  const std::vector<std::uint64_t> primes = {kBigPrime, 5, 3, 2};
+  for (std::uint64_t p : primes) {
+    secred::SubSolve ref;
+    secred::solve_subset(system, kEqIdx, p, ref, false, true, nullptr);
+
+    std::vector<std::uint32_t> read_set = kTargets;
+    read_set.push_back(0); // an id the caller reads whether or not it is a pivot
+    secred::SubSolve got;
+    secred::solve_subset_planned(system, kEqIdx, p, got, false, true, nullptr,
+                                 &read_set);
+
+    for (std::uint32_t id : read_set) {
+      auto rit = ref.solmap.find(id);
+      auto git = got.solmap.find(id);
+      REQUIRE((git != got.solmap.end()) == (rit != ref.solmap.end()));
+      if (rit != ref.solmap.end())
+        REQUIRE(git->second == rit->second);
+    }
+    REQUIRE(got.solmap.size() <= read_set.size());
+    // Everything else is still the reference's.
+    REQUIRE(got.bwd_deps == ref.bwd_deps);
+    REQUIRE(got.fwd_deps.empty());
+    REQUIRE(got.eq_index.empty());
   }
 }

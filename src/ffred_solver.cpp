@@ -422,7 +422,10 @@ void FwdStore::reset(std::size_t n_ids) {
 
 bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                std::size_t n_values, const FwdPlan &plan, uint64_t p,
-                               FwdStore &store, const std::atomic<bool> *abort) {
+                               FwdStore &store, const std::atomic<bool> *abort,
+                               std::unordered_map<uint32_t, std::vector<uint32_t>>
+                                   *fwd_deps,
+                               std::vector<uint32_t> *row_src) {
   // The rows handed in are the pool's rows minus whatever vanished at this point (a
   // numerator or a denominator that is 0 mod p), and a dropped coefficient moves its row
   // in the reference's order: the row is shorter, and if the front term went, its front
@@ -446,11 +449,13 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
 
   Row &pend = store.pend;
   Row &merged = store.merged;
+  std::vector<uint32_t> deps; // the pivots this row substituted, when asked for
   for (uint32_t k : *store.order_ptr) {
     if (abort && abort->load(std::memory_order_relaxed))
       return false;
     // This point's row k, gathered on demand: the row's terms whose coefficient did not
     // vanish here.  Descending id, as the merge below assumes.
+    deps.clear();
     pend.clear();
     for (std::size_t t = rows.begin(k), te = rows.begin(k + 1); t < te; ++t) {
       const uint64_t v = values[rows.terms[t].second];
@@ -479,6 +484,8 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
 
       const uint32_t w = pend.ids[idx];
       const uint64_t c = pend.vals[idx];
+      if (fwd_deps)
+        deps.push_back(w);
       const uint32_t row = store.row_of[w];
       const uint32_t rb = store.begin[row], rl = store.len[row];
       const uint32_t *rids = store.ids.data() + rb;
@@ -556,15 +563,22 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
     for (std::size_t t = 0; t < pend.n; ++t)
       store.vals.push_back(shoup_mul(pend.vals[t], neg_inv, np, p));
     store.mark(pivot, row);
+    if (fwd_deps)
+      (*fwd_deps)[pivot] = std::move(deps); // the reference inserts the empty ones too
+    if (row_src)
+      row_src->push_back(k);
   }
   return true;
 }
 
 bool backward_eliminate_planned(FwdStore &store, uint64_t p,
                                 const std::vector<uint32_t> &only_keys,
-                                const std::atomic<bool> *abort) {
+                                const std::atomic<bool> *abort,
+                                std::unordered_map<uint32_t, std::vector<uint32_t>>
+                                    *bwd_deps) {
   std::vector<std::pair<uint32_t, uint64_t>> masters;
   std::vector<std::pair<uint32_t, uint64_t>> out;
+  std::vector<uint32_t> deps;
   for (uint32_t k : only_keys) {
     if (abort && abort->load(std::memory_order_relaxed))
       return false;
@@ -576,6 +590,7 @@ bool backward_eliminate_planned(FwdStore &store, uint64_t p,
     const uint32_t row = store.row_of[k];
     const uint32_t rb = store.begin[row], rl = store.len[row];
     masters.clear();
+    deps.clear();
     for (uint32_t i = 1; i < rl; ++i) {
       const uint32_t id = store.ids[rb + i];
       const uint64_t c = store.vals[rb + i];
@@ -584,6 +599,8 @@ bool backward_eliminate_planned(FwdStore &store, uint64_t p,
       } else {
         // Derived: substitute one level deep.  Keys ascend and the row of a smaller id
         // has already been rewritten, so its right-hand side carries masters only.
+        if (bwd_deps)
+          deps.push_back(id);
         const uint32_t sb = store.begin[store.row_of[id]];
         const uint32_t sl = store.len[store.row_of[id]];
         const uint64_t cp = shoup_precomp(c, p);
@@ -624,6 +641,8 @@ bool backward_eliminate_planned(FwdStore &store, uint64_t p,
       store.vals.push_back(t.second);
     }
     store.row_of[k] = nr;
+    if (bwd_deps && !deps.empty())
+      (*bwd_deps)[k] = std::move(deps);
   }
   return true;
 }

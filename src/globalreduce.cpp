@@ -129,6 +129,77 @@ void NumericEvalPlan::fill_values(std::uint64_t p,
     values[s] = secred::rat_mod_u64(coeffs[s].num, coeffs[s].den, p);
 }
 
+namespace secred {
+
+void solve_subset_planned(const std::vector<Eq> &system,
+                          const std::vector<std::uint32_t> &eq_idx, std::uint64_t p,
+                          SubSolve &out, bool want_fwd, bool want_bwd,
+                          const std::vector<std::uint32_t> *only_keys,
+                          const std::vector<std::uint32_t> *solmap_keys) {
+  out.solmap.clear();
+  out.eq_index.clear();
+  out.fwd_deps.clear();
+  out.bwd_deps.clear();
+
+  NumericEvalPlan plan;
+  plan.build(system, eq_idx);
+  std::vector<std::uint64_t> values;
+  plan.fill_values(p, values);
+  FwdStore store;
+  store.reset(plan.store_ids);
+  std::vector<std::uint32_t> row_src; // plan row of each registered solution
+  forward_eliminate_planned(plan.rows(), values.data(), values.size(), plan.plan, p,
+                            store, nullptr, want_fwd ? &out.fwd_deps : nullptr,
+                            want_fwd ? &row_src : nullptr);
+  // The back substitution appends rows of its own, so the pivots are the rows the forward
+  // pass registered -- everything below reads the store through that count.
+  const std::size_t n_fwd_rows = store.rows();
+
+  // The reference back-substitutes over every pivot, ascending; a caller with a lazy chain
+  // restricts it to those keys.
+  std::vector<std::uint32_t> keys;
+  if (only_keys) {
+    keys = *only_keys;
+  } else {
+    keys.reserve(n_fwd_rows);
+    for (std::size_t r = 0; r < n_fwd_rows; ++r)
+      keys.push_back(store.ids[store.begin[r]]);
+    std::sort(keys.begin(), keys.end());
+  }
+  backward_eliminate_planned(store, p, keys, nullptr,
+                             want_bwd ? &out.bwd_deps : nullptr);
+
+  // The rows as the reference's maps hold them -- after the back substitution rewrote
+  // them, whole for a caller that wants all of them (the learn) and for the caller's own
+  // read set only where it named one (the selection's targets).
+  auto materialise = [&](std::uint32_t id) {
+    const std::uint32_t *ri = store.row_ids(id);
+    const std::uint64_t *rv = store.row_vals(id);
+    const std::uint32_t n = store.row_size(id);
+    ResEq re;
+    re.reserve(n);
+    for (std::uint32_t t = 0; t < n; ++t)
+      re.emplace_back(ri[t], rv[t]);
+    out.solmap[id] = std::move(re);
+  };
+  if (solmap_keys) {
+    for (std::uint32_t id : *solmap_keys)
+      if (store.has_row(id))
+        materialise(id);
+  } else {
+    for (std::size_t r = 0; r < n_fwd_rows; ++r)
+      materialise(store.ids[store.begin[r]]);
+  }
+
+  // pivot -> the raw equation that registered it, through the source row the forward pass
+  // recorded for each solution.
+  if (want_fwd)
+    for (std::size_t r = 0; r < n_fwd_rows; ++r)
+      out.eq_index[store.ids[store.begin[r]]] = plan.sys_idx[row_src[r]];
+}
+
+} // namespace secred
+
 bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
                          const std::vector<std::uint32_t> &bwd_chain,
                          const std::vector<unsigned> &dep_targets,
@@ -432,30 +503,24 @@ GlobalReductionResult reduce_global_finiteflow(
   // 3) Learn once at the learn prime: forward elimination -> masters + structure +
   // dependencies (for mark-and-sweep).
   const uint64_t learn_prime = ff::BIG_UINT_PRIMES[0];
-  std::unordered_map<uint32_t, secred::ResEq> learn_solmap;
-  std::unordered_map<uint32_t, uint32_t> eq_index; // pivot -> raw equation index
-  std::unordered_map<uint32_t, std::vector<uint32_t>> fwd_deps, bwd_deps;
+  // The whole system through the planned store: the same four maps the reference solve
+  // produces (see solve_subset_planned), at the planned elimination's speed.
+  secred::SubSolve learn;
   double learn_s = 0.0;
   {
     auto t_learn0 = std::chrono::steady_clock::now();
-    std::vector<secred::ResEq> res_eqs;
-    std::vector<uint32_t> sys_idx;
-    res_eqs.reserve(neqs);
-    sys_idx.reserve(neqs);
-    for (std::size_t i = 0; i < system.size(); ++i) {
-      secred::ResEq re;
-      secred::reduce_mod(system[i], learn_prime, re);
-      if (!re.empty()) {
-        res_eqs.push_back(std::move(re));
-        sys_idx.push_back(static_cast<uint32_t>(i));
-      }
-    }
-    secred::forward_eliminate(res_eqs, sys_idx, learn_prime, learn_solmap,
-                              &eq_index, &fwd_deps);
-    secred::backward_eliminate(learn_solmap, learn_prime, &bwd_deps);
+    std::vector<uint32_t> all_eq_idx;
+    all_eq_idx.reserve(neqs);
+    for (std::size_t i = 0; i < system.size(); ++i)
+      all_eq_idx.push_back(static_cast<uint32_t>(i));
+    secred::solve_subset_planned(system, all_eq_idx, learn_prime, learn, true, true);
     auto t_learn1 = std::chrono::steady_clock::now();
     learn_s = std::chrono::duration<double>(t_learn1 - t_learn0).count();
   }
+  std::unordered_map<uint32_t, secred::ResEq> &learn_solmap = learn.solmap;
+  std::unordered_map<uint32_t, uint32_t> &eq_index = learn.eq_index;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> &fwd_deps = learn.fwd_deps;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> &bwd_deps = learn.bwd_deps;
 
   // Masters = union of the integrals on the right-hand sides of the target reductions
   // (the reduction is fully recursive, so a right-hand side is exactly masters).
@@ -575,7 +640,11 @@ GlobalReductionResult reduce_global_finiteflow(
   {
     auto solve_at_learn = [&](const std::vector<uint32_t> &idx,
                               secred::SubSolve &sub) {
-      secred::solve_subset(system, idx, learn_prime, sub, false, true);
+      // The selection reads the targets' rows and the backward chain, so only those rows
+      // are materialised: the repair can run a dozen rounds, and each round's full
+      // 570k-row solution map would be seconds of hashing the store already holds.
+      secred::solve_subset_planned(system, idx, learn_prime, sub, false, true, nullptr,
+                                   &dep_targets);
     };
     GlobalSelection gsel =
         select_global_forward(eq_index, fwd_deps, learn_solmap, dep_targets,
@@ -621,15 +690,7 @@ GlobalReductionResult reduce_global_finiteflow(
   // equation map -- are read only up there (the selection, the diagnostics, the legacy
   // closure).  Releasing them hands the reconstruction their memory instead of keeping it
   // alive across the primes.
-  {
-    std::unordered_map<uint32_t, secred::ResEq> no_res;
-    std::unordered_map<uint32_t, std::vector<uint32_t>> no_deps;
-    learn_solmap.swap(no_res);
-    fwd_deps.swap(no_deps);
-    bwd_deps.swap(no_deps);
-  }
-  eq_index.clear();
-  eq_index.rehash(0);
+  learn = secred::SubSolve{};
 
   {
     secred::LearnSummary ls;
