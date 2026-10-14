@@ -85,9 +85,28 @@ inline GlobalSelection select_global_forward(
   out.n_fwd_only = needed.size();
   out.needed_eq_idx = eq_idx_of(needed);
 
+  // The row set the last solve ran on.  A repair round can add an integral without
+  // growing the closure (the added pivot's equation was already selected), and re-solving
+  // an unchanged row set at the same prime reproduces the same result: the missing set
+  // cannot shrink, so the loop would spend every remaining round on identical solves
+  // before falling back.  Recognise that stall after the one wasted solve.
+  std::vector<uint32_t> solved_idx;
+
   for (unsigned round = 0; round < max_repair_rounds; ++round) {
+    if (round != 0 && out.needed_eq_idx == solved_idx) {
+      std::cerr << "finiteflow global reduction: forward selection cannot be "
+                   "repaired: the repair added "
+                << out.n_repair_added
+                << " integral(s) that register no new equation, so re-solving the "
+                   "unchanged set would repeat the last result; falling back to the "
+                   "legacy closure\n";
+      out.ok = false;
+      out.fallback = true;
+      return out;
+    }
     secred::SubSolve sub;
     solve(out.needed_eq_idx, sub);
+    solved_idx = out.needed_eq_idx;
 
     // Sufficiency test: every target must be solved, and its reduction may only
     // have masters on the right-hand side.  When that holds the sub-solve

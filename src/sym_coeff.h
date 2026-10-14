@@ -667,9 +667,12 @@ inline bool eval_pool_rows(const SymCoeffPool &pool, const std::vector<uint32_t>
   sys_idx.clear();
   res_eqs.reserve(eq_idx.size());
   sys_idx.reserve(eq_idx.size());
+  ResEq re; // hoisted: a dropped row's buffer is reused by the next row
   for (uint32_t i : eq_idx) {
-    ResEq re;
-    for (std::size_t t = pool.eq_begin[i], te = pool.eq_begin[i + 1]; t < te; ++t) {
+    re.clear();
+    const std::size_t t0 = pool.eq_begin[i], t1 = pool.eq_begin[i + 1];
+    re.reserve(t1 - t0); // the row's size up front, not a doubling sequence
+    for (std::size_t t = t0; t < t1; ++t) {
       const uint64_t v = values[pool.terms[t].second];
       if (v)
         re.emplace_back(pool.terms[t].first, v);

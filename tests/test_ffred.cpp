@@ -422,6 +422,53 @@ TEST(global_forward_repair_cap_falls_back) {
   REQUIRE(capped.needed_eq_idx == (std::vector<uint32_t>{0u, 1u}));
 }
 
+// A repair round that adds an integral which registers no new equation ("the closure did
+// not grow") can never converge: the next solve would run on the identical row set at the
+// identical prime and reproduce the identical result, so the missing set cannot shrink and
+// the loop would burn every one of its 64 rounds on it before falling back.  The guard
+// recognises the stall after that one solve and returns to the legacy closure at once.
+// The counter is the observable; the stub solver is what makes the stall reachable at unit
+// scale (a real elimination settles this fixture inside round 0).
+TEST(global_forward_repair_stall_skips_resolve) {
+  // Forward closure of I_127 = {127, 126, 125}: all three equations are already selected,
+  // and I_125 is a reducible integral (a full-system pivot), so the repair adds it as a
+  // seed and nothing changes.
+  std::unordered_map<uint32_t, uint32_t> eq_index{{127u, 1u}, {126u, 0u}, {125u, 3u}};
+  std::unordered_map<uint32_t, std::vector<uint32_t>> fwd_deps{{127u, {126u, 125u}}};
+  std::unordered_map<uint32_t, ResEq> full_pivots{{126u, {}}, {127u, {}}, {125u, {}}};
+  std::vector<unsigned> dep_targets{127u};
+  std::unordered_map<unsigned, unsigned> master_index{{1u, 0u}};
+  unsigned calls = 0;
+
+  GlobalSelection sel = select_global_forward(
+      eq_index, fwd_deps, full_pivots, dep_targets, master_index,
+      [&](const std::vector<uint32_t> &idx, secred::SubSolve &sub) {
+        ++calls;
+        REQUIRE(idx == (std::vector<uint32_t>{0u, 1u, 3u}));
+        // I_127 = I_125: the right-hand side keeps a non-master the subset cannot remove.
+        sub.solmap[127u] = ResEq{{127u, 1u}, {125u, 1u}};
+      });
+
+  REQUIRE_EQ(calls, 1u); // solved once, then the stall is recognised
+  REQUIRE(!sel.ok);
+  REQUIRE(sel.fallback);
+  REQUIRE_EQ(sel.n_repair_added, 1u); // I_125 was offered back as a seed ...
+  REQUIRE(sel.needed_eq_idx == (std::vector<uint32_t>{0u, 1u, 3u})); // ... and added no row
+
+  // The guard must not skip a solve whose row set did change: the real fixture needs two
+  // (the forward closure, then the repaired set).
+  LearnCtx c;
+  unsigned real_calls = 0;
+  GlobalSelection real_sel = select_global_forward(
+      c.eq_index, c.fwd_deps, c.solmap, c.dep_targets, c.master_index,
+      [&](const std::vector<uint32_t> &idx, secred::SubSolve &sub) {
+        ++real_calls;
+        solve_at_learn(c.system, P, idx, sub);
+      });
+  REQUIRE(real_sel.ok);
+  REQUIRE_EQ(real_calls, 2u);
+}
+
 // Chain invariants: bwd_chain lies among the subset solmap's keys (INV-1) and is closed
 // under the subset's backward dependencies (INV-2); and restricting back substitution to
 // only_keys = bwd_chain matches the unrestricted run term by term on every chain key --

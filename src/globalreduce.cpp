@@ -450,18 +450,23 @@ GlobalReductionResult reduce_global_finiteflow(
   // Masters = union of the integrals on the right-hand sides of the target reductions
   // (the reduction is fully recursive, so a right-hand side is exactly masters).
   // Not "ids in 0..nvars-1 never solved": that would count isolated variables as masters.
-  std::set<unsigned> needed_masters;
+  std::unordered_set<unsigned> needed_masters;
   for (unsigned id : target_ids) {
     auto it = learn_solmap.find(id);
     if (it == learn_solmap.end())
       continue; // target is itself a master (no reduction)
     const secred::ResEq &red = it->second;
-    for (size_t k = 1; k < red.size(); ++k)
+    for (std::size_t k = 1; k < red.size(); ++k)
       needed_masters.insert(red[k].first);
   }
   // Masters in descending id, matching the order of the original FiniteFlow path's
   // needed_indepvars() (ascending column = descending id).
-  std::vector<unsigned> masters(needed_masters.rbegin(), needed_masters.rend());
+  std::vector<unsigned> masters;
+  masters.reserve(needed_masters.size());
+  for (unsigned id : needed_masters)
+    masters.push_back(id);
+  std::sort(masters.begin(), masters.end(),
+            [](unsigned a, unsigned b) { return a > b; });
   const unsigned nnindeps = masters.size();
 
   // Reducible targets (present in learn_solmap), in the caller's target order.
@@ -601,6 +606,20 @@ GlobalReductionResult reduce_global_finiteflow(
 
   res.selected_equations = static_cast<std::uint64_t>(learn_solmap.size());
   res.raw_equations = neqs;
+
+  // The learn's own structures -- the reductions, the dependency graphs and the pivot ->
+  // equation map -- are read only up there (the selection, the diagnostics, the legacy
+  // closure).  Releasing them hands the reconstruction their memory instead of keeping it
+  // alive across the primes.
+  {
+    std::unordered_map<uint32_t, secred::ResEq> no_res;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> no_deps;
+    learn_solmap.swap(no_res);
+    fwd_deps.swap(no_deps);
+    bwd_deps.swap(no_deps);
+  }
+  eq_index.clear();
+  eq_index.rehash(0);
 
   {
     secred::LearnSummary ls;
