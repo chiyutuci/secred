@@ -32,6 +32,10 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
+  ordering_mode: balance      # integral ordering: normal (generation order) | balance (default;
+                              # seeds, subsector columns and the global numbering all follow the
+                              # balance key: total power, depth, rank, max denominator power,
+                              # max numerator power)
   gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
   cache_dir: cache_F234_S     # directory for the run's output (reductions, masters, logs)
 
