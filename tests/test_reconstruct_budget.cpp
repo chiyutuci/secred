@@ -128,6 +128,37 @@ TEST(default_reserve_no_longer_caps_the_n1_pool) {
   REQUIRE(kWatchdogBytes - (kNthreads * n1_per_worker() + kStructuresBytes) < 20ull * kGiB);
 }
 
+// Why the pool is sized from a measurement and not from the model above: the F1 n=1 run
+// that went through the model-sized pool.  It printed `59 of 64 thread(s), 6.85 GB per
+// worker within a 443.71 GB budget`, i.e. the cap read an RSS in (ceiling - 60p, ceiling -
+// 59p], and then the process reached 479 GB of RSS -- 493 GB machine-wide -- with the first
+// prime's fill still running, where the driver's watchdog killed it (rc=143).  Backing one
+// store out of that peak against the RSS the cap read gives >= 7.45 GB, so the model is at
+// least 9 % low -- a lower bound, since the fill had not finished -- and the peak arrives
+// during the fill, so the backstop could not have saved it.
+TEST(the_model_was_at_least_nine_percent_low_at_the_f1_n1_pool) {
+  const std::uint64_t ceiling = machine_ceiling();
+  const std::uint64_t modelled = 685ull * kGiB / 100; // the printed 6.85 GB per worker
+  // What the cap that admitted 59 implies about the RSS it was given.
+  const std::uint64_t rss_lo = ceiling - 60 * modelled; // exclusive
+  const std::uint64_t rss_hi = ceiling - 59 * modelled; // inclusive
+  REQUIRE(reconstruction_worker_cap(ceiling, rss_lo + 1, modelled, kNthreads, kNprimeMax) ==
+          59);
+  REQUIRE(reconstruction_worker_cap(ceiling, rss_hi, modelled, kNthreads, kNprimeMax) == 59);
+  // One store, from the peak the run reached before it was killed.
+  constexpr std::uint64_t kObservedPeak = 479ull * kGiB;
+  const std::uint64_t measured_lo = (kObservedPeak - rss_hi) / 59;
+  const std::uint64_t measured_hi = (kObservedPeak - rss_lo) / 59;
+  REQUIRE(measured_lo > modelled);
+  REQUIRE(measured_hi < 8ull * kGiB); // ~7.5 GB: bigger than the model, not double
+  // Sized from that store instead, the same ceiling admits fewer threads -- and the pool it
+  // admits stays inside the ceiling, which is the property the model-sized one lost.
+  const unsigned from_measure = reconstruction_worker_cap(
+      ceiling, rss_hi, measured_hi, kNthreads, kNprimeMax - 1);
+  REQUIRE(from_measure < 59);
+  REQUIRE(rss_hi + static_cast<std::uint64_t>(from_measure) * measured_hi <= ceiling);
+}
+
 // What the cap is for: whatever it admits, the structures already resident plus the
 // stores the pool will allocate stay under the ceiling -- and with the machine's own
 // ceiling under the driver's line, under that too.

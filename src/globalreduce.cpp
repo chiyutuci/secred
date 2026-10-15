@@ -308,20 +308,61 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
   // holds the whole selected solution), so the pool is capped by the prime count -- and
   // by the memory budget, which is the binding one at F1's sizes: the phase costs one
   // store per worker, and nothing used to bound that product.
-  const std::uint64_t per_worker =
-      secred::reconstruction_worker_bytes(plan.terms.size(), plan.store_ids);
+  //
+  // What one store costs is **measured** here rather than modelled: prime 0 is solved on
+  // this thread with a single store, and the RSS that took is what the pool is sized from.
+  // A model is not enough at F1's sizes -- `reconstruction_worker_bytes` read 6.85 GB per
+  // worker for F1 balance n=1, where the run's own RSS puts the store at 7.45 GB or more,
+  // and the peak arrives *during* the first prime's fill (the store grows as the forward
+  // pass runs), so no worker ever reaches the prime boundary where the backstop below
+  // could retire it.  The estimate has to be right before the pool exists.
+  //
+  // The pre-flight is one prime's work on one thread -- ~2 s at F234_N's size, minutes at
+  // F1 n=1's -- and its result is prime 0's, so the phase loses the parallelism of a
+  // single prime and nothing else.
   const std::uint64_t ceiling = secred::reconstruction_ceiling(
       max_memory, memory_reserve, system_memory().total);
+  const std::uint64_t rss_before = process_used_memory();
+  std::uint64_t measured = 0;
+  {
+    secred::FwdStore probe_store;
+    std::vector<std::uint64_t> probe_values;
+    PrimeSlot &probe_slot = slots[0];
+    const auto t0 = std::chrono::steady_clock::now();
+    probe_slot.ok = solve_prime_numeric(plan, ff::BIG_UINT_PRIMES[0], bwd_chain,
+                                        dep_targets, masters, master_index, probe_store,
+                                        probe_values, probe_slot.xout,
+                                        probe_slot.fail_target, probe_slot.fail_integral,
+                                        &stop);
+    probe_slot.seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const std::uint64_t rss_after = process_used_memory();
+    if (probe_slot.ok && rss_after > rss_before)
+      measured = rss_after - rss_before; // one worker's store, including its slot
+  }
+  // The measurement is the estimate; the model stays as the fallback for a pre-flight that
+  // could not be measured, and as the figure the log prints beside it.
+  const std::uint64_t modelled =
+      secred::reconstruction_worker_bytes(plan.terms.size(), plan.store_ids);
+  const std::uint64_t per_worker = measured != 0 ? measured : modelled;
+  // Prime 0 is already solved, so the pool shares out one prime less.
   const unsigned nworkers = secred::reconstruction_worker_cap(
-      ceiling, process_used_memory(), per_worker, nthreads,
-      static_cast<unsigned>(nprime_max));
+      ceiling, rss_before, per_worker, nthreads,
+      static_cast<unsigned>(nprime_max - 1));
   // Where the backstop below stops retiring.
   const unsigned trim_floor = secred::reconstruction_trim_floor(nworkers);
   std::atomic<unsigned> running{0};
   std::cout << "  " << secred::kFlowTag << " reconstruct pool: " << nworkers << " of "
             << nthreads << " thread(s), " << secred::format_memory(per_worker)
-            << " per worker within a " << secred::format_memory(ceiling) << " budget\n"
-            << std::flush;
+            << " per worker";
+  if (measured != 0)
+    std::cout << " measured (model " << secred::format_memory(modelled) << ")";
+  else
+    std::cout << " from the model (the pre-flight could not be measured)";
+  std::cout << " within a " << secred::format_memory(ceiling) << " budget\n" << std::flush;
+  // Prime 0's slot is filled by the pre-flight above; the pool starts at prime 1.
+  next.store(1, std::memory_order_relaxed);
+  slots[0].ready = true;
   std::vector<std::thread> workers;
   workers.reserve(nworkers);
   for (unsigned w = 0; w < nworkers; ++w) {

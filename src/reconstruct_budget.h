@@ -19,17 +19,28 @@
 //
 // 18 B per term is the calibrated figure: 12 B of id + value per term, times the 1.5
 // average tail capacity of a vector grown by doubling, plus 4 B per integral id for
-// `row_of`, which `reset` sizes eagerly.  It is a model of a store's cost, not a
-// measurement of the run's -- which is why `reconstruct_ffred` also keeps a backstop
-// that retires workers once the process's own RSS passes the ceiling the pool was sized
-// against.
+// `row_of`, which `reset` sizes eagerly.  It is a **model**, and the measurement below is
+// what replaces it: at F1 n=1 the model said 6.85 GB per worker, the pool of 59 it
+// admitted reached 479 GB of RSS with the fill still in progress, and the driver's
+// watchdog killed the run there (rc=143, machine at 493 GB).  One store, backed out of
+// that peak with the RSS the cap itself must have read (33-40 GB, from the pool it
+// admitted), is >= 7.45 GB: the model is at least 9 % low, and that is a *lower* bound,
+// since the fill had not finished.  The fill is the memory, and it takes the whole of the
+// first prime, so the backstop (which retires a worker only at a prime boundary) cannot
+// fire before the peak: the estimate has to be right before the pool exists.
+// `reconstruct_ffred` therefore solves prime 0 on one thread and one store first, and
+// sizes the pool from that measurement; this model is the fallback for a pre-flight that
+// could not be measured, and the figure the log prints beside the measurement.
 //
 // `memory_reserve` defaults to 30 GB since 2026-10-15 (it was 60).  On this 503.7 GiB box
-// that moves the ceiling from 443.71 GB to 473.67 GB, which is above what n=1's stores
-// plus the resident structures need, so at F1's size the cap binds no longer and the pool
-// is 64 again: the budget below is what holds the phase to the configured memory, and a
-// larger reserve is what makes it hold the phase back.  The F1 n=1 run archived in
-// bench/F1_numeric/ ran at 60 -- it had already parsed its config when the default moved.
+// that moves the ceiling from 443.71 GB to 473.67 GB, which at F1 n=1's size is *not* the
+// safer of the two: the measured store (>= 7.45 GB) puts ~55 workers under 473.67 GB,
+// whose own footprint lands within ~10 GB of the 480 GiB whole-machine line the driver
+// watching that box enforces, while 443.71 GB gives ~51 workers and ~40 GB of margin.  A
+// run of that size therefore wants the reserve stated explicitly --
+// bench/F1_numeric/f1_balance_n1.yaml pins 60 for exactly this reason, and the F1 n=1 runs
+// archived in bench/F1_numeric/ ran at 60 (they had already parsed their config when the
+// default moved).
 
 #include <algorithm>
 #include <cstddef>
