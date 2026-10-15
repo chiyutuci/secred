@@ -414,7 +414,7 @@ TEST(process_used_memory_sanity) {
 TEST(reduction_context_memory_defaults) {
   ReductionContext ctx;
   REQUIRE(ctx.maxMemory == 512ULL * 1024 * 1024 * 1024);
-  REQUIRE(ctx.memoryReserve == 60ULL * 1024 * 1024 * 1024);
+  REQUIRE(ctx.memoryReserve == 30ULL * 1024 * 1024 * 1024);
 }
 
 TEST(memory_headroom_proceeds_when_idle) {

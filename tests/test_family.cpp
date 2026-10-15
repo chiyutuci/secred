@@ -198,7 +198,7 @@ TEST(family_parse_memory_reserve_default) {
   clear_symtab();
   YAML::Node cfg = box_config("tc_memreserve_default");
   Family f(cfg);
-  REQUIRE(FamilyTestHelper::memory_reserve(f) == 60ULL * 1024 * 1024 * 1024);
+  REQUIRE(FamilyTestHelper::memory_reserve(f) == 30ULL * 1024 * 1024 * 1024);
 }
 
 TEST(family_parse_memory_reserve_custom) {

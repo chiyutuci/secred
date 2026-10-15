@@ -110,6 +110,24 @@ TEST(n1_plan_is_capped_below_the_requested_threads) {
   REQUIRE(cap >= 1);
 }
 
+// The reserve's default is 30 GB since 2026-10-15 (it was 60), and that is the difference
+// between the two lines above: the higher ceiling no longer shortens n=1's pool, so the
+// phase runs all 64 threads -- the budget still holds it to the configured memory, a
+// larger reserve is what makes it bite.
+TEST(default_reserve_no_longer_caps_the_n1_pool) {
+  const std::uint64_t ceiling =
+      reconstruction_ceiling(kMaxMemory, 30ull * kGiB, kMachineBytes);
+  REQUIRE(ceiling > machine_ceiling());
+  REQUIRE(reconstruction_worker_cap(ceiling, kStructuresBytes, n1_per_worker(), kNthreads,
+                                    kNprimeMax) == kNthreads);
+  // The pool that admits does fit the ceiling it was sized against...
+  REQUIRE(kNthreads * n1_per_worker() + kStructuresBytes <= ceiling);
+  // ...but it fits it closely: what the 30 GB reserve leaves is within 20 GiB of the
+  // whole-machine line the F1 driver enforced, which is why that run was pinned by the
+  // machine's line and not by this ceiling.
+  REQUIRE(kWatchdogBytes - (kNthreads * n1_per_worker() + kStructuresBytes) < 20ull * kGiB);
+}
+
 // What the cap is for: whatever it admits, the structures already resident plus the
 // stores the pool will allocate stay under the ceiling -- and with the machine's own
 // ceiling under the driver's line, under that too.

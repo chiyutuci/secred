@@ -121,8 +121,8 @@ private:
   bool _symmetry = true;
   // Integral order of the per-sector stage; see OrderingMode.
   OrderingMode _ordering_mode      = OrderingMode::Balance;
-  // System-memory headroom kept free during parallel sector execution (default 60 GB).
-  std::uint64_t _memory_reserve = 60ULL * 1024 * 1024 * 1024;
+  // System-memory headroom kept free during parallel sector execution (default 30 GB).
+  std::uint64_t _memory_reserve = 30ULL * 1024 * 1024 * 1024;
   // Allowed total memory for the reduction, in bytes (default 512 GB). Sectors
   // are admitted only while the process stays under _max_memory - _memory_reserve;
   // set smaller to simulate a machine with less RAM.

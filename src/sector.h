@@ -534,7 +534,7 @@ struct ReductionContext {
   std::uint64_t maxMemory =
       512ULL * 1024 * 1024 * 1024; // allowed total (bytes)
   std::uint64_t memoryReserve =
-      60ULL * 1024 * 1024 * 1024; // headroom below ceiling
+      30ULL * 1024 * 1024 * 1024; // headroom below ceiling
   std::mutex admitMutex;
   std::condition_variable admitCv;
   // Injectable probe returning this process's current memory usage (bytes), for

@@ -11,10 +11,11 @@
 // At F1 balance n=0 (64 workers, a plan of 319,589,746 terms) that pool put the run's
 // peak at 391.31 GB, of which the plan and the global system already resident before the
 // pool started are ~48 GiB and the stores the rest: 64 x 18 B x 319,589,746 = 343 GiB.
-// n=1's plan has 387,712,396 terms, i.e. 425 GiB of stores alone at 64 workers -- past
-// the 480 GiB whole-machine ceiling the driver watching that machine enforced, before
-// the run's own earlier phases are even added in.  It was killed in the reconstruction
-// (rc=143) with the machine at 486 GiB.
+// n=1's plan has 387,712,396 terms, i.e. 416 GiB of stores alone at 64 workers -- 464 GiB
+// once the structures that are already resident are added, only 16 GiB below the 480 GiB
+// whole-machine line the driver watching that machine enforced, so the first co-tenant
+// that holds memory takes the run past it.  It was killed in the reconstruction (rc=143)
+// with the machine at 486 GiB.
 //
 // 18 B per term is the calibrated figure: 12 B of id + value per term, times the 1.5
 // average tail capacity of a vector grown by doubling, plus 4 B per integral id for
@@ -22,6 +23,13 @@
 // measurement of the run's -- which is why `reconstruct_ffred` also keeps a backstop
 // that retires workers once the process's own RSS passes the ceiling the pool was sized
 // against.
+//
+// `memory_reserve` defaults to 30 GB since 2026-10-15 (it was 60).  On this 503.7 GiB box
+// that moves the ceiling from 443.71 GB to 473.67 GB, which is above what n=1's stores
+// plus the resident structures need, so at F1's size the cap binds no longer and the pool
+// is 64 again: the budget below is what holds the phase to the configured memory, and a
+// larger reserve is what makes it hold the phase back.  The F1 n=1 run archived in
+// bench/F1_numeric/ ran at 60 -- it had already parsed its config when the default moved.
 
 #include <algorithm>
 #include <cstddef>

@@ -140,7 +140,7 @@ Powers of an invariant are written with `^` in the expressions
 | `subsector_filter_n` | `1` | Offset *n* of the subsector filter: a subsector integral is dropped when its boundary quantity `depth + rank` is more than *n* below the boundary. |
 | `cut` | — | Cut propagator flags (family section). |
 | `max_memory` | `512` | Allowed total memory in GB. Set it smaller to run on a machine with less RAM; sectors are admitted only while the process stays below this ceiling. |
-| `memory_reserve` | `60` | Headroom kept free below `max_memory`, in GB. |
+| `memory_reserve` | `30` | Headroom kept free below `max_memory`, in GB. |
 
 The global engine (FireFly for a symbolic system, FiniteFlow for a numeric one),
 the equation set of the global reduction (forward closure plus numeric sufficiency
