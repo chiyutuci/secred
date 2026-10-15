@@ -397,7 +397,7 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
           ctx.rawEquationsPath, all_integrals, integral_id, reduce._rawTargets,
           ctx.narrowingSuccess.load(), ctx.narrowingFail.load(),
           ctx.rawEquationsTotal.load(), ctx.globalEquationsCount.load(),
-          mastersGlobalPath, _gthreads);
+          mastersGlobalPath, _gthreads, _max_memory, _memory_reserve);
     std::filesystem::remove(ctx.rawEquationsPath);
 
     // A phase that did not complete has no table to write: stop the run before the

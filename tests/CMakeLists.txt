@@ -29,6 +29,7 @@ set(TEST_SOURCES
     test_run_report.cpp
     test_utils.cpp
     test_firefly_global.cpp
+    test_reconstruct_budget.cpp
 )
 
 # Core secred source files needed by the tests (exclude main.cpp and secred.cpp).

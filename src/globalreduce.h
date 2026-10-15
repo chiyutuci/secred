@@ -110,6 +110,9 @@ bool solve_prime_numeric(const NumericEvalPlan &plan, std::uint64_t p,
 // The reconstruction set is always the forward closure plus the numeric
 // sufficiency repair (see global_select.h); when the repair does not converge the
 // selection falls back to the forward-and-backward closure.
+// max_memory / memory_reserve are the settings the sector stage gates itself with
+// (`family.h`); the reconstruction reads the same two numbers to size its worker pool,
+// since one worker holds the whole reduced system for the run (reconstruct_budget.h).
 GlobalReductionResult reduce_global_finiteflow(
     const std::string &raw_equations_path,
     const std::vector<RawIntegral> &all_integrals,
@@ -117,7 +120,8 @@ GlobalReductionResult reduce_global_finiteflow(
     const std::vector<RawIntegral> &targets,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_global_path, unsigned nthreads = 64);
+    const std::string &masters_global_path, unsigned nthreads,
+    std::uint64_t max_memory, std::uint64_t memory_reserve);
 
 // Symbolic in-process global reduction: the coefficients are GiNaC polynomials in
 // `symbols`, the elimination uses the built-in modular solver (the same machinery

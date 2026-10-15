@@ -38,6 +38,7 @@
 #include "ffred_solver.h"
 #include "masters_file.h"
 #include "progress_bar.h"
+#include "reconstruct_budget.h"
 #include "spill_reader.h"
 #include "sym_coeff.h"
 #include "symbolic_ffred.h"
@@ -275,6 +276,7 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
                        const std::vector<unsigned> &masters,
                        const std::unordered_map<unsigned, unsigned> &master_index,
                        unsigned nthreads, unsigned max_primes,
+                       std::uint64_t max_memory, std::uint64_t memory_reserve,
                        ff::MPRational res[], double *elim_seconds) {
   const unsigned nndeps = dep_targets.size();
   const unsigned nnindeps = masters.size();
@@ -303,16 +305,48 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
   // Each worker owns one store and one slot array: a prime allocates nothing after the
   // first, and a worker reuses its memory for every prime it takes.  The plan's table is
   // shared and read-only.  More workers than concurrent primes is pure memory (one store
-  // holds the whole selected solution), so the pool is capped by the prime count as well.
-  const unsigned nworkers =
-      static_cast<unsigned>(std::min<std::size_t>(nthreads, nprime_max));
+  // holds the whole selected solution), so the pool is capped by the prime count -- and
+  // by the memory budget, which is the binding one at F1's sizes: the phase costs one
+  // store per worker, and nothing used to bound that product.
+  const std::uint64_t per_worker =
+      secred::reconstruction_worker_bytes(plan.terms.size(), plan.store_ids);
+  const std::uint64_t ceiling = secred::reconstruction_ceiling(
+      max_memory, memory_reserve, system_memory().total);
+  const unsigned nworkers = secred::reconstruction_worker_cap(
+      ceiling, process_used_memory(), per_worker, nthreads,
+      static_cast<unsigned>(nprime_max));
+  // Where the backstop below stops retiring.
+  const unsigned trim_floor = secred::reconstruction_trim_floor(nworkers);
+  std::atomic<unsigned> running{0};
+  std::cout << "  " << secred::kFlowTag << " reconstruct pool: " << nworkers << " of "
+            << nthreads << " thread(s), " << secred::format_memory(per_worker)
+            << " per worker within a " << secred::format_memory(ceiling) << " budget\n"
+            << std::flush;
   std::vector<std::thread> workers;
   workers.reserve(nworkers);
   for (unsigned w = 0; w < nworkers; ++w) {
     workers.emplace_back([&]() {
       secred::FwdStore store;
       std::vector<std::uint64_t> values;
+      running.fetch_add(1, std::memory_order_relaxed);
+      bool holds_store = true;
       for (;;) {
+        // The pool was sized from a model of what one store costs; this is what happens
+        // if that model was low.  A prime boundary is the only point a worker may leave
+        // -- quitting mid-prime would leave its slot unfilled and hang the consumer --
+        // so a worker that finds the process past the ceiling gives up its store here,
+        // and so does the next one to notice, until the pool is back inside the budget or
+        // down to the floor.
+        if (secred::reconstruction_over_budget(process_used_memory(), ceiling)) {
+          unsigned r = running.load(std::memory_order_relaxed);
+          while (r > trim_floor &&
+                 !running.compare_exchange_weak(r, r - 1, std::memory_order_relaxed)) {
+          }
+          if (r > trim_floor) {
+            holds_store = false;
+            break;
+          }
+        }
         const std::size_t ip = next.fetch_add(1, std::memory_order_relaxed);
         if (ip >= nprime_max || stop.load(std::memory_order_relaxed))
           break;
@@ -338,6 +372,8 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
         if (!slot.ok)
           break; // the consumer stops on a failure; do not start another prime
       }
+      if (holds_store)
+        running.fetch_sub(1, std::memory_order_relaxed);
     });
   }
 
@@ -451,7 +487,8 @@ GlobalReductionResult reduce_global_finiteflow(
     const std::vector<RawIntegral> &targets,
     unsigned narrowing_success, unsigned narrowing_fail,
     unsigned raw_equations_total, std::size_t global_equations_count,
-    const std::string &masters_global_path, unsigned nthreads) {
+    const std::string &masters_global_path, unsigned nthreads,
+    std::uint64_t max_memory, std::uint64_t memory_reserve) {
   GlobalReductionResult res;
   namespace ff = fflow;
 
@@ -738,9 +775,13 @@ GlobalReductionResult reduce_global_finiteflow(
                    std::chrono::duration<double>(tplan1 - tplan0).count())
             << ")\n"
             << std::flush;
+  // Only the plan is needed from here on, and the pool is sized against what is
+  // resident at that moment: handing the global system back before the stores are
+  // allocated buys every worker the memory the system was holding.
+  std::vector<secred::Eq>().swap(system);
   bool ok = reconstruct_ffred(plan, bwd_chain, dep_targets, masters,
-                              master_index, nthreads, max_primes, resmp.get(),
-                              &elim_seconds);
+                              master_index, nthreads, max_primes, max_memory,
+                              memory_reserve, resmp.get(), &elim_seconds);
   const auto t3 = std::chrono::steady_clock::now();
   if (!ok) {
     std::cerr << "finiteflow global reduction: reconstruct failed\n";
