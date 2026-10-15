@@ -38,6 +38,7 @@ system symbolic, since the invariant is set to 1 before the reduction.
 | [FLINT](https://flintlib.org/) | build | arbitrary-precision rationals (`lib/arith`) |
 | [yaml-cpp](https://github.com/jbeder/yaml-cpp) | build | input files |
 | [GiNaC](https://www.ginac.de/) (with CLN) | build | symbolic manipulation |
+| [jemalloc](https://jemalloc.net/) | build and run | the allocator — **required**, not optional; see below |
 | [FiniteFlow](https://github.com/peraro/finiteflow) | build and run | finite-field linear algebra and rational reconstruction |
 | [FireFly](https://github.com/peraro/firefly) | build and run | FireFly's `Reconstructor`, the global engine of a symbolic system |
 
@@ -45,8 +46,17 @@ On Debian/Ubuntu most of them come from the package manager:
 
 ```bash
 sudo apt install build-essential cmake ninja-build libgmp-dev libmpfr-dev \
-     libflint-dev libyaml-cpp-dev libginac-dev libcln-dev
+     libflint-dev libyaml-cpp-dev libginac-dev libcln-dev libjemalloc-dev
 ```
+
+**jemalloc is required.** SecRed runs one thread per sector (64 by default) and each
+allocates heavily through GiNaC; with glibc's allocator those threads serialise on its
+arena lock. Measured on the F234 benchmark at 64 threads, back to back with the same
+binary: sector reduction 1min1s → 27.8s, total 3min13s → 2min30s, peak memory 7.26 GB →
+6.20 GB, with byte-identical results. The configure step therefore fails — with the
+package name for your distribution — when the library is missing, rather than quietly
+building the slow version. `cmake -S . -B build -DJEMALLOC_LIBRARY=/path/to/libjemalloc.so`
+covers an installation under a prefix CMake does not search.
 
 FiniteFlow and FireFly are built from source and install `libfflow` / `libfirefly`:
 

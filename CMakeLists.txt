@@ -36,23 +36,31 @@ if (SECRED_LTO)
     endif ()
 endif ()
 
-# jemalloc, on by default where it is installed and quietly skipped where it is not: the
-# sector stage runs 64 threads, each allocating GiNaC expressions, against glibc's
-# M_ARENA_MAX=8 (main.cpp caps it for the memory gate of ARCHITECTURE.md 8.3), and that
-# cap serialises them.  Measured on F234 at 64 threads, back to back with the same
-# binary: sector reduction 1min1s -> 27.8s, total 3min13s -> 2min30s, peak 7.26 GB ->
-# 6.20 GB, with the reductions byte-identical.  Linking a library that defines malloc is
-# enough -- libjemalloc comes before libc on the link line -- so no LD_PRELOAD is needed.
-# A missing jemalloc is a warning, not an error: the program builds and runs anywhere.
-option(SECRED_JEMALLOC "Link jemalloc when it is available" ON)
-if (SECRED_JEMALLOC)
-    find_library(JEMALLOC_LIBRARY NAMES jemalloc)
-    if (JEMALLOC_LIBRARY)
-        message(STATUS "jemalloc: ${JEMALLOC_LIBRARY}")
-    else ()
-        message(STATUS "jemalloc: not found, using the system allocator")
-    endif ()
+# jemalloc is a required dependency, not a tuning option.  The sector stage runs 64
+# threads, each allocating GiNaC expressions, against glibc's M_ARENA_MAX=8 (main.cpp
+# caps it for the memory gate of ARCHITECTURE.md 8.3), and that cap serialises them.
+# Measured on F234 at 64 threads, back to back with the same binary: sector reduction
+# 1min1s -> 27.8s, total 3min13s -> 2min30s, peak 7.26 GB -> 6.20 GB, with the
+# reductions byte-identical.  Linking a library that defines malloc is enough --
+# libjemalloc comes before libc on the link line -- so no LD_PRELOAD is needed.
+#
+# This was `option(SECRED_JEMALLOC ...)` with a warning when the library was missing,
+# which produced builds that are correct and twice as slow with nothing saying so.  A
+# dependency worth that much is either present or the configure stops here.
+find_library(JEMALLOC_LIBRARY NAMES jemalloc)
+if (NOT JEMALLOC_LIBRARY)
+    message(FATAL_ERROR
+        "libjemalloc not found, and SecRed requires it.  Without jemalloc the 64 "
+        "sector threads serialise on glibc's arena lock: on F234 at 64 threads the "
+        "sector stage takes 1min1s instead of 27.8s and the run 3min13s instead of "
+        "2min30s, with the results identical -- i.e. nothing else would tell you.\n"
+        "  Debian/Ubuntu:  sudo apt install libjemalloc-dev\n"
+        "  Fedora/RHEL:    sudo dnf install jemalloc-devel\n"
+        "  macOS:          brew install jemalloc\n"
+        "Installed under a prefix CMake does not search?  Pass it in directly:\n"
+        "  cmake -S . -B build -DJEMALLOC_LIBRARY=/path/to/libjemalloc.so")
 endif ()
+message(STATUS "jemalloc: ${JEMALLOC_LIBRARY}")
 
 # set project directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -104,11 +112,9 @@ endif ()
 target_link_libraries(secred ${FIREFLY_LIBRARY})
 
 # jemalloc last on the line, but before libc, which the linker appends: it is the first
-# definition of malloc/free the link sees, so it is the one the program calls (see the
-# option above).
-if (JEMALLOC_LIBRARY)
-    target_link_libraries(secred ${JEMALLOC_LIBRARY})
-endif ()
+# definition of malloc/free the link sees, so it is the one the program calls (see
+# above).  It is not optional, so it is not guarded.
+target_link_libraries(secred ${JEMALLOC_LIBRARY})
 
 # unit tests
 add_subdirectory(tests)

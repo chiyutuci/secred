@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Collect all test translation units (everything except test_main.cpp)
 set(TEST_SOURCES
     test_main.cpp
+    test_allocator.cpp
     test_symmetry.cpp
     test_rawintegral.cpp
     test_arithmetic.cpp
@@ -64,6 +65,12 @@ target_link_libraries(secred_tests
     ${FFLOW_LIBRARY}
     ${FIREFLY_LIBRARY}
 )
+
+# jemalloc too, and last for the same reason as in the main executable: the tests run
+# the same engine, so they must not be the one target that measures the glibc arena.
+# test_allocator.cpp also turns the link order into an assertion -- mallctl only exists
+# in jemalloc, so a build that failed to link it fails to link this binary.
+target_link_libraries(secred_tests ${JEMALLOC_LIBRARY})
 
 # Register with CTest so "cmake --build build --target test" works
 enable_testing()
