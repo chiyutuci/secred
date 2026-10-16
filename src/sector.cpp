@@ -115,12 +115,25 @@ bool Sector::_compare_balance(const RawIntegral &i1, const RawIntegral &i2) {
 // std::map, i.e. RawIntegral::operator<), which the final reverse then mirrors —
 // tied integrals come back in the reverse of the arrival order.
 void Sector::_order_subintegrals(std::vector<RawIntegral> &subInts,
-                                 OrderingMode mode) {
+                                 OrderingMode mode,
+                                 const std::set<RawIntegral> *preferred) {
   if (mode == OrderingMode::Balance)
     std::stable_sort(subInts.begin(), subInts.end(), _compare_balance);
   else
     std::sort(subInts.begin(), subInts.end(), _compare_subintegral);
   std::reverse(subInts.begin(), subInts.end());
+  // `preferred` again, but the direction is the opposite of the seeds'.  The
+  // caller reads index i as the column at nvars + i, so the smallest subsector
+  // column -- the largest id -- is index 0, which the reverse above has just
+  // given to the most complex integral.  A preferred integral is the simplest
+  // one and belongs at the *end*.  Stable, so the preferred group keeps the
+  // mode's order; an integral of another sector is not in this vector, so the
+  // predicate is then false everywhere and the partition is a no-op.
+  if (preferred)
+    std::stable_partition(subInts.begin(), subInts.end(),
+                          [preferred](const RawIntegral &x) {
+                            return !preferred->contains(x);
+                          });
 }
 
 void writeTargetList(const std::string &path,
@@ -267,7 +280,8 @@ void Sector::_generate_combinations(int number, int sum) {
     }
 }
 
-void Sector::_generate_seeds(OrderingMode mode) {
+void Sector::_generate_seeds(OrderingMode mode,
+                             const std::set<RawIntegral> *preferred) {
   int lines = std::popcount(_id);
   int zeros = (int)_nprops - lines;
   int number = std::max(lines, zeros);
@@ -314,6 +328,19 @@ void Sector::_generate_seeds(OrderingMode mode) {
     std::stable_sort(_seeds.begin(), _seeds.end(), _compare_balance);
   }
   // OrderingMode::Normal: keep generation order, no sort.
+
+  // The `preferred` list is the leading key of the weights: the integrals it
+  // names are the simplest ones, so they take weights 0..k-1, i.e. the smallest
+  // ids, which the elimination never pivots on (forward_eliminate consumes the
+  // highest remaining id).  Stable, so the preferred group keeps the order the
+  // mode above gave it and every other seed keeps its own, one rank up; an
+  // integral of another sector is not in _seeds at all, so the predicate is then
+  // false everywhere and the partition is a no-op.
+  if (preferred)
+    std::stable_partition(_seeds.begin(), _seeds.end(),
+                          [preferred](const RawIntegral &x) {
+                            return preferred->contains(x);
+                          });
 
   for (unsigned i = 0; i < _seeds.size(); ++i)
     _weights[_seeds[i]] = i;
@@ -482,7 +509,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   // releases on every return path, so probe iterations are gated too.
   SectorRunGuard guard(ctx);
 
-  _generate_seeds(cfg.ordering_mode);
+  _generate_seeds(cfg.ordering_mode, cfg.preferred);
 
   std::vector<EquationFF> system;
   std::vector<std::pair<uint32, uint32>> eqrecord;
@@ -538,7 +565,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   for (auto item : subsector_map) {
     subInts.emplace_back(item.first);
   }
-  _order_subintegrals(subInts, cfg.ordering_mode);
+  _order_subintegrals(subInts, cfg.ordering_mode, cfg.preferred);
   subsector_map.clear();
   for (unsigned i = 0; i < subInts.size(); ++i) {
     subsector_map[subInts[i]] = i;

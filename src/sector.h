@@ -13,6 +13,7 @@
 #include <mutex>
 #include <numeric>
 #include <queue>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -30,6 +31,10 @@
 
 enum class OrderingMode { Normal, Balance };
 
+// Defined below, but SectorConfig names it first; only a pointer to it is stored,
+// so the declaration suffices here.
+class RawIntegral;
+
 struct SectorConfig {
   std::string cache_dir = "cache";
   unsigned subsector_filter_n = 1;
@@ -39,6 +44,14 @@ struct SectorConfig {
   // Off by default: it is a diagnostic, and a run with it on has to be the same
   // reduction as one without it.
   bool sector_debug = false;
+  // The input file's optional `preferred` list (Reduce::_preferred): the
+  // integrals the user wants as masters.  In the sector stage such an integral is
+  // ordered as the simplest one -- the smallest seed weight, and the last
+  // subsector column -- so the elimination, whose pivot is the highest remaining
+  // id, never consumes it and it survives into the master basis.  nullptr (the
+  // default) is the feature off: the order is then exactly the one a file
+  // without the key gets.
+  const std::set<RawIntegral> *preferred = nullptr;
 };
 
 class Reduce;
@@ -952,13 +965,16 @@ private:
                                  const std::vector<IBPProtoM> *ibps_sym,
                                  const SectorConfig &, ReductionContext &);
 
-  void _generate_seeds(OrderingMode mode = OrderingMode::Balance);
+  void _generate_seeds(OrderingMode mode = OrderingMode::Balance,
+                       const std::set<RawIntegral> *preferred = nullptr);
   void _generate_combinations(int number, int sum);
   static bool _compare_subintegral(const RawIntegral &, const RawIntegral &);
   static bool _compare_balance(const RawIntegral &, const RawIntegral &);
   // Sort the discovered subsector integrals into column order (most complex
-  // first) for the given ordering mode; see the definition for the tie rules.
-  static void _order_subintegrals(std::vector<RawIntegral> &, OrderingMode);
+  // first) for the given ordering mode; see the definition for the tie rules and
+  // for how `preferred` reverses that direction.
+  static void _order_subintegrals(std::vector<RawIntegral> &, OrderingMode,
+                                  const std::set<RawIntegral> *preferred = nullptr);
   static void _print_progress(ReductionContext &);
 
 private:

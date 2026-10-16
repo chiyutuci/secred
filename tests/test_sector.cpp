@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <set>
 #include <thread>
 
 // Helper: unambiguously construct RawIntegral from an int initializer list.
@@ -45,9 +46,10 @@ public:
 
   // Proxy for the private subsector column ordering.
   static std::vector<RawIntegral> order_subintegrals(
-      const std::vector<RawIntegral> &in, OrderingMode mode) {
+      const std::vector<RawIntegral> &in, OrderingMode mode,
+      const std::set<RawIntegral> *preferred = nullptr) {
     std::vector<RawIntegral> v = in;
-    Sector::_order_subintegrals(v, mode);
+    Sector::_order_subintegrals(v, mode, preferred);
     return v;
   }
 
@@ -56,8 +58,9 @@ public:
   }
 
   static void generate_seeds(Sector &s,
-                              OrderingMode mode = OrderingMode::Balance) {
-    s._generate_seeds(mode);
+                              OrderingMode mode = OrderingMode::Balance,
+                              const std::set<RawIntegral> *preferred = nullptr) {
+    s._generate_seeds(mode, preferred);
   }
 
   static const std::vector<RawIntegral> &seeds(const Sector &s) {
@@ -891,6 +894,52 @@ TEST(order_subintegrals_balance_ties_mirror_input_order) {
     REQUIRE(out[i] == in[in.size() - 1 - i]);
 }
 
+TEST(order_subintegrals_preferred_go_last) {
+  // The simplest column is the LAST index of this vector (the caller reads index
+  // i as the column at nvars + i, so index 0 is the smallest column = the largest
+  // id = the most complex integral).  A preferred integral is the simplest one
+  // and must therefore come back at the end -- the reverse of the seeds' rule.
+  std::vector<RawIntegral> in = {RI({2, -1, 0}), RI({1, 0, 0}), RI({1, 1, -1})};
+  const std::set<RawIntegral> preferred{RI({2, -1, 0})};
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    auto plain = SectorTestHelper::order_subintegrals(in, mode);
+    auto got = SectorTestHelper::order_subintegrals(in, mode, &preferred);
+    REQUIRE(got.size() == 3u);
+    REQUIRE(got[2] == RI({2, -1, 0}));
+    // The exact statement, mode-independent: the plain order with the preferred
+    // integral moved to the end.  (Its plain position differs by mode -- in
+    // Normal it is already at index 1 -- so the tail is not a shift of the whole
+    // vector.)
+    std::vector<RawIntegral> want;
+    for (const RawIntegral &x : plain)
+      if (x != RI({2, -1, 0}))
+        want.push_back(x);
+    want.push_back(RI({2, -1, 0}));
+    for (unsigned i = 0; i < want.size(); ++i)
+      REQUIRE(got[i] == want[i]);
+  }
+}
+
+TEST(order_subintegrals_foreign_preferred_entries_are_ignored) {
+  // Entries that belong to another sector are not in this vector at all, so the
+  // partition must be a no-op -- and so must nullptr and an empty set.
+  std::vector<RawIntegral> in = {RI({2, -1, 0}), RI({1, 0, 0}), RI({1, 1, -1})};
+  const std::set<RawIntegral> foreign{RI({9, 9, 9}), RI({0, 0, 0})};
+  const std::set<RawIntegral> empty;
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    auto plain = SectorTestHelper::order_subintegrals(in, mode);
+    // An explicit array: an initializer_list cannot deduce an element type from
+    // a pointer and a nullptr_t at once.
+    const std::set<RawIntegral> *cases[] = {&foreign, &empty, nullptr};
+    for (const std::set<RawIntegral> *p : cases) {
+      auto got = SectorTestHelper::order_subintegrals(in, mode, p);
+      REQUIRE(got.size() == plain.size());
+      for (unsigned i = 0; i < plain.size(); ++i)
+        REQUIRE(got[i] == plain[i]);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // _generate_seeds — ordering modes
 // ---------------------------------------------------------------------------
@@ -934,6 +983,82 @@ TEST(seeds_balance_mode_total_power_first) {
   const auto &w = SectorTestHelper::weights(s);
   for (unsigned i = 0; i < seeds.size(); ++i)
     REQUIRE(w.at(seeds[i]) == i);
+}
+
+TEST(seeds_preferred_take_the_smallest_weights) {
+  // The one-line 3/2 box: nine seeds, simplest first in both modes, and both
+  // modes end on [3,-2].  Marking that last seed preferred must move it to
+  // weight 0 and shift nothing else's relative order.
+  std::vector<bool> lines = {true, false};
+  const std::set<RawIntegral> preferred{RI({3, -2})};
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    Sector sp = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
+    SectorTestHelper::generate_seeds(sp, mode);
+    const auto &plain = SectorTestHelper::seeds(sp);
+    REQUIRE(plain.size() == 9u);
+    REQUIRE(plain.back() == RI({3, -2}));
+
+    Sector s = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
+    SectorTestHelper::generate_seeds(s, mode, &preferred);
+    const auto &seeds = SectorTestHelper::seeds(s);
+    const auto &w = SectorTestHelper::weights(s);
+    REQUIRE(seeds.size() == plain.size());
+    REQUIRE(seeds[0] == RI({3, -2}));
+    REQUIRE(w.at(RI({3, -2})) == 0u);
+    // Every other seed keeps its relative order, one rank up.
+    for (unsigned i = 1; i < seeds.size(); ++i) {
+      REQUIRE(seeds[i] == plain[i - 1]);
+      REQUIRE(w.at(seeds[i]) == i);
+    }
+  }
+}
+
+TEST(seeds_two_preferred_take_weights_zero_and_one) {
+  // Inside the preferred group the mode's order still decides, not the order the
+  // set happens to be built in.
+  std::vector<bool> lines = {true, false};
+  Sector sp = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
+  SectorTestHelper::generate_seeds(sp, OrderingMode::Balance);
+  const auto &plain = SectorTestHelper::seeds(sp);
+  // Balance order: [1,0] [1,-1] [2,0] [1,-2] [2,-1] [3,0] [2,-2] [3,-1] [3,-2],
+  // so [3,0] (total 3) precedes [2,-2] (total 4) -- and the two preferred seeds
+  // must come back in that order, ahead of everything else.
+  REQUIRE(plain[5] == RI({3, 0}));
+  REQUIRE(plain[6] == RI({2, -2}));
+
+  const std::set<RawIntegral> preferred{RI({2, -2}), RI({3, 0})};
+  Sector s = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
+  SectorTestHelper::generate_seeds(s, OrderingMode::Balance, &preferred);
+  const auto &seeds = SectorTestHelper::seeds(s);
+  const auto &w = SectorTestHelper::weights(s);
+  REQUIRE(seeds.size() == 9u);
+  REQUIRE(seeds[0] == RI({3, 0}));
+  REQUIRE(seeds[1] == RI({2, -2}));
+  REQUIRE(w.at(RI({3, 0})) == 0u);
+  REQUIRE(w.at(RI({2, -2})) == 1u);
+  REQUIRE(seeds[2] == RI({1, 0}));
+}
+
+TEST(seeds_foreign_preferred_entries_are_ignored) {
+  // A one-line sector never holds an integral with a positive second index, so
+  // [0,1] and [9,9] are legal-length entries of another sector: the weights must
+  // be exactly the plain ones.
+  std::vector<bool> lines = {true, false};
+  const std::set<RawIntegral> foreign{RI({9, 9}), RI({0, 1})};
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    Sector sp = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
+    SectorTestHelper::generate_seeds(sp, mode);
+    Sector sg = SectorTestHelper::make_sector(1, 2, lines, 3, 2);
+    SectorTestHelper::generate_seeds(sg, mode, &foreign);
+    const auto &plain = SectorTestHelper::seeds(sp);
+    const auto &got = SectorTestHelper::seeds(sg);
+    const auto &w = SectorTestHelper::weights(sg);
+    REQUIRE(got.size() == plain.size());
+    for (unsigned i = 0; i < plain.size(); ++i) {
+      REQUIRE(got[i] == plain[i]);
+      REQUIRE(w.at(got[i]) == i);
+    }
+  }
 }
 
 TEST(seeds_balance_mode_differs_from_normal) {
