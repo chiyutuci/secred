@@ -140,12 +140,7 @@ itself is unchanged either way. The list is a set: the order of the entries does
 not matter. It is a **bias, not a guarantee**: the number of masters is fixed by
 the mathematics, so an entry can still lose to another preferred integral that is
 linearly dependent on it modulo the simpler integrals, and SecRed reports nothing
-when that happens. Because the basis decides the elimination path, the bias moves
-the cost of a run in either direction — on the F234 benchmark, biasing the basis
-toward the master set of a larger reduction made the run 2.6–2.9× slower and
-roughly tripled the number of primes the reconstruction needed, while biasing it
-toward a compatible basis of the same size cost nothing: wall clock, peak memory
-and even the reconstruction's prime count stayed within noise of the unbiased run.
+when that happens.
 
 ### Settings
 
