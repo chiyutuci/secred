@@ -42,3 +42,13 @@ targets:
   - [ 1, 2, 1, 1 ]
   - [ 1, 1, 2, 1 ]
   - [ 1, 1, -1, 2 ]
+
+# preferred: master integrals the user asks for (optional; same syntax as
+# targets, and read from the same level).  An entry that takes part in the
+# reduction is ordered as the simplest integral of its sector, so the elimination
+# keeps it; an entry that never appears -- dropped by the subsector filter, or its
+# sector is not reached -- is ignored, and the reduction itself is unchanged
+# either way.  The list is a set: the order of its entries does not matter.  Keep
+# this block commented out: this file's md5s are pinned by the smoke test.
+# preferred:
+#   - [ 0, 0, 1, 0 ]

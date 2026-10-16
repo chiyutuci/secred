@@ -47,9 +47,12 @@ targets:
   return YAML::Load(yaml);
 }
 
-// Helper: bubble topology (1 loop, 2 external, 2 propagators)
-static YAML::Node bubble_config(const std::string &cache_dir = "test_cache_bubble") {
-  std::string yaml = R"(
+// Helper: the bubble topology's YAML text (1 loop, 2 external, 2 propagators).
+// Kept as text, separately from the node, so a test can splice a further
+// top-level block onto the same family -- `preferred` sits at the same level as
+// `targets`, and the malformed cases have to reach init_reduce as raw text.
+static std::string bubble_config_text(const std::string &cache_dir) {
+  return R"(
 settings:
   cache_dir: )" + cache_dir + R"(
 
@@ -69,7 +72,22 @@ family:
 targets:
   - [1, 1]
 )";
-  return YAML::Load(yaml);
+}
+
+// Helper: bubble topology (1 loop, 2 external, 2 propagators)
+static YAML::Node bubble_config(const std::string &cache_dir = "test_cache_bubble") {
+  return YAML::Load(bubble_config_text(cache_dir));
+}
+
+// Helper: the bubble config with an extra top-level YAML block spliced on.
+static YAML::Node bubble_config_with(const std::string &cache_dir,
+                                     const std::string &extra) {
+  return YAML::Load(bubble_config_text(cache_dir) + extra);
+}
+
+// Helper: unambiguously construct a RawIntegral from an int initializer list.
+static RawIntegral RIf(std::initializer_list<int> il) {
+  return RawIntegral(std::vector<int>(il));
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +591,132 @@ targets:
   Reduce r;
   REQUIRE_THROWS_AS(f.init_reduce(cfg, r), std::runtime_error);
   std::filesystem::remove_all("tc_wrongtarget");
+}
+
+// ---------------------------------------------------------------------------
+// init_reduce: the optional `preferred` list
+// ---------------------------------------------------------------------------
+
+TEST(init_reduce_preferred_defaults_to_empty) {
+  clear_symtab();
+  YAML::Node cfg = bubble_config("tc_pref_default");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  REQUIRE(r.preferred().empty());
+  std::filesystem::remove_all("tc_pref_default");
+}
+
+TEST(init_reduce_parses_preferred) {
+  // [1,1] is also the target: preferring what you already reduce is the normal
+  // case, and it must parse once, not twice.
+  clear_symtab();
+  YAML::Node cfg = bubble_config_with("tc_pref_parse",
+                                      "preferred:\n  - [1, 1]\n");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  REQUIRE(r.preferred().size() == 1u);
+  REQUIRE(r.preferred().count(RIf({1, 1})) == 1u);
+  std::filesystem::remove_all("tc_pref_parse");
+}
+
+TEST(init_reduce_preferred_is_a_set) {
+  // The list is a set: a repeated entry collapses, and the entry order carries
+  // no meaning.
+  clear_symtab();
+  YAML::Node cfg = bubble_config_with(
+      "tc_pref_set", "preferred:\n  - [0, 1]\n  - [1, 1]\n  - [0, 1]\n");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  REQUIRE(r.preferred().size() == 2u);
+  REQUIRE(r.preferred().count(RIf({0, 1})) == 1u);
+  REQUIRE(r.preferred().count(RIf({1, 1})) == 1u);
+  std::filesystem::remove_all("tc_pref_set");
+}
+
+TEST(init_reduce_empty_preferred_key_is_the_same_as_absent) {
+  // `preferred:` with a null value asks for nothing; it must not throw and must
+  // leave the reduction alone.
+  clear_symtab();
+  YAML::Node cfg = bubble_config_with("tc_pref_null", "preferred:\n");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  REQUIRE_NOTHROW(f.init_reduce(cfg, r));
+  REQUIRE(r.preferred().empty());
+  std::filesystem::remove_all("tc_pref_null");
+}
+
+TEST(init_reduce_rejects_wrong_size_preferred) {
+  // A malformed *input*, not an "illegal integral": the length is validated at
+  // parse time, exactly as a target's is.
+  clear_symtab();
+  YAML::Node cfg = bubble_config_with("tc_pref_wrongsize",
+                                      "preferred:\n  - [1, 1, 1]\n");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  REQUIRE_THROWS_AS(f.init_reduce(cfg, r), std::runtime_error);
+  std::filesystem::remove_all("tc_pref_wrongsize");
+}
+
+TEST(init_reduce_rejects_a_flat_preferred_entry) {
+  // `preferred: [1, 1]` is a list of scalars where a list of index vectors
+  // belongs: the YAML conversion throws, which is the clear failure we want.
+  clear_symtab();
+  YAML::Node cfg = bubble_config_with("tc_pref_flat", "preferred: [1, 1]\n");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  REQUIRE_THROWS(f.init_reduce(cfg, r));
+  std::filesystem::remove_all("tc_pref_flat");
+}
+
+TEST(init_reduce_rejects_a_scalar_preferred) {
+  // A scalar is not "no preference" and not a list: it must throw, not pass
+  // silently.  (Only an empty value means "nothing preferred".)
+  clear_symtab();
+  YAML::Node cfg = bubble_config_with("tc_pref_scalar", "preferred: 5\n");
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  REQUIRE_THROWS(f.init_reduce(cfg, r));
+  std::filesystem::remove_all("tc_pref_scalar");
+}
+
+TEST(init_reduce_preferred_does_not_extend_the_reduction) {
+  // [5,0] is a legal-length entry that no seed box of this family ever holds: it
+  // parses, and the scheduled sectors stay exactly those of `targets`.
+  std::vector<unsigned> plain_ids;
+  {
+    clear_symtab();
+    YAML::Node cfg = bubble_config("tc_pref_scope_a");
+    Family f(cfg);
+    f.init();
+    Reduce r;
+    f.init_reduce(cfg, r);
+    REQUIRE(r.preferred().empty());
+    plain_ids = r.sector_ids();
+    REQUIRE(!plain_ids.empty());
+    std::filesystem::remove_all("tc_pref_scope_a");
+  }
+  {
+    clear_symtab();
+    YAML::Node cfg = bubble_config_with("tc_pref_scope_b",
+                                        "preferred:\n  - [5, 0]\n");
+    Family f(cfg);
+    f.init();
+    Reduce r;
+    f.init_reduce(cfg, r);
+    REQUIRE(r.preferred().count(RIf({5, 0})) == 1u);
+    REQUIRE(r.sector_ids() == plain_ids);
+    std::filesystem::remove_all("tc_pref_scope_b");
+  }
 }
 
 TEST(init_reduce_bubble_succeeds) {

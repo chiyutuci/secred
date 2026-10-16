@@ -220,7 +220,7 @@ void Family::run_reduce(Reduce &reduce) {
 void Family::_run_reduce_layer(Reduce &reduce) const {
   BS::thread_pool pool(_sthreads);
   SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode,
-                    _sector_debug};
+                    _sector_debug,    &reduce._preferred};
 
   // Hierarchical parallel execution: sectors are pre-sorted by descending
   // popcount(id), so iterating in order visits layers from highest to lowest.
@@ -303,7 +303,7 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
     pending[i].store(parent_count[i], std::memory_order_relaxed);
 
   SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode,
-                    _sector_debug};
+                    _sector_debug,    &reduce._preferred};
 
   std::atomic<unsigned> done_count{0};
   std::mutex done_mutex;
@@ -358,7 +358,8 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce) const {
   // the (depth, rank) key (Normal) or the balance key, with the sector mask and
   // the lexicographic order as the deterministic tie-breaks that make it a total
   // order.
-  secred::order_global_integrals(all_integrals, _ordering_mode);
+  secred::order_global_integrals(all_integrals, _ordering_mode,
+                                 &reduce._preferred);
 
   std::unordered_map<RawIntegral, unsigned> integral_id;
   integral_id.reserve(all_integrals.size());
@@ -662,6 +663,30 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
   for (unsigned i = 0; i < _nprops; ++i)
     if (hasLine[i])
       reduce._top |= 1 << i;
+
+  // The optional `preferred` list, at the same level as `targets` and with the
+  // same syntax.  It only biases the master choice: an entry that takes part in
+  // this reduction is ordered as its sector's simplest integral (see
+  // SectorConfig::preferred), while an entry that never appears -- dropped by the
+  // subsector filter, its sector not reached, or the entry reducible itself --
+  // is ignored.  Nothing here extends the reduction, so the scheduled sectors
+  // stay a function of `targets` alone.  A wrong index count is a malformed
+  // input and throws, exactly as a wrong-sized target does.  `preferred:` with an
+  // empty value asks for nothing, i.e. it is the absent case; any other value
+  // that is not a list of index vectors -- a scalar, a map, a list of scalars --
+  // makes the conversion below throw.
+  if (config["preferred"] && !config["preferred"].IsNull()) {
+    for (const auto &integral :
+         config["preferred"].as<std::vector<RawIntegral>>()) {
+      if (integral.size() != _nprops) {
+        std::stringstream ss;
+        ss << integral;
+        throw std::runtime_error("preferred integral " + ss.str() +
+                                 " is invalid");
+      }
+      reduce._preferred.insert(integral);
+    }
+  }
   std::cout << "\n #0.3   Collecting target integrals "
                "finished.\n";
 

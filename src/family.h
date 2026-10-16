@@ -185,6 +185,12 @@ public:
   // none to build -- a numeric family, or an init_reduce that has not run yet.
   const secred::RowTable *row_table() const { return _ctx.rowTable; }
 
+  // The master integrals the input file's optional `preferred` list asks for.
+  // The set is the leading key of all three orderings that decide the master
+  // basis -- the seed weights, the subsector columns and the global numbering
+  // (see SectorConfig::preferred) -- and empty when the file has no such key.
+  const std::set<RawIntegral> &preferred() const { return _preferred; }
+
   friend class Family;
 
 private:
@@ -193,6 +199,8 @@ private:
   std::vector<GiNaC::symbol> _symIndices;
   // raw target integrals
   std::vector<RawIntegral> _rawTargets;
+  // the input file's optional `preferred` list (see preferred())
+  std::set<RawIntegral> _preferred;
   std::set<unsigned> _targetSectors;
   // top sector
   unsigned _top = 0;
