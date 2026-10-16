@@ -6,6 +6,12 @@
 // balance_less in sector.h).  Both fall back to sector mask ASC and then to the
 // lexicographic order, so each is a total order and std::sort suffices.
 //
+// Ahead of all of this sits one optional key: the input file's `preferred`
+// list.  It cannot be packed into the key below (all 64 bits are spoken for),
+// so `order_global_integrals` applies it to the sorted table as a stable
+// partition -- the preferred integrals are the simplest ones and take the
+// lowest numbers, which is what the solver prefers as a master.
+//
 // Header-only so the unit tests can drive the real sort: a change here moves the
 // column order of the system file, the master basis and the global equation
 // count.
@@ -14,6 +20,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <set>
 #include <vector>
 
 #include "sector.h"
@@ -21,7 +28,10 @@
 namespace secred {
 
 // Comparator of the global numbering.  Balance enables the five-key order within
-// a layer; Normal keeps the depth/rank order.
+// a layer; Normal keeps the depth/rank order.  This is the order *within* a
+// preferred group: `order_global_integrals` puts the input file's `preferred`
+// integrals ahead of everything else, so a preferred integral with a larger key
+// still takes a lower number than a non-preferred one with a smaller key.
 inline bool global_integral_less(const RawIntegral &a, const RawIntegral &b,
                                  OrderingMode mode) {
   unsigned pa = std::popcount(a.sector());
@@ -107,8 +117,11 @@ inline bool global_order_key_less(const GlobalOrderKey &a,
 }
 
 // Sort the global integral table into numbering order (number = sorted index).
+// `preferred` is the input file's `preferred` list, or nullptr when the file has
+// none.  A preferred integral leads the whole numbering, whatever its keys say.
 inline void order_global_integrals(std::vector<RawIntegral> &integrals,
-                                   OrderingMode mode) {
+                                   OrderingMode mode,
+                                   const std::set<RawIntegral> *preferred = nullptr) {
   const std::size_t n = integrals.size();
   if (n < 2)
     return;
@@ -120,12 +133,25 @@ inline void order_global_integrals(std::vector<RawIntegral> &integrals,
             [&integrals](const GlobalOrderKey &a, const GlobalOrderKey &b) {
               return global_order_key_less(a, b, integrals);
             });
-  // Gather into numbering order.  One extra table, freed at the end of the move:
-  // the caller has just released the distinct-integral set that held the same
-  // elements, so the peak does not grow.
-  std::vector<RawIntegral> ordered(n);
-  for (std::size_t i = 0; i < n; ++i)
-    ordered[i] = integrals[keys[i].idx];
+  // Gather into numbering order.  `preferred` is a stable partition of the
+  // sorted table, and two passes over the sorted keys are that partition for
+  // free: the relative order inside each group is the key order either way, and
+  // the empty case costs one `contains` per row.  One extra table, freed at the
+  // end of the move: the caller has just released the distinct-integral set that
+  // held the same elements, so the peak does not grow.
+  std::vector<RawIntegral> ordered;
+  ordered.reserve(n);
+  if (preferred) {
+    for (std::size_t i = 0; i < n; ++i)
+      if (preferred->contains(integrals[keys[i].idx]))
+        ordered.emplace_back(integrals[keys[i].idx]);
+    for (std::size_t i = 0; i < n; ++i)
+      if (!preferred->contains(integrals[keys[i].idx]))
+        ordered.emplace_back(integrals[keys[i].idx]);
+  } else {
+    for (std::size_t i = 0; i < n; ++i)
+      ordered.emplace_back(integrals[keys[i].idx]);
+  }
   integrals = std::move(ordered);
 }
 

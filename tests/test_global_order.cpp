@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <random>
+#include <set>
 #include <vector>
 
 // Global integral numbering (src/global_order.h).  The number is the index after
@@ -272,6 +273,123 @@ TEST(global_order_decorated_sort_reproduces_the_comparator_sort) {
     std::vector<RawIntegral> got = v;
     secred::order_global_integrals(got, mode);
     expect_order(got, want);
+    expect_permutation(v, got);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// `preferred`: the leading key of the numbering
+//
+// The master basis follows the numbering, so a preferred integral has to land in
+// the lowest IDs.  The packed key cannot carry it -- head fills all 64 bits --
+// so the gather partitions instead.  These tests pin that partition, and pin
+// that without a preferred set the order is exactly the old one.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<RawIntegral> run_pref(std::vector<RawIntegral> v, OrderingMode mode,
+                                  const std::set<RawIntegral> &preferred) {
+  secred::order_global_integrals(v, mode, &preferred);
+  return v;
+}
+
+// The reference the gather must equal: the comparator's own order, stably
+// partitioned so the preferred integrals lead.  Built from
+// global_integral_less, i.e. independently of the code under test.
+std::vector<RawIntegral> reference_partition(std::vector<RawIntegral> v,
+                                             OrderingMode mode,
+                                             const std::set<RawIntegral> &pref) {
+  std::sort(v.begin(), v.end(),
+            [mode](const RawIntegral &a, const RawIntegral &b) {
+              return secred::global_integral_less(a, b, mode);
+            });
+  std::stable_partition(v.begin(), v.end(), [&pref](const RawIntegral &x) {
+    return pref.contains(x);
+  });
+  return v;
+}
+
+}  // namespace
+
+TEST(global_order_preferred_leads_the_numbering) {
+  auto v = order_corpus(200, 20261016u);
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    std::vector<RawIntegral> plain = v;
+    secred::order_global_integrals(plain, mode);
+    // The integral the plain numbering puts last is the one the feature has to
+    // move to the front.
+    const RawIntegral moved = plain.back();
+    const std::set<RawIntegral> preferred{moved};
+    auto got = run_pref(v, mode, preferred);
+    REQUIRE(got.size() == plain.size());
+    REQUIRE(got.front() == moved);
+    expect_order(got, reference_partition(v, mode, preferred));
+    expect_permutation(v, got);
+  }
+}
+
+TEST(global_order_preferred_group_keeps_the_key_order) {
+  // Two preferred integrals in different layers.  Inside the group the ordinary
+  // key still decides, and its leading key is popcount(sector) ASCENDing (see
+  // global_order_popcount_is_the_first_key above), so the one-line [0,1] comes
+  // before the two-line [1,1] -- the preferred set does not order itself, the
+  // mode does.  The plain order of these four is [1,0] [0,1] [2,0] [1,1], so the
+  // partition moves the two preferred ones to the front and leaves the rest in
+  // their relative order.
+  std::vector<RawIntegral> v = {RI({1, 0}), RI({1, 1}), RI({0, 1}), RI({2, 0})};
+  const std::set<RawIntegral> preferred{RI({0, 1}), RI({1, 1})};
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    auto got = run_pref(v, mode, preferred);
+    REQUIRE(got.size() == 4u);
+    REQUIRE(got[0] == RI({0, 1}));  // popcount 1, in the group
+    REQUIRE(got[1] == RI({1, 1}));  // popcount 2, in the group
+    REQUIRE(got[2] == RI({1, 0}));  // the rest, plain order
+    REQUIRE(got[3] == RI({2, 0}));
+    // And the same statement against the independent oracle.
+    expect_order(got, reference_partition(v, mode, preferred));
+  }
+}
+
+TEST(global_order_preferred_entries_not_present_are_ignored) {
+  // An entry naming an integral outside the table cannot reorder anything: the
+  // numbering only ever sees the reduction's own integrals.  (The corpus draws
+  // indices from -4..4 with 1..6 propagators, so these two are never in it.)
+  auto v = order_corpus(120, 11u);
+  const std::set<RawIntegral> preferred{RI({5, 5, 5, 5}), RI({-5, -5})};
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    std::vector<RawIntegral> plain = v;
+    secred::order_global_integrals(plain, mode);
+    expect_order(run_pref(v, mode, preferred), plain);
+  }
+}
+
+TEST(global_order_empty_preferred_set_is_the_plain_order) {
+  auto v = order_corpus(120, 12u);
+  const std::set<RawIntegral> empty;
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    std::vector<RawIntegral> plain = v;
+    secred::order_global_integrals(plain, mode);
+    expect_order(run_pref(v, mode, empty), plain);
+    std::vector<RawIntegral> nulled = v;
+    secred::order_global_integrals(nulled, mode, nullptr);
+    expect_order(nulled, plain);
+  }
+}
+
+TEST(global_order_preferred_is_a_stable_partition_of_the_reference_sort) {
+  // The general invariant: the gather is exactly "sort by global_integral_less,
+  // then stably partition on the preferred set" -- nothing else moves.
+  auto v = order_corpus(500, 20261016u);
+  for (OrderingMode mode : {OrderingMode::Normal, OrderingMode::Balance}) {
+    std::vector<RawIntegral> plain = v;
+    secred::order_global_integrals(plain, mode);
+    std::set<RawIntegral> preferred;
+    for (unsigned i = 0; i < plain.size(); i += 7)
+      preferred.insert(plain[i]);
+    REQUIRE(preferred.size() > 40u);  // the corpus is big enough to matter
+    auto got = run_pref(v, mode, preferred);
+    expect_order(got, reference_partition(v, mode, preferred));
     expect_permutation(v, got);
   }
 }
