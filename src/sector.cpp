@@ -137,37 +137,111 @@ initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
                     const std::set<RawIntegral> &uptargets) {
   unsigned rank = 1;
   unsigned depth = std::popcount(id);
-  for (const auto &integral : targets) {
-    rank = std::max(rank, integral.rank() + 1);
-    depth = std::max(depth, integral.depth() + 1);
-  }
-  for (const auto &integral : uptargets) {
-    rank = std::max(rank, integral.rank() + 1);
-    depth = std::max(depth, integral.depth());
-  }
+  // Both kinds of request take the layer above themselves.  A request is reduced
+  // here, so the box has to generate the seed that reduces it -- and a request
+  // sitting exactly on a hard cap is generated (it is a column, and _generate_seeds
+  // reaches the cap layer) but refuses to generate an equation, because
+  // SeedBound::admits is strict; the box would then start one widening short of
+  // what the request needs, which is a probe round spent on nothing.  The two sets
+  // differ in where a request came from -- the input, or a larger sector's spill --
+  // not in what it needs here.
+  auto raise = [&](const std::set<RawIntegral> &requests) {
+    for (const auto &integral : requests) {
+      rank = std::max(rank, integral.rank() + 1);
+      depth = std::max(depth, integral.depth() + 1);
+    }
+  };
+  raise(targets);
+  raise(uptargets);
   return {depth, rank};
 }
 
-std::string format_seed_box_line(unsigned id, const SeedBound &bound,
+std::string format_seed_box_line(const SeedBound &bound,
                                  const SeedBound &initial) {
-  // The three figures are the extents of the admitted seeds, not of the boundary:
-  // a seed sits strictly inside both hard bounds, and a seed of this sector has
-  // depth >= popcount(id), so the rank extent reads min(rank, limit - popcount(id))
-  // - 1 whenever the cap bites and the total-power figure is the box corner
-  // depth + rank - 2 at the initial cap.  "start:" repeats them for the box
-  // initial_seed_bounds derived.
-  auto append = [id](std::ostringstream &oss, const SeedBound &b) {
+  // The three figures describe the boundary the sector ran with, as the level a
+  // seed range is quoted in: depth and rank are the two hard caps lowered by one,
+  // since a seed sits strictly inside them, and the total power is the cap lowered
+  // by one, which for the box initial() builds is one layer below the two figures'
+  // sum -- the box corner the cap leaves out of the system's equations -- and only
+  // reads the corner for a hand-built box whose cap sits higher.  The sector's own
+  // base layer enters nowhere: the level is what the requests ask for, so a request
+  // sitting on the base layer reads its own depth and rank even where the sector
+  // holds no seed of that rank (that level's range is then empty and the round loop
+  // widens), which is what keeps a start line comparable with the requests written
+  // above it.  "start:" repeats them for the box initial_seed_bounds derived.
+  auto append = [](std::ostringstream &oss, const SeedBound &b) {
     const int depth = (int)b.depth;
     const int rank = (int)b.rank;
     const int limit = (int)b.limit;
-    oss << " depth: " << std::min(depth, limit) - 1
-        << " rank: " << std::min(rank, limit - (int)std::popcount(id)) - 1
+    oss << " depth: " << depth - 1
+        << " rank: " << rank - 1
         << " total: " << std::min(depth + rank - 2, limit - 1);
   };
   std::ostringstream oss;
   append(oss, bound);
   oss << "  start:";
   append(oss, initial);
+  return oss.str();
+}
+
+ProbeCriterion probe_criterion(const SeedBound &bound,
+                               const std::vector<std::size_t> &needed_indep,
+                               const std::vector<RawIntegral> &seeds,
+                               unsigned nvars, bool collect) {
+  ProbeCriterion out;
+  for (const std::size_t col : needed_indep) {
+    // A column at or above nvars is a subsector integral: it is handed to its own
+    // sector through ctx.uptargets and generates no equation here, so the box it
+    // sits outside of is that sector's to widen, not this one's.
+    if (col >= nvars)
+      continue;
+    const RawIntegral &seed = seeds[nvars - 1 - col];
+    if (collect)
+      out.own_masters.push_back(seed);
+    if (!bound.exceeded(seed))
+      continue;
+    out.refusal_bits |= bound.refusal(seed);
+    // exceeded() is the total-power test alone (SeedBound::exceeded), so every
+    // report here is a total-power one and the cap hint rides along with all of
+    // them: a depth widening has to carry the cap to the top of the wider box.
+    out.refusal_bits |= 4;
+  }
+  return out;
+}
+
+std::string format_probe_report(unsigned round, const SeedBound &bound,
+                                const ProbeCriterion &crit) {
+  // The figures are the boundary as it stands this round, not the seeds' extents
+  // format_seed_box_line prints: the report exists to be read against the masters
+  // below it.  "failed" is the pass not settling -- it is written where the
+  // criterion fired, so the sector either widens and runs again or, on the last
+  // round, is given up on.
+  std::ostringstream oss;
+  oss << "[probe] round " << round << " failed: depth: " << bound.depth
+      << " rank: " << bound.rank << " limit: " << bound.limit
+      << ", seed top: " << bound.seed_top() << '\n';
+
+  unsigned refused = 0;
+  for (const RawIntegral &m : crit.own_masters)
+    if (bound.exceeded(m))
+      ++refused;
+  oss << "[probe] own masters: " << crit.own_masters.size()
+      << ", refused: " << refused << ", refusal bits: " << crit.refusal_bits
+      << '\n';
+
+  for (const RawIntegral &m : crit.own_masters) {
+    std::string verdict;
+    if (bound.past_top(m))
+      verdict += "PAST-TOP ";
+    if (bound.past_depth_cap(m))
+      verdict += "PAST-DEPTH-CAP ";
+    if (verdict.empty())
+      verdict = "ok";
+    else
+      verdict.pop_back();  // the join above leaves a trailing space
+    oss << "[probe]   " << m << "  depth: " << m.depth() << " rank: " << m.rank()
+        << " total: " << m.depth() + m.rank() << "  " << verdict << '\n';
+  }
   return oss.str();
 }
 
@@ -285,6 +359,10 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
                                                     ctx.uptargets[_id]);
   _bound = SeedBound::initial(boxDepth, boxRank);
   _initialBound = _bound;
+  // sector_debug's reports accumulate across the rounds below (a report is
+  // produced where the criterion fires, which is not where the log survives); a
+  // sector is reduced once per run, but a stale block would outlive a re-run.
+  _probeReport.clear();
 
   namespace fs = std::filesystem;
   std::string sectorpath =
@@ -304,19 +382,26 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   std::uint64_t fullNanos = 0;   // time in the round that settled and spilled
 
   // Every round is a full pass, so the criterion that decides the box sees the
-  // subsector columns too.  A pass that reports an inadmissible seed
-  // (SeedBound::exceeded -- past the top of the seed box, or through its depth cap
-  // under that top) spills nothing: it returns at the criterion, before the
-  // masters/uptargets propagation and before the equations are appended, so the
-  // next round starts from a clean directory and an unchanged ctx and only the box
-  // differs.  Widening the reported figure by one layer admits that seed
-  // (_bound.widen_for; a depth widening carries the cap along only when the box top
-  // was what was reported, bit 4), and the loop repeats until a round reports
-  // nothing -- that round is the one that settles and spills.
+  // subsector columns too.  A pass that reports a master past the level's total
+  // figure (SeedBound::exceeded) spills nothing: it returns at the criterion,
+  // before the masters/uptargets propagation and before the equations are
+  // appended, so the next round starts from a clean directory and an unchanged ctx
+  // and only the box differs.  A master a hard cap refuses under that figure is not
+  // reported at all -- it stays a master of the sector -- so every report is a
+  // total-power one, and widening the reported figure by one layer admits that
+  // seed: a hard cap grows on the axis reported (the depth widening carrying the
+  // cap along, as the top was reported too, bit 4), and a report the total-power
+  // cap alone made -- the box corner, which both hard caps admit -- raises the cap
+  // with both figures standing, taking the level (d, r, d + r - 1) to (d, r,
+  // d + r).  A pass that reports a hard cap and the corner at once takes one widen
+  // per figure, the cap first (_bound.widen_for), and the loop repeats until a
+  // round reports nothing -- that round is the one that settles and spills.
   for (unsigned round = 0;; ++round) {
     // A re-run can find a directory an earlier run left behind, and a reporting
     // round leaves its own partial files (targets, the seed-box line; see below).
-    // The deletion is charged to the round that follows it.
+    // The deletion is charged to the round that follows it.  It also takes the log
+    // of the round before -- which is why sector_debug's reports are collected in
+    // _probeReport and appended once, after the loop.
     const auto roundBegin = std::chrono::steady_clock::now();
     fs::remove_all(sectorpath);
     _probeRounds = round + 1;
@@ -343,6 +428,16 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
     }
     expanded = true;
     _bound.widen_for(result);
+  }
+
+  // sector_debug: the reports of the rounds that failed, appended to the log of
+  // the round that settled -- or of the last round, when the sector was given up
+  // on, which is the case a reader most wants the figures for.  The log is the
+  // last round's: every round deletes the directory before it runs.
+  if (!_probeReport.empty()) {
+    std::ofstream report(sectorpath + "/log", std::ios::app);
+    if (report.is_open())
+      report << _probeReport;
   }
 
   if (expanded)
@@ -504,7 +599,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   // once the sector finishes.
   writeTargetList(sectorpath + "/targets", ctx.targets[_id]);
   unsigned neededvars = ctx.targets[_id].size();
-  file << '\n' << format_seed_box_line(_id, _bound, _initialBound)
+  file << '\n' << format_seed_box_line(_bound, _initialBound)
        // How many passes it took to settle the bound: the driver widens the box and
        // runs another pass while one still reports a seed outside it, so "rounds: 3"
        // says the leading triple is two widenings past "start".
@@ -607,26 +702,25 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   //
   // A needed independent variable whose seed the boundary does not admit means the
   // box was too small: that seed generates no equation, the reduction cannot close
-  // on it, and it stays a master (SeedBound names the two ways that happens).
+  // on it, and it stays a master (SeedBound names the two ways that happens).  The
+  // walk is probe_criterion's, subsector columns included: those are needed here
+  // too, but they are another sector's to admit, so they never report this box.
   //
   // The return value names the figure that has to grow: bit 1 the depth, bit 2 the
   // rank, bit 4 the *repair* -- set when the total power was what was wrong, so the
   // cap must ride along at the top of the widened box (SeedBound::widen_depth).  A
   // depth report from the depth cap alone leaves bit 4 clear and deepens the box
   // without moving the cap.
-  unsigned refusalBits = 0;
-  for (unsigned i = 0; i < needed_indep.size(); ++i) {
-    if (needed_indep[i] >= nvars)
-      continue;
-    const RawIntegral &seed = _seeds[nvars - 1 - needed_indep[i]];
-    if (!_bound.exceeded(seed))
-      continue;
-    refusalBits |= _bound.refusal(seed);
-    if (_bound.past_top(seed))
-      refusalBits |= 4;
+  const ProbeCriterion crit =
+      probe_criterion(_bound, needed_indep, _seeds, nvars, cfg.sector_debug);
+  if (crit.refusal_bits != 0) {
+    // sector_debug: keep the pass's report for the log that survives.  Writing it
+    // here would be wasted -- run_reduce_ff_n deletes the whole sector directory,
+    // log included, before the next pass.
+    if (cfg.sector_debug)
+      _probeReport += format_probe_report(_probeRounds, _bound, crit);
+    return crit.refusal_bits;
   }
-  if (refusalBits != 0)
-    return refusalBits;
 
   file << "\n masters: ";
   file << needed_indep.size() << '\n';

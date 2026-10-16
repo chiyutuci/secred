@@ -103,6 +103,7 @@ public:
   static unsigned subsector_filter_n(const Family &f) {
     return f._subsector_filter_n;
   }
+  static bool sector_debug(const Family &f) { return f._sector_debug; }
   static const std::string &cache_dir(const Family &f) {
     return f._cache_dir;
   }
@@ -192,6 +193,23 @@ TEST(family_parse_settings_cache_dir) {
   f.init();
   REQUIRE(std::filesystem::exists("my_custom_cache"));
   std::filesystem::remove_all("my_custom_cache");
+}
+
+TEST(family_parse_sector_debug_default_off) {
+  // sector_debug is a diagnostic: unless the config asks for it, a pass that
+  // reports its box too small prints nothing extra.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_sector_debug_default");
+  Family f(cfg);
+  REQUIRE(!FamilyTestHelper::sector_debug(f));
+}
+
+TEST(family_parse_sector_debug) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_sector_debug");
+  cfg["settings"]["sector_debug"] = true;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::sector_debug(f));
 }
 
 TEST(family_parse_memory_reserve_default) {

@@ -219,7 +219,8 @@ void Family::run_reduce(Reduce &reduce) {
 
 void Family::_run_reduce_layer(Reduce &reduce) const {
   BS::thread_pool pool(_sthreads);
-  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode};
+  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode,
+                    _sector_debug};
 
   // Hierarchical parallel execution: sectors are pre-sorted by descending
   // popcount(id), so iterating in order visits layers from highest to lowest.
@@ -301,7 +302,8 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
   for (unsigned i = 0; i < nsec; ++i)
     pending[i].store(parent_count[i], std::memory_order_relaxed);
 
-  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode};
+  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode,
+                    _sector_debug};
 
   std::atomic<unsigned> done_count{0};
   std::mutex done_mutex;
@@ -572,6 +574,11 @@ Family::Family(const YAML::Node &config) {
     // integral.
     if (s["subsector_filter_n"])
       _subsector_filter_n = s["subsector_filter_n"].as<unsigned>();
+    // sector_debug: a diagnostic -- a pass that reports its seed box as too small
+    // leaves its own masters, the figures the criterion read and the verdicts it
+    // reached in the sector log, so a widening (or a sector given up on) can be
+    // checked by hand.  It changes nothing about the reduction.
+    if (s["sector_debug"]) _sector_debug = s["sector_debug"].as<bool>();
     // ordering_mode: integral order.  "balance" (default) orders the per-sector
     // seeds and subsector columns, and the global IDs (the global numbering, see
     // order_global_integrals below); "normal" keeps the generation order.

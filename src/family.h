@@ -116,6 +116,9 @@ private:
   std::string _cache_dir = "cache";
   // Offset n of the subsector filter (see SectorConfig).
   unsigned _subsector_filter_n = 1;
+  // settings.sector_debug: print each reporting pass's own masters into the sector
+  // log (default false; see SectorConfig).
+  bool _sector_debug = false;
   // settings.symmetry: build and use the sector symmetry relations (default
   // true; spec 5.6).
   bool _symmetry = true;

@@ -34,6 +34,11 @@ struct SectorConfig {
   std::string cache_dir = "cache";
   unsigned subsector_filter_n = 1;
   OrderingMode ordering_mode = OrderingMode::Balance;
+  // settings.sector_debug: append every reporting pass's probe report to the
+  // sector log, so a widening (or a sector given up on) can be checked by hand.
+  // Off by default: it is a diagnostic, and a run with it on has to be the same
+  // reduction as one without it.
+  bool sector_debug = false;
 };
 
 class Reduce;
@@ -619,20 +624,28 @@ struct ReductionContext {
 //
 // `depth` and `rank` are hard caps (a seed is admitted only if depth() < depth
 // and rank() < rank); `limit` caps the total power depth() + rank(), starting
-// at the top of the seed box's own total-power range (limit == depth + rank),
-// where the strict comparison cuts nothing -- the only seed reaching that total
-// is the box corner, which the hard caps reject anyway.  `quantity()` is the
-// figure everything here counts in and `boundary()` the cap; the criterion and
-// the subsector filter measure against `seed_top()` instead, so the filter's
-// offset n does not shift when the cap moves.
+// one layer below the top of the seed box's own total-power range
+// (limit == depth + rank - 2), so the strict comparison cuts exactly the box
+// corner -- the seed class with both hard caps at their maxima, which is the
+// layer that generates no equation.  `quantity()` is the figure everything here
+// counts in and `boundary()` the cap; the criterion and the subsector filter
+// measure against `seed_top()` instead, so the filter's offset n does not shift
+// when the cap moves.
 struct SeedBound {
   unsigned depth = 0;
   unsigned rank = 0;
   // Admitted iff depth() + rank() < limit; read it through boundary(), never
-  // directly.  The strict comparison is why initial() starts the cap at the top
-  // of the seed box's total-power range rather than at the corner the hard caps
-  // allow.
+  // directly.  The strict comparison is why initial() starts the cap one layer
+  // below the corner the hard caps allow: the corner seeds are then the top
+  // layer the boundary keeps out of the system's equations.
   unsigned limit = 0;
+
+  // The cap a box with these hard caps carries: one layer below the box corner
+  // depth + rank - 2, so the strict comparison in admits() cuts exactly the
+  // corner layer.  Signed, so a degenerate hand-built box (depth 0) cannot wrap.
+  static unsigned cap_for(unsigned depth, unsigned rank) {
+    return (unsigned)std::max(0, (int)depth + (int)rank - 2);
+  }
 
   // The boundary a sector starts from, given the box initial_seed_bounds
   // derived.
@@ -640,7 +653,7 @@ struct SeedBound {
     SeedBound b;
     b.depth = depth;
     b.rank = rank;
-    b.limit = depth + rank;
+    b.limit = cap_for(depth, rank);
     return b;
   }
 
@@ -651,13 +664,13 @@ struct SeedBound {
   // The cap on the quantity; a widening moves it (see widen_depth).
   unsigned boundary() const { return limit; }
 
-  // The largest quantity an admitted seed can reach: the box corner depth +
-  // rank
-  // - 2, lowered to limit - 1 once the cap bites into the box.  Signed, so a
-  // degenerate hand-built box (depth 0) reports -1 rather than wrapping.  It is
-  // the reference the subsector filter counts its layers from -- what the seeds
-  // reach, not where the boundary sits -- and the triple format_seed_box_line
-  // prints.
+  // The largest quantity an admitted seed can reach: limit - 1, the cap lowered
+  // by one, which for the box initial() builds is one layer below the box corner
+  // depth + rank - 2; a hand-built box whose cap sits above the corner reports
+  // the corner instead.  Signed, so a degenerate hand-built box (depth 0) reports
+  // -1 rather than wrapping.  It is the reference the subsector filter counts its
+  // layers from -- what the seeds reach, not where the boundary sits -- and the
+  // total-power figure format_seed_box_line prints.
   int seed_top() const {
     return std::min((int)depth + (int)rank - 2, (int)limit - 1);
   }
@@ -669,46 +682,62 @@ struct SeedBound {
     return quantity(i) < boundary();
   }
 
-  // The box-top half of the criterion.  Measuring against the seed box rather
-  // than the cap is what makes it fire -- the cap sits at or above the box top
-  // -- and it names the box top as what has to move (see widen_depth's
+  // The criterion itself: the seed's total power is one layer or more above the
+  // last admitted one -- the level's total figure is what decides whether a
+  // sector's box was too small.  The cap starts one layer below the box corner,
+  // so this fires on the corner layer itself -- the seeds with both hard caps at
+  // their maxima -- which is exactly the layer the boundary is built to leave out
+  // of the system's equations.  Measuring against seed_top() rather than the cap
+  // keeps the two consistent (seed_top() is boundary() - 1 for the box initial()
+  // builds) and names the box top as what has to move (see widen_depth's
   // carry_cap).
   bool past_top(const RawIntegral &i) const {
     return (int)quantity(i) > seed_top();
   }
 
-  // The depth-cap half.  A large rank figure lifts seed_top() well above the
-  // depth cap, so a deep, low-rank seed slips under the top yet is refused by
-  // admits() -- on F234's sector 246 the box (7, 5) has seed_top() 10, and the
-  // seed [0,1,2,0,1,1,1,1,0] (depth 7, rank 0, total 7) sits three layers below
-  // the top while the depth cap refuses it.  This half is what reports it.
+  // The depth hard cap's own verdict on a seed -- admission's, not the
+  // criterion's (2026-10-16).  A large rank figure lifts seed_top() well above
+  // the depth cap, so a deep, low-rank seed can sit under the total figure and
+  // still be refused by admits(): on F234's sector 246 the box (7, 5) has
+  // seed_top() 9, and the seed [0,1,2,0,1,1,1,1,0] (depth 7, rank 0, total 7) sits
+  // two layers below it while the depth cap refuses it.  The criterion no longer
+  // reports such a seed -- only the total figure moves a box -- so the seed
+  // generates no equation and stays a master of the sector; this predicate is what
+  // the probe report marks it with (PAST-DEPTH-CAP), so the log still says why the
+  // master is there.
   bool past_depth_cap(const RawIntegral &i) const { return i.depth() >= depth; }
 
-  // The narrowing-failure criterion: the seed is either past the box top or
-  // under it at the depth hard cap.  Either way the boundary refuses it, it
-  // generates no equation, and it survives as an unreduced master -- and either
-  // way one widening is enough to admit it, which is why both halves are
-  // reported.
-  //
-  // The criterion is one-sided on the rank axis: a wide, shallow seed the rank
-  // cap refuses is not reported, since widening would not admit it either --
-  // those are the "outer" seeds the sector hands on as masters.
-  bool exceeded(const RawIntegral &i) const {
-    return past_top(i) || past_depth_cap(i);
-  }
+  // The narrowing-failure criterion: is this master outside the level the sector
+  // ran with?  Its total power past the level's total figure is the whole test.
+  // Both hard caps are admission's alone: a seed one of them refuses while its
+  // total power sits inside the level stays a master of the sector (the probe
+  // report marks it, the box does not move for it), which is why this is one-sided
+  // on both the depth and the rank cap -- a report out of this criterion always
+  // names a total-power failure, and every repair it asks for admits what it
+  // reported: the cap alone for the box corner (refusal() bit 8, the one class
+  // both hard caps admit and the total power cuts), the hard cap the seed crossed
+  // -- with the cap carried along, bit 4 -- for a seed past the top that pins one.
+  // A pass that reports both takes one widening per figure, the cap first, which
+  // the round cap (kMaxRounds) covers.
+  bool exceeded(const RawIntegral &i) const { return past_top(i); }
 
   // Which figure has to grow for a seed exceeded() reports to be admitted
-  // again: bit 1 the depth hard cap, bit 2 the rank hard cap.  It names a
-  // figure, not the repair's cap policy -- the caller pairs it with past_top()
-  // to decide whether a depth widening also carries the cap along
-  // (widen_depth's carry_cap).
+  // again: bit 1 the depth hard cap, bit 2 the rank hard cap, bit 8 the
+  // total-power cap itself.  It names a figure, not the repair's cap policy --
+  // the caller pairs it with past_top() to decide whether a depth widening also
+  // carries the cap along (widen_depth's carry_cap).  A seed both hard caps
+  // admit is the box corner -- every seed inside them has total power at most
+  // depth + rank - 2, so one past the top sits exactly there -- and the cap is
+  // the one figure that takes it (widen_cap), which is the smallest box that
+  // readmits it: a hard cap grown instead would print one figure higher and buy
+  // a layer of seeds nothing reported.
   unsigned refusal(const RawIntegral &i) const {
     unsigned bits = 0;
     if (i.depth() >= depth)
       bits |= 1;
     if (i.rank() >= rank)
       bits |= 2;
-    return bits == 0 ? 1u : bits;
+    return bits == 0 ? 8u : bits;
   }
 
   // The subsector filter, applied at both sites in
@@ -723,33 +752,64 @@ struct SeedBound {
   }
 
   // Raise the box by one layer in the figure refusal() named -- widen_depth for
-  // bit 1, widen_rank for bit 2 -- which admits the reported seed, so the next
-  // pass either settles or reports a seed the new layer brought in.
+  // bit 1, widen_rank for bit 2, widen_cap for bit 8 -- so the next pass either
+  // settles or reports a seed the new layer brought in.  The two hard-cap
+  // repairs are here; the cap repair is below them.
   //
-  // The cap rides at the top of the box (limit == depth + rank, as initial()
-  // built it), so it never cuts an admission the hard caps allow and seed_top()
-  // rises by exactly one layer; std::max keeps a cap already above the box top
-  // from being dragged down.
+  // The cap rides one layer below the box top (limit == depth + rank - 2, as
+  // initial() built it), so it keeps that relation as the box grows and
+  // seed_top() rises by exactly one layer, which is where the reported seed
+  // usually sits; std::max keeps a cap already above that from being dragged
+  // down.
   //
-  // carry_cap == false deepens the box without moving the cap, repairing a
-  // report the depth hard cap made on its own (the caller's bit 4): the total
-  // power was not wrong, so the box grows one layer deeper and keeps its
-  // ceiling.
+  // carry_cap == false deepens the box without moving the cap: the box grows one
+  // layer deeper and keeps its ceiling, the repair for a report the depth hard cap
+  // made on its own.  The criterion has not asked for that repair since
+  // 2026-10-16 -- it reports total-power failures only, so bit 4 rides along with
+  // every depth report it makes -- and the flag is kept, with its tests, because it
+  // is what tells the two deepenings apart.
   void widen_depth(bool carry_cap = true) {
     ++depth;
     if (carry_cap)
-      limit = std::max(limit, depth + rank);
+      limit = std::max(limit, cap_for(depth, rank));
   }
 
   void widen_rank() {
     ++rank;
-    limit = std::max(limit, depth + rank);
+    limit = std::max(limit, cap_for(depth, rank));
   }
 
-  // Apply one pass's report to the box: bit 1 deepens it (carrying the cap only
-  // when bit 4 says the box top was what was reported), bit 2 widens the rank.
-  // A report always pins a hard figure, so a lone bit 4 widens nothing.
+  // Raise the total-power cap by one layer, leaving both hard caps where they
+  // are: the repair a report the cap alone made asks for (refusal()'s bit 8) --
+  // the box corner, the one seed class the hard caps admit and the total power
+  // refuses.  The cap sits strictly below the corner whenever that report can
+  // fire (a seed inside the hard caps has total power at most depth + rank - 2,
+  // and this one is past the top), so one layer is exactly enough: the corner
+  // comes in, the box becomes the whole box its hard caps allow, and the level
+  // the sector runs with grows from (d, r, d + r - 1) to (d, r, d + r) with both
+  // figures standing.  Nothing beyond the corner is bought -- the next report out
+  // of such a box pins a hard cap, so widen_depth / widen_rank is its repair.
+  void widen_cap() { ++limit; }
+
+  // Apply one pass's report to the box: bit 1 deepens it (carrying the cap, since
+  // every report the criterion makes is a total-power one and bit 4 rides along),
+  // bit 2 widens the rank, bit 8 raises the total-power cap with both hard caps
+  // standing.  A report always pins one of the three figures, so a lone bit 4
+  // widens nothing.
+  //
+  // The total-power cap is exclusive: a pass that reports the box corner asks for
+  // the level (d, r, d + r), and growing a hard figure in the same pass would take
+  // it to (d + 1, r, d + r) instead -- a figure grown for a report that never
+  // pinned one.  That pass comes first, the cap one layer up and nothing else; the
+  // pass that still finds a seed where the report said grows that figure then, so
+  // the widenings arrive in the order of the figures the levels are quoted in.
+  // The two hard caps are not exclusive with each other: a seed past both pins
+  // both, and one pass grows both.
   void widen_for(unsigned refusalBits) {
+    if (refusalBits & 8) {
+      widen_cap();
+      return;
+    }
     if (refusalBits & 1)
       widen_depth(/*carry_cap=*/(refusalBits & 4) != 0);
     if (refusalBits & 2)
@@ -782,26 +842,80 @@ constexpr RoundAction round_action(unsigned round, unsigned refusalBits) {
 }
 
 // Initial seed-box bounds (max depth, max rank) for a sector: the smallest box
-// that covers everything the sector is asked for.  A target needs one layer
-// above itself (the equations then reduce it away), an uptarget is reduced in
-// place, so it only needs its own depth.  There is no extra floor: a sector
-// whose requests reach no further than its own base layer starts at zero excess
-// depth.  Both sets only ever hold integrals of this very sector (their lines
-// are the sector's lines), so the result always satisfies
-// depth >= popcount(id) -- the excess-depth arithmetic in _generate_seeds stays
-// non-negative, and the round loop widens the box if it turns out too small.
+// that covers everything the sector is asked for.  A request needs one layer
+// above itself on both axes (the equations then reduce it away), and the two
+// sets are read the same way -- a target comes from the input, an uptarget from
+// a larger sector's spill, which is where they differ, not in what the box has
+// to cover.  There is no extra floor: a sector whose requests reach no further
+// than its own base layer starts at zero excess depth.  Both sets only ever hold
+// integrals of this very sector (their lines are the sector's lines), so the
+// result always satisfies depth >= popcount(id) -- the excess-depth arithmetic
+// in _generate_seeds stays non-negative, and the round loop widens the box if it
+// turns out too small.  Note that the box's total-power cap is one layer below
+// the corner these caps give (SeedBound::initial), so a request that is itself
+// the corner of the box it asks for -- a single request, or one that pins both
+// maxima -- is generated but starts out refused; the round loop then widens the
+// cap by one layer (SeedBound::widen_cap) and the box settles at the request's
+// own level with the total-power figure one above what it asked for, the depth
+// and rank figures standing.  The printed triple
+// (format_seed_box_line) reads these caps as a level -- one step below on each
+// axis, and one further step below their sum in total power -- so it prints
+// exactly the depth, the rank and their sum minus one the requests asked for.
 std::pair<unsigned, unsigned>
 initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
                     const std::set<RawIntegral> &uptargets);
 
-// One sector log's seed-box line: "depth rank total" for the seeds the boundary
-// admits -- one step below each hard bound, since a seed sits strictly inside
-// it -- then the same triple for the box initial_seed_bounds derived, after
-// "start:". The settling round appends "rounds: N", so the log says how many
-// widenings the sector needed.  The arithmetic is in format_seed_box_line
-// (sector.cpp).
-std::string format_seed_box_line(unsigned id, const SeedBound &bound,
+// One sector log's seed-box line: "depth rank total" for the boundary the sector
+// ran with, read as a seed range -- the two hard caps lowered by one step each,
+// since a seed sits strictly inside them, and the total power one further step
+// below their sum, since the cap leaves out the box corner -- then the same
+// triple for the box initial_seed_bounds derived, after "start:". The figures
+// are the boundary, not the extents of the seeds that exist under it: a level
+// whose range no seed of the sector reaches (a request that is the box corner,
+// or one on the base layer asking for a rank the sector cannot carry with it)
+// still prints as asked for, and the round loop's widening is what the leading
+// triple then shows.  The settling round appends "rounds: N", so the log says
+// how many widenings the sector needed.  The arithmetic is in
+// format_seed_box_line (sector.cpp).
+std::string format_seed_box_line(const SeedBound &bound,
                                  const SeedBound &initial);
+
+// One pass's report, as the criterion reaches it and as sector_debug prints it.
+struct ProbeCriterion {
+  // What widen_for reads: 0 when the pass settles, otherwise bit 1 (the depth
+  // hard cap), bit 2 (the rank hard cap), bit 4 (the total power was what was
+  // reported, so a depth widening has to carry the cap along) and bit 8 (the
+  // total-power cap itself refused the seed -- the box corner -- so the cap is
+  // the figure to grow).
+  unsigned refusal_bits = 0;
+  // The sector's own masters among the needed independent variables, in walk
+  // order.  Filled only when the caller asks (sector_debug), since it is the only
+  // consumer: a run without the option collects nothing.
+  std::vector<RawIntegral> own_masters;
+};
+
+// The criterion of one pass: walk the needed independent variables (columns,
+// ascending = most complex first), skip the subsector entries -- a column at or
+// above nvars is a subsector integral, handed on through ctx.uptargets, which
+// generates no equation here and so may not report this sector's box -- and
+// report every master whose total power is past the level's total figure
+// (SeedBound::exceeded).  A master a hard cap refuses under that figure is not
+// reported: it stays a master of the sector, marked PAST-DEPTH-CAP in the probe
+// report.  It is the mark and sweep of Sector::sector_reduction_ff_n, kept here
+// whole so the scope of the criterion is testable without running a reduction.
+ProbeCriterion probe_criterion(const SeedBound &bound,
+                               const std::vector<std::size_t> &needed_indep,
+                               const std::vector<RawIntegral> &seeds,
+                               unsigned nvars, bool collect);
+
+// One probe report, as sector_debug writes it into a sector log: the box the pass
+// read, then one line per own master with the three figures the criterion reads
+// and the verdict it reached (PAST-TOP / PAST-DEPTH-CAP / ok).  The report is
+// produced where the criterion fires, which is not where the log survives -- the
+// next pass deletes the directory -- so the caller collects the result and
+// appends it once the round loop is done (Sector::_probeReport).
+std::string format_probe_report(unsigned round, const SeedBound &bound,
+                                const ProbeCriterion &crit);
 
 // Dump a sector's target list (one operator<< form per line) to `path`.  The
 // stream is closed before returning, so the file on disk is a complete,
@@ -863,6 +977,11 @@ private:
   // the round now running (1-based), set by run_reduce_ff_n; the log reports it
   // so the number of widenings a sector needed is readable
   unsigned _probeRounds = 0;
+  // sector_debug: the reports of the rounds that failed (format_probe_report),
+  // accumulated because the round loop deletes the sector directory -- log
+  // included -- before every pass; run_reduce_ff_n appends them to the log of the
+  // round that settles.  Empty unless the option is on.
+  std::string _probeReport;
   // lines
   std::vector<bool> _lines;
 

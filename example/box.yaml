@@ -31,6 +31,9 @@ settings:
                               # seeds, subsector columns and the global numbering all follow the
                               # balance key: total power, depth, rank, max denominator power,
                               # max numerator power)
+  sector_debug: false         # when a pass finds its seed box too small, append the pass's own
+                              # masters, the figures the criterion read and its verdicts to the
+                              # sector log (default false; a diagnostic, the reduction is the same)
   gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
   cache_dir: cache_box        # directory for the run's output (reductions, masters, logs)
 
