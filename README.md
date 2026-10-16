@@ -121,12 +121,31 @@ settings:                         # all optional
 
 targets:                          # propagator index vectors to reduce
   - [ 2, 2, 1, 1 ]
+
+preferred:                        # [optional] integrals asked for as masters
+  - [ 0, 0, 1, 0 ]
 ```
 
 Each propagator is given as `[momentum, mass]` and denotes
 `momentum² − mass²`; the mass must be an invariant of mass dimension 1.
 Powers of an invariant are written with `^` in the expressions
 (e.g. `2^2` for `4`).
+
+`preferred` names integrals the user wants to see in the master basis, with the
+same syntax as `targets`. Every entry that takes part in the reduction is ordered
+as the *simplest* integral of its sector, so the elimination does not consume it
+as a pivot and the numbering keeps it; an entry that never appears — dropped by
+the subsector filter, or its sector is not reached — is ignored, and the reduction
+itself is unchanged either way. The list is a set: the order of the entries does
+not matter. It is a **bias, not a guarantee**: the number of masters is fixed by
+the mathematics, so an entry can still lose to another preferred integral that is
+linearly dependent on it modulo the simpler integrals, and SecRed reports nothing
+when that happens. Because the basis decides the elimination path, the bias moves
+the cost of a run in either direction — on the F234 benchmark, biasing the basis
+toward the master set of a larger reduction made the run 2.6–2.9× slower and
+roughly tripled the number of primes the reconstruction needed, while biasing it
+toward a compatible basis of the same size cost nothing: wall clock, peak memory
+and even the reconstruction's prime count stayed within noise of the unbiased run.
 
 ### Settings
 
