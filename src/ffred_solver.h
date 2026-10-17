@@ -288,6 +288,27 @@ struct FwdStore {
   uint32_t row_size(uint32_t id) const { return len[row_of[id]]; }
 };
 
+// What one elimination did, for the probe report: the fill-in of the plan rather than
+// its wall-clock (which machine load moves).  Terms are the unit the merge loop moves --
+// one written (id, value) pair -- so `moved` is what the ordered merges cost and
+// `gathered` what reading the point's own rows cost.  A caller that wants one point's
+// figure passes a fresh struct; one that accumulates over a thread's lifetime adds the
+// per-call struct with `add` (the probe report divides by the point count).
+struct FwdStats {
+  std::uint64_t rows = 0;     // plan rows walked (including rows that reduced to 0 = 0)
+  std::uint64_t gathered = 0; // terms gathered from those rows at this point
+  std::uint64_t merges = 0;   // substitutions (ordered merges) performed
+  std::uint64_t moved = 0;    // terms written by those merges: the fill-in paid
+  std::uint64_t pivots = 0;   // solutions registered (rows that did not reduce to 0)
+  void add(const FwdStats &o) {
+    rows += o.rows;
+    gathered += o.gathered;
+    merges += o.merges;
+    moved += o.moved;
+    pivots += o.pivots;
+  }
+};
+
 // forward_eliminate over `rows` at one point -- the plan's rows with this point's
 // vanishing coefficients dropped, read straight out of the shared table -- into `store`:
 // same pivots, same rows.  `values` holds the point's residue for every coefficient slot
@@ -314,13 +335,17 @@ struct FwdStore {
 // that reduced to zero registers nothing, so a solution's position in the store is not the
 // position it had in the order, and a caller that needs the latter (the learn's pivot ->
 // equation map) cannot recover it from the store alone.
+//
+// `stats`, when given, is reset at entry and then holds what this call did (up to an
+// abort, if one stopped it): the probe report's account of the elimination's cost.
 bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                std::size_t n_values, const FwdPlan &plan, uint64_t p,
                                FwdStore &store,
                                const std::atomic<bool> *abort = nullptr,
                                std::unordered_map<uint32_t, std::vector<uint32_t>>
                                    *fwd_deps = nullptr,
-                               std::vector<uint32_t> *row_src = nullptr);
+                               std::vector<uint32_t> *row_src = nullptr,
+                               FwdStats *stats = nullptr);
 
 // backward_eliminate over `store`, restricted to `only_keys` (ascending; the lazy chain of
 // the reconstruction).  A rewritten row is appended as a new row and the key's row index

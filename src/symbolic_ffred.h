@@ -140,6 +140,10 @@ public:
     // firefly driver prints the three as per-probe averages, the way Kira's probe report
     // does.  Three clock reads per point against ~a second of work: free.
     double eval_seconds = 0.0, fwd_seconds = 0.0, bwd_seconds = 0.0;
+    // What those eliminations did -- row merges and the terms they moved -- accumulated
+    // by the same rule.  The phase timers answer "how long", which machine load moves;
+    // this answers "how much work", which is what a truncated equation set changes.
+    FwdStats fwd_stats;
     // Set by a NonMasterRhs result, for the caller's message.
     unsigned fail_target = 0;
     unsigned fail_integral = 0;
@@ -198,8 +202,11 @@ public:
     // The rows are the pool's, read on demand against this point's slot values, so the
     // scratch holds the solutions rather than a second copy of the system.
     scratch.store.reset(store_ids_);
-    forward_eliminate_planned(rows_, scratch.values.data(), scratch.values.size(), plan_, p,
-                              scratch.store);
+    FwdStats point_stats; // this point's tally; the scratch's accumulates over its life
+    forward_eliminate_planned(
+        rows_, scratch.values.data(), scratch.values.size(), plan_, p, scratch.store,
+        nullptr, nullptr, nullptr, &point_stats);
+    scratch.fwd_stats.add(point_stats);
     const auto t_fwd = std::chrono::steady_clock::now();
     backward_eliminate_planned(scratch.store, p, bwd_chain_);
     const auto t_bwd = std::chrono::steady_clock::now();

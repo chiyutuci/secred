@@ -202,6 +202,11 @@ private:
   // the input file's optional `preferred` list (see preferred())
   std::set<RawIntegral> _preferred;
   std::set<unsigned> _targetSectors;
+  // Kira-style seed truncation derived from _rawTargets and _top in
+  // prepare_sectors (derive_seed_truncation, with the calibrated
+  // kSeedLevelOffset relaxation); every sector reads it read-only through
+  // SectorConfig::truncation.
+  SeedTruncation _truncation;
   // top sector
   unsigned _top = 0;
   // number of propagators

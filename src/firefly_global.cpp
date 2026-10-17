@@ -172,6 +172,17 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
                     secred::kFireFlyTag, box.eval_seconds() / per,
                     box.fwd_seconds() / per, box.bwd_seconds() / per);
       std::cout << line;
+      // The same probes' elimination work, which is what a truncated equation set
+      // changes: the time above moves with machine load, these counts do not.
+      std::snprintf(line, sizeof(line),
+                    "  %s probe elimination (average per probe): %llu row merges moving "
+                    "%llu terms / %llu solutions from %llu terms gathered\n",
+                    secred::kFireFlyTag,
+                    static_cast<unsigned long long>(box.fwd_merges() / per),
+                    static_cast<unsigned long long>(box.fwd_moved() / per),
+                    static_cast<unsigned long long>(box.fwd_pivots() / per),
+                    static_cast<unsigned long long>(box.fwd_gathered() / per));
+      std::cout << line;
     }
     if (box.hard_failure()) {
       if (box.fail_reason() ==

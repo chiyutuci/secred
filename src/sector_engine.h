@@ -50,6 +50,35 @@ inline ResEq res_eq_from_row(const unsigned *cols, const uint64_t *vals,
   return out;
 }
 
+// Kira 3's mandatory list (paper §3.2), applied to one sector's spill: the rows a
+// target-driven selection drops because the integral they carry is not on any target's
+// reduction path.  Subsector columns are eliminated before any seed column (every
+// subsector id is lower), so a subsector integral still present in a raw row is one the
+// sector never solved: either a master of this stage (the check passes it) or another
+// sector's master, which the global stage can eliminate only if the rows carrying it are
+// spilled.  Without those rows the spill is sufficient for the sector's own targets and
+// incomplete for the global basis: a supersector's rows relating a subsector master are
+// pruned here, and the master survives the global learn (44 masters where Kira has 43 on
+// the Jpsi family).  Returned by index into eqs (the raw generated rows).
+inline std::unordered_set<uint32_t> unreducible_subsector_rows(
+    const std::vector<ResEq> &eqs, unsigned nsubint,
+    const std::unordered_map<unsigned, unsigned> &master_index,
+    const std::unordered_map<uint32_t, ResEq> &full_solmap) {
+  std::unordered_set<uint32_t> rows;
+  for (uint32_t r = 0; r < eqs.size(); ++r) {
+    for (const auto &term : eqs[r]) {
+      const unsigned id = term.first;
+      if (id >= nsubint) // a seed of this sector, not a subsector column
+        continue;
+      if (master_index.count(id) || full_solmap.count(id))
+        continue;
+      rows.insert(r);
+      break;
+    }
+  }
+  return rows;
+}
+
 // Solve on the idx subset of eqs (shared by learn and the repair loop).  Identical to
 // solve_subset except the input is already residues, saving an Eq -> ResEq conversion.
 inline void solve_res_subset(const std::vector<ResEq> &eqs,

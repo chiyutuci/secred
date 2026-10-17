@@ -169,6 +169,47 @@ initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
   return {depth, rank};
 }
 
+SeedTruncation derive_seed_truncation(const std::vector<RawIntegral> &targets,
+                                      unsigned top, unsigned level_offset) {
+  SeedTruncation truncation;
+  if (targets.empty())
+    return truncation;
+  truncation.active = true;
+  unsigned s_max = 0;
+  for (const RawIntegral &target : targets) {
+    s_max = std::max(s_max, target.rank());
+    truncation.dots =
+        std::max(truncation.dots, target.depth() - std::popcount(target.sector()));
+    unsigned &s_exc = truncation.s_exc[target.sector()];
+    s_exc = std::max(s_exc, target.rank());
+  }
+  // Kira's tuning formula (l = t_top - s_max), with t_top the top sector's line
+  // count, relaxed by the fixed calibrated offset (kSeedLevelOffset, 1).
+  // Clamped at 0: a target carrying more rank than the top has lines, or an
+  // offset past the derived figure, asks for a rule that cuts nothing, which the
+  // max(1, ...) inside the caps then says anyway.
+  truncation.l =
+      std::max(0, (int)std::popcount(top) - (int)s_max - (int)level_offset);
+  return truncation;
+}
+
+std::pair<unsigned, unsigned>
+truncated_seed_caps(unsigned id, unsigned depth, unsigned rank,
+                    const SeedTruncation &truncation) {
+  if (!truncation.active)
+    return {depth, rank};
+  const unsigned lines = std::popcount(id);
+  const unsigned s_exc = truncation.s_exc.contains(id) ? truncation.s_exc.at(id) : 0u;
+  // Kira keeps a seed when sps <= max(1, t - l + 1, s_exc); admission here is
+  // strict, so the cap is one above that.  The dots limit is a depth cap: the
+  // seed's positive powers beyond one per line must stay within `dots`, i.e. its
+  // depth stays below lines + dots + 1.
+  const int keep_rank = std::max({1, (int)lines - truncation.l + 1, (int)s_exc});
+  const unsigned cap_rank = (unsigned)std::max(0, keep_rank + 1);
+  const unsigned cap_depth = lines + truncation.dots + 1;
+  return {std::min(depth, cap_depth), std::min(rank, cap_rank)};
+}
+
 std::string format_seed_box_line(const SeedBound &bound,
                                  const SeedBound &initial) {
   // The three figures describe the boundary the sector ran with, as the level a
@@ -192,6 +233,13 @@ std::string format_seed_box_line(const SeedBound &bound,
   };
   std::ostringstream oss;
   append(oss, bound);
+  // While the rule still cuts the box, name the two admission caps after the
+  // triple, read as levels the same way (a seed sits strictly below them).  A
+  // cap already level with its hard cap is a lifted exception and prints nothing,
+  // so a sector that took one reads exactly as a sector the rule never touched.
+  if (bound.trunc_depth < bound.depth || bound.trunc_rank < bound.rank)
+    oss << " trunc: depth " << (int)bound.trunc_depth - 1 << " rank "
+        << (int)bound.trunc_rank - 1;
   oss << "  start:";
   append(oss, initial);
   return oss.str();
@@ -200,7 +248,8 @@ std::string format_seed_box_line(const SeedBound &bound,
 ProbeCriterion probe_criterion(const SeedBound &bound,
                                const std::vector<std::size_t> &needed_indep,
                                const std::vector<RawIntegral> &seeds,
-                               unsigned nvars, bool collect) {
+                               unsigned nvars, bool collect,
+                               const std::unordered_set<std::size_t> *scope) {
   ProbeCriterion out;
   for (const std::size_t col : needed_indep) {
     // A column at or above nvars is a subsector integral: it is handed to its own
@@ -213,10 +262,21 @@ ProbeCriterion probe_criterion(const SeedBound &bound,
       out.own_masters.push_back(seed);
     if (!bound.exceeded(seed))
       continue;
+    // The probe's target scope -- a master outside it is one only a spill
+    // request needs, so the box does not move for it: it stays a master of the
+    // sector, the way Kira accepts what its box finds.  The walk still visits it
+    // (own_masters), so sector_debug shows why it is there.
+    if (scope != nullptr && scope->find(col) == scope->end()) {
+      ++out.scope_skipped;
+      if (collect)
+        out.accepted.push_back(seed);
+      continue;
+    }
     out.refusal_bits |= bound.refusal(seed);
-    // exceeded() is the total-power test alone (SeedBound::exceeded), so every
-    // report here is a total-power one and the cap hint rides along with all of
-    // them: a depth widening has to carry the cap to the top of the wider box.
+    // The cap hint rides along with every report: a total-power report that pins
+    // the depth cap has to carry the total-power cap to the top of the wider box.
+    // A truncation report (bits 16/32) ignores it -- widen_for lifts the exception
+    // and moves no box figure -- so it costs nothing there.
     out.refusal_bits |= 4;
   }
   return out;
@@ -234,13 +294,18 @@ std::string format_probe_report(unsigned round, const SeedBound &bound,
       << " rank: " << bound.rank << " limit: " << bound.limit
       << ", seed top: " << bound.seed_top() << '\n';
 
+  // "Refused" counts what the criterion reported, not what the box would have
+  // refused: an accepted master (outside the target scope) is one the box
+  // refused and the walk let through, and it is counted in `accepted` instead.
   unsigned refused = 0;
   for (const RawIntegral &m : crit.own_masters)
-    if (bound.exceeded(m))
+    if (bound.exceeded(m) &&
+        std::find(crit.accepted.begin(), crit.accepted.end(), m) ==
+            crit.accepted.end())
       ++refused;
   oss << "[probe] own masters: " << crit.own_masters.size()
-      << ", refused: " << refused << ", refusal bits: " << crit.refusal_bits
-      << '\n';
+      << ", refused: " << refused << ", accepted: " << crit.scope_skipped
+      << ", refusal bits: " << crit.refusal_bits << '\n';
 
   for (const RawIntegral &m : crit.own_masters) {
     std::string verdict;
@@ -248,10 +313,21 @@ std::string format_probe_report(unsigned round, const SeedBound &bound,
       verdict += "PAST-TOP ";
     if (bound.past_depth_cap(m))
       verdict += "PAST-DEPTH-CAP ";
+    if (bound.truncation_refused(m)) {
+      if (m.depth() >= bound.trunc_depth)
+        verdict += "PAST-TRUNC-DEPTH ";
+      if (m.rank() >= bound.trunc_rank)
+        verdict += "PAST-TRUNC-RANK ";
+    }
     if (verdict.empty())
       verdict = "ok";
     else
       verdict.pop_back();  // the join above leaves a trailing space
+    // Accepted on purpose (outside the target scope): the figures still say why
+    // the box would have refused it, the verdict says why it did not.
+    if (std::find(crit.accepted.begin(), crit.accepted.end(), m) !=
+        crit.accepted.end())
+      verdict += " ACCEPTED";
     oss << "[probe]   " << m << "  depth: " << m.depth() << " rank: " << m.rank()
         << " total: " << m.depth() + m.rank() << "  " << verdict << '\n';
   }
@@ -381,10 +457,43 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   // SeedBound for the boundary rule built on top of it.  Keep it: a widening below
   // may relax the boundary once or more, and a sector's log reports both so the
   // starting point stays visible.
-  unsigned boxDepth, boxRank;
-  std::tie(boxDepth, boxRank) = initial_seed_bounds(_id, ctx.targets[_id],
-                                                    ctx.uptargets[_id]);
+  //
+  // ctx.targets at this point still holds the sector's input targets alone --
+  // uptargets are merged into it only after the system is generated (below) --
+  // so targetBox is the box the sector's own targets derive.  requestBox adds
+  // the spill requests, and it is the box the sector runs with.
+  // The input targets alone, kept for the probe's target scope -- the pass
+  // below merges the spill requests into ctx.targets, and the criterion needs
+  // the two sets apart.
+  _inputTargets = ctx.targets[_id];
+
+  const auto targetBox = initial_seed_bounds(_id, ctx.targets[_id], {});
+  const auto requestBox =
+      initial_seed_bounds(_id, ctx.targets[_id], ctx.uptargets[_id]);
+  if (requestBox != targetBox) {
+    ctx.boxSpillRaised.fetch_add(1, std::memory_order_relaxed);
+    ctx.boxSpillExtraDepth.fetch_add(requestBox.first - targetBox.first,
+                                     std::memory_order_relaxed);
+    ctx.boxSpillExtraRank.fetch_add(requestBox.second - targetBox.second,
+                                    std::memory_order_relaxed);
+  }
+
+  const auto [boxDepth, boxRank] = requestBox;
   _bound = SeedBound::initial(boxDepth, boxRank);
+  // Kira-style truncation: cut the seeds the derived rule refuses (an admission
+  // layer, so every seed keeps its column), unless this sector has none.  The
+  // probe reports an over-cut seed as a needed independent variable and the round
+  // loop lifts the sector's exception (SeedBound::widen_for).
+  bool truncated = false;
+  if (cfg.truncation && cfg.truncation->active) {
+    std::tie(_bound.trunc_depth, _bound.trunc_rank) = truncated_seed_caps(
+        _id, _bound.depth, _bound.rank, *cfg.truncation);
+    truncated =
+        _bound.trunc_depth < _bound.depth || _bound.trunc_rank < _bound.rank;
+  }
+  if (truncated)
+    ctx.truncatedSectors.fetch_add(1, std::memory_order_relaxed);
+  bool truncationLifted = false;
   _initialBound = _bound;
   // sector_debug's reports accumulate across the rounds below (a report is
   // produced where the criterion fires, which is not where the log survives); a
@@ -403,8 +512,12 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
   };
 
   // Whether the box was widened at all, i.e. whether the sector settled on a box
-  // past the one initial_seed_bounds returned.
+  // past the one initial_seed_bounds returned.  `widened` is the narrower figure
+  // the narrowing statistic reads: a round discarded to lift a truncation
+  // exception (SeedBound::widen_for bits 16/32) leaves the box where it was, so
+  // the sector still settled on the box initial_seed_bounds derived.
   bool expanded = false;
+  bool widened = false;
   std::uint64_t probeNanos = 0;  // time in rounds whose work was thrown away
   std::uint64_t fullNanos = 0;   // time in the round that settled and spilled
 
@@ -454,7 +567,17 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
       break;
     }
     expanded = true;
+    if ((result & 48u) && !truncationLifted) {
+      truncationLifted = true;
+      ctx.truncationLifted.fetch_add(1, std::memory_order_relaxed);
+    }
+    const unsigned depthBefore = _bound.depth;
+    const unsigned rankBefore = _bound.rank;
+    const unsigned limitBefore = _bound.limit;
     _bound.widen_for(result);
+    if (_bound.depth != depthBefore || _bound.rank != rankBefore ||
+        _bound.limit != limitBefore)
+      widened = true;
   }
 
   // sector_debug: the reports of the rounds that failed, appended to the log of
@@ -467,7 +590,7 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
       report << _probeReport;
   }
 
-  if (expanded)
+  if (widened)
     ctx.narrowingFail.fetch_add(1, std::memory_order_relaxed);
   else
     ctx.narrowingSuccess.fetch_add(1, std::memory_order_relaxed);
@@ -725,6 +848,26 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
     if (ffred_learn.solmap.find(id) != ffred_learn.solmap.end())
       ffred_dep_targets.push_back(id);
 
+  // Which masters may move the box (the probe's fixed target scope).  The set is
+  // the masters the sector's *input* targets reduce to, read off the same learn:
+  // a master only a spill request needs is not in it, so the walk below accepts
+  // it instead of widening.  A sector with no input targets gets an empty set and
+  // never widens: its box is its ancestors' targets' (the Kira model), and what
+  // the box finds there is its contribution to the basis.  nsubint + weight is
+  // the seed's ResEq id (a seed's column is nvars - 1 - weight).
+  std::unordered_set<std::size_t> probe_scope;
+  {
+    std::vector<unsigned> input_ids;
+    input_ids.reserve(_inputTargets.size());
+    for (const RawIntegral &t : _inputTargets) {
+      const auto w = _weights.find(t);
+      if (w != _weights.end())
+        input_ids.push_back(nsubint + w->second);
+    }
+    for (unsigned id : secred::sector_masters(ffred_learn, input_ids))
+      probe_scope.insert(ncols - 1 - id);
+  }
+
   // mark and sweep
   //
   // A needed independent variable whose seed the boundary does not admit means the
@@ -738,8 +881,11 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   // cap must ride along at the top of the widened box (SeedBound::widen_depth).  A
   // depth report from the depth cap alone leaves bit 4 clear and deepens the box
   // without moving the cap.
-  const ProbeCriterion crit =
-      probe_criterion(_bound, needed_indep, _seeds, nvars, cfg.sector_debug);
+  const ProbeCriterion crit = probe_criterion(
+      _bound, needed_indep, _seeds, nvars, cfg.sector_debug, &probe_scope);
+  if (crit.scope_skipped != 0)
+    ctx.probeScopeSkipped.fetch_add(crit.scope_skipped,
+                                    std::memory_order_relaxed);
   if (crit.refusal_bits != 0) {
     // sector_debug: keep the pass's report for the log that survives.  Writing it
     // here would be wasted -- run_reduce_ff_n deletes the whole sector directory,
@@ -807,6 +953,21 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
     sel_idx.assign(ffred_sel.needed_eq_idx.begin(),
                    ffred_sel.needed_eq_idx.end());
   }
+
+  // Kira 3's mandatory list (see unreducible_subsector_rows): keep the rows that carry
+  // a subsector integral this sector never reduces.  The target-driven closure prunes
+  // exactly those rows when the integral is no target's dependency, and the global
+  // stage then has nothing to eliminate that subsector master with -- the 44-vs-43
+  // case on the Jpsi family.  Applied on the fallback path too: the closure there is
+  // sufficient for this sector's targets, not for the global basis.
+  const std::size_t n_selected_before = sel_idx.size();
+  for (uint32_t r : secred::unreducible_subsector_rows(
+           res_eqs, nsubint, master_index, ffred_learn.solmap))
+    sel_idx.push_back(r);
+  std::sort(sel_idx.begin(), sel_idx.end());
+  sel_idx.erase(std::unique(sel_idx.begin(), sel_idx.end()), sel_idx.end());
+  const std::size_t n_mandatory_rows = sel_idx.size() - n_selected_before;
+
   selected_eqs.reserve(sel_idx.size());
   for (unsigned j : sel_idx)
     selected_eqs.push_back(sys_idx[j]);
@@ -814,8 +975,8 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   file << "\n remained equations: " << selected_eqs.size() << '\n';
   file << " selection: forward (repair rounds " << ffred_sel.n_repair_rounds
        << ", +" << ffred_sel.n_repair_added << " added; fwd closure "
-       << ffred_sel.n_fwd_rows << " equations; fallback "
-       << (ffred_sel.fallback ? "yes" : "no") << ")\n";
+       << ffred_sel.n_fwd_rows << " equations; mandatory " << n_mandatory_rows
+       << "; fallback " << (ffred_sel.fallback ? "yes" : "no") << ")\n";
 
   // Regenerate each selected equation from its (seed, ibp) record and spill
   // the whole round to the raw equation file (ctx.appendRawEquations, one

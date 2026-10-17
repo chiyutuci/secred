@@ -245,6 +245,70 @@ TEST(sector_selection_forward_then_repair) {
   REQUIRE_EQ(fin.solmap.at(127u)[1].second, 2u);
 }
 
+// Kira 3's mandatory list at the sector stage: a raw row carrying a subsector integral
+// the sector never reduces is kept even when no target's reduction path reaches it —
+// those rows are what a supersector contributes to the global elimination of a
+// subsector master.  Master columns, reducible columns and seed columns are not
+// mandatory.
+TEST(sector_unreducible_subsector_rows_kept) {
+  // nsubint = 4 (ids 0..3), nvars = 4 seeds (ids 4..7), ncols = 8, id = ncols-1-col.
+  constexpr unsigned N = 8;
+  auto mk = [](std::initializer_list<std::pair<unsigned, int64_t>> terms) {
+    std::vector<unsigned> cols;
+    std::vector<uint64_t> vals;
+    for (const auto &t : terms) {
+      cols.push_back(N - 1 - t.first);
+      int64_t v = t.second % static_cast<int64_t>(P);
+      if (v < 0)
+        v += static_cast<int64_t>(P);
+      vals.push_back(static_cast<uint64_t>(v));
+    }
+    return secred::res_eq_from_row(cols.data(), vals.data(),
+                                   static_cast<unsigned>(cols.size()), N, P);
+  };
+  // Target chain 7 <- 6 <- 5 <- {2,0}; a disjoint row 4 = 3 + 0 carries subsector id 3,
+  // which nothing ever reduces.  Masters for target 7 are {0,2}.
+  std::vector<ResEq> eqs = {
+      mk({{7, 1}, {6, -1}, {2, -1}}),
+      mk({{6, 1}, {5, -1}, {2, -1}}),
+      mk({{5, 1}, {2, -1}, {0, -1}}),
+      mk({{4, 1}, {3, -1}, {0, -1}}),
+  };
+  std::vector<uint32_t> all{0u, 1u, 2u, 3u};
+  SubSolve learn;
+  secred::solve_res_subset(eqs, all, P, learn, /*want_fwd=*/true,
+                           /*want_bwd=*/true);
+  REQUIRE(learn.solmap.count(3u) == 0);
+  REQUIRE(learn.solmap.count(4u) == 1);
+
+  const std::vector<unsigned> target_ids{7u};
+  const std::vector<unsigned> masters = secred::sector_masters(learn, target_ids);
+  REQUIRE_EQ(masters.size(), 2u);
+  std::unordered_map<unsigned, unsigned> master_index;
+  for (unsigned j = 0; j < masters.size(); ++j)
+    master_index[masters[j]] = j;
+
+  // Row 3 (4 = 3 + 0) is the only one carrying an unreducible, non-master subsector id.
+  auto rows = secred::unreducible_subsector_rows(eqs, 4u, master_index,
+                                                 learn.solmap);
+  REQUIRE_EQ(rows.size(), 1u);
+  REQUIRE(rows.count(3u) == 1);
+
+  // Declaring id 3 a master of this stage makes it not mandatory here: the global stage
+  // gets it from the subsector that owns it.
+  std::unordered_map<unsigned, unsigned> with3 = master_index;
+  with3[3u] = masters.size();
+  REQUIRE(secred::unreducible_subsector_rows(eqs, 4u, with3, learn.solmap).empty());
+
+  // An unreducible subsector integral carried by a target's own chain is a master and
+  // is excluded too: ids 0 and 2 are masters, so no chain row qualifies.
+  for (uint32_t r : rows)
+    REQUIRE(r != 0u);
+  REQUIRE(rows.count(0u) == 0);
+  REQUIRE(rows.count(1u) == 0);
+  REQUIRE(rows.count(2u) == 0);
+}
+
 // The selection and the row mapping are deterministic: the same input twice is identical,
 // which cross-run reproducibility requires.
 TEST(sector_selection_deterministic) {

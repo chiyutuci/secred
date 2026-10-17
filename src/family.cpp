@@ -119,6 +119,23 @@ void Family::run_reduce(Reduce &reduce) {
     const double probeShare =
         atpsSeconds > 0 ? 100.0 * probeSeconds / atpsSeconds : 0.0;
 
+    // Seed truncation (SeedTruncation): how many sectors the derived rule cut, and
+    // how many of those the probe then made lift the exception -- the measure of
+    // over-truncation, which costs one discarded pass per lifted sector.
+    const unsigned trunc = reduce._ctx.truncatedSectors.load();
+    const unsigned lifted = reduce._ctx.truncationLifted.load();
+
+    // Seed-box diagnostics (2026-10-17): how far the recursive spill lifts the
+    // box over the sector's own input targets.
+    const unsigned spillRaised = reduce._ctx.boxSpillRaised.load();
+    const unsigned spillDepth = reduce._ctx.boxSpillExtraDepth.load();
+    const unsigned spillRank = reduce._ctx.boxSpillExtraRank.load();
+    // Probe scope (fixed to the masters the input targets need): how many
+    // out-of-box master reports the target-only walk accepted instead of
+    // widening the box.
+    const char *probeMode = "targets";
+    const unsigned accepted = reduce._ctx.probeScopeSkipped.load();
+
     std::ofstream sfile(_cache_dir + "/sectors/sectors", std::ios::trunc);
     if (sfile.is_open())
       sfile << "narrowing succeeded: " << ok << "\n"
@@ -128,13 +145,35 @@ void Family::run_reduce(Reduce &reduce) {
             << ratio << " %\n"
             << "probe seconds:       " << probeSeconds << "\n"
             << "full seconds:        " << fullSeconds << "\n"
-            << "probe share:         " << probeShare << " %\n";
+            << "probe share:         " << probeShare << " %\n"
+            << "truncated sectors:   " << trunc << "\n"
+            << "truncation lifted:   " << lifted << "\n"
+            << "truncation l:        " << reduce._truncation.l << "\n"
+            << "truncation offset:   " << kSeedLevelOffset << "\n"
+            << "box spill raised:    " << spillRaised << "\n"
+            << "box spill extra:     " << spillDepth << " depth, " << spillRank
+            << " rank\n"
+            << "probe scope:         " << probeMode << "\n"
+            << "probe accepted:      " << accepted << "\n";
 
     char atpsLine[128];
     std::snprintf(atpsLine, sizeof(atpsLine),
                   "\n  ATPS: probe %.1f s / full %.1f s / probe share %.1f %%",
                   probeSeconds, fullSeconds, probeShare);
     std::cout << atpsLine << std::endl;  // flush: precedes the global phase
+
+    std::cout << "\n  Seed truncation: " << trunc << " sectors cut, " << lifted
+              << " lifted by the probe (l = " << reduce._truncation.l
+              << ", offset " << kSeedLevelOffset << ")"
+              << std::endl;  // flush: same reason
+
+    std::cout << "\n  Seed box: spill raised " << spillRaised
+              << " sectors (+" << spillDepth << " depth, +" << spillRank
+              << " rank over targets-only)" << std::endl;  // flush: same reason
+
+    std::cout << "\n  Probe scope (" << probeMode << "): " << accepted
+              << " out-of-box master reports accepted, not needed by the"
+              << " input targets" << std::endl;  // flush: same reason
 
     // With the pure-numeric FiniteFlow global reduction the probe narrowing is
     // folded into the Reduction Statistics summary printed after learn.
@@ -219,8 +258,8 @@ void Family::run_reduce(Reduce &reduce) {
 
 void Family::_run_reduce_layer(Reduce &reduce) const {
   BS::thread_pool pool(_sthreads);
-  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode,
-                    _sector_debug,    &reduce._preferred};
+  SectorConfig scfg{_cache_dir,     _subsector_filter_n, _ordering_mode,
+                    _sector_debug,  &reduce._preferred,  &reduce._truncation};
 
   // Hierarchical parallel execution: sectors are pre-sorted by descending
   // popcount(id), so iterating in order visits layers from highest to lowest.
@@ -302,8 +341,8 @@ void Family::_run_reduce_fine(Reduce &reduce) const {
   for (unsigned i = 0; i < nsec; ++i)
     pending[i].store(parent_count[i], std::memory_order_relaxed);
 
-  SectorConfig scfg{_cache_dir, _subsector_filter_n, _ordering_mode,
-                    _sector_debug,    &reduce._preferred};
+  SectorConfig scfg{_cache_dir,     _subsector_filter_n, _ordering_mode,
+                    _sector_debug,  &reduce._preferred,  &reduce._truncation};
 
   std::atomic<unsigned> done_count{0};
   std::mutex done_mutex;
@@ -553,11 +592,17 @@ Family::Family(const YAML::Node &config) {
              {"global_tool",
               "the global tool is fixed: a symbolic system is reconstructed with "
               "FireFly, a numeric one with FiniteFlow"},
-             {"threads", "settings.sthreads"},
-             {"global_finiteflow_threads", "settings.gthreads"}}) {
+             {"threads", "use settings.sthreads"},
+             {"global_finiteflow_threads", "use settings.gthreads"},
+             {"probe_mode",
+              "the probe scope is fixed to the input targets: only a master the "
+              "sector's input targets need may widen its box"},
+             {"seed_level_offset",
+              "the calibrated offset is written into the rule "
+              "(kSeedLevelOffset = 1)"}}) {
       if (s[key])
         throw std::runtime_error("settings." + std::string(key) +
-                                 " was removed; use " + replacement);
+                                 " was removed; " + replacement);
     }
     if (s["cache_dir"])       _cache_dir       = s["cache_dir"].as<std::string>();
     if (s["sthreads"])        _sthreads        = s["sthreads"].as<unsigned>();
@@ -1171,6 +1216,11 @@ void Reduce::print() const {
 }
 
 void Reduce::prepare_sectors() {
+  // Kira-style seed truncation, derived once from the input's targets: no user
+  // knob (derive_seed_truncation).  Built here, before any worker starts, so every
+  // sector reads the same read-only rule.
+  _truncation = derive_seed_truncation(_rawTargets, _top);
+
   _lines = std::vector<bool>(_nprops, false);
   for (unsigned i = 0; i < _nprops; ++i)
     if (_top & (1 << i))

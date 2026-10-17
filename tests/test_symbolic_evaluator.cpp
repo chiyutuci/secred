@@ -411,3 +411,27 @@ TEST(symbolic_global_learn_reports_a_target_that_is_a_master) {
   REQUIRE_EQ(l.dep_targets.size(), std::size_t(0));   // [0] never becomes a pivot
   REQUIRE_EQ(l.nnindeps, 0u);
 }
+
+// The elimination counters behind the probe report's fill-in line.  They accumulate
+// exactly like the phase timers -- a scratch outlives one evaluator -- and the row count
+// is the equations the point eliminated, so the driver can divide by the point count.
+TEST(symbolic_evaluator_counts_the_elimination_fill_in) {
+  secred::SymbolicFFEvaluator ev = evaluator_of();
+  const std::uint64_t p = 1125899906842597ULL;
+  ev.reduce_for_prime(p, 1);
+  secred::SymbolicFFEvaluator::Scratch scratch;
+  const std::uint64_t x[2] = {5, 7};
+  std::uint64_t out[1] = {0};
+  REQUIRE_EQ(scratch.fwd_stats.rows, std::uint64_t(0));
+  REQUIRE(ev.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  REQUIRE_EQ(scratch.fwd_stats.rows, std::uint64_t(3));   // the three equations
+  REQUIRE_EQ(scratch.fwd_stats.pivots, std::uint64_t(3)); // and their three solutions
+  REQUIRE(scratch.fwd_stats.gathered > 0);                // E1's terms, then E2's, E3's
+  REQUIRE(scratch.fwd_stats.merges > 0);  // E1 substitutes the other two solutions
+  REQUIRE(scratch.fwd_stats.moved > 0);   // and pays their fill-in
+  const std::uint64_t first = scratch.fwd_stats.moved;
+  REQUIRE(ev.evaluate_point(p, x, scratch, out) ==
+          secred::SymbolicFFEvaluator::PointResult::Ok);
+  REQUIRE(scratch.fwd_stats.moved > first); // the second point adds to the same counters
+}

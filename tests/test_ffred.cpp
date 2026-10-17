@@ -1358,3 +1358,76 @@ TEST(forward_eliminate_planned_abandons_the_work_on_the_flag) {
   REQUIRE(!secred::backward_eliminate_planned(done, p, {6u, 5u}, &stop_bwd));
   REQUIRE(done.row_of == before);
 }
+
+// ---------------------------------------------------------------------------
+// The fill-in tally
+//
+// The truncated equation sets of the 2026-10-17 probe/offset knobs eliminate slower
+// than the half-larger full system, and the probe report shows the cost sits in the
+// forward elimination, not in the coefficient tables.  What the elimination costs is
+// the fill-in of its merge plan: the planned path can report the merges it runs and
+// the terms those merges move, next to the three phase timers the driver prints.
+// ---------------------------------------------------------------------------
+
+TEST(forward_eliminate_planned_tallies_the_merges_its_plan_runs) {
+  // A chain: the row {129, 128} substitutes the solution {128, 126} exactly once,
+  // so one merge moves the two terms of the rewritten row.
+  std::vector<Eq> system;
+  system.push_back(eq({{128, {1, 1}}, {126, {-1, 1}}}));
+  system.push_back(eq({{129, {1, 1}}, {128, {-1, 1}}}));
+  const uint64_t p = fflow::BIG_UINT_PRIMES[0];
+  const std::size_t n_ids = 130u;
+
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin, sys_idx;
+  std::vector<uint64_t> values;
+  pool_of(system, p, terms, eq_begin, values, sys_idx);
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  secred::FwdStore store;
+  store.reset(n_ids);
+  secred::FwdStats stats;
+  REQUIRE(secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p,
+                                            store, nullptr, nullptr, nullptr, &stats));
+  REQUIRE_EQ(stats.rows, std::uint64_t(2));
+  REQUIRE_EQ(stats.gathered, std::uint64_t(4)); // two terms per row, none vanished
+  REQUIRE_EQ(stats.merges, std::uint64_t(1));
+  REQUIRE_EQ(stats.moved, std::uint64_t(2)); // {129, 128} -> {129, 126}
+  REQUIRE_EQ(stats.pivots, std::uint64_t(2));
+}
+
+TEST(forward_eliminate_planned_tallies_a_row_that_reduces_to_zero) {
+  // The third row is the first one again: it substitutes the same solution and
+  // reduces to 0 = 0, so it is a walked row and a merge, but neither a pivot nor a
+  // moved term.  The total is what the caller divides by the point count, so the
+  // zero-producing row has to be accounted, not skipped.
+  std::vector<Eq> system;
+  system.push_back(eq({{128, {1, 1}}, {126, {-1, 1}}}));
+  system.push_back(eq({{129, {1, 1}}, {128, {-1, 1}}}));
+  system.push_back(eq({{128, {1, 1}}, {126, {-1, 1}}}));
+  const uint64_t p = fflow::BIG_UINT_PRIMES[0];
+  const std::size_t n_ids = 130u;
+
+  std::vector<std::pair<uint32_t, uint32_t>> terms;
+  std::vector<uint32_t> eq_begin, sys_idx;
+  std::vector<uint64_t> values;
+  pool_of(system, p, terms, eq_begin, values, sys_idx);
+  secred::FwdPlan plan;
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+  secred::SymRowTable table{terms.data(), eq_begin.data(), system.size()};
+
+  secred::FwdStore store;
+  store.reset(n_ids);
+  secred::FwdStats stats;
+  REQUIRE(secred::forward_eliminate_planned(table, values.data(), values.size(), plan, p,
+                                            store, nullptr, nullptr, nullptr, &stats));
+  REQUIRE_EQ(stats.rows, std::uint64_t(3));
+  REQUIRE_EQ(stats.gathered, std::uint64_t(6));
+  REQUIRE_EQ(stats.merges, std::uint64_t(2));
+  REQUIRE_EQ(stats.moved, std::uint64_t(2));
+  REQUIRE_EQ(stats.pivots, std::uint64_t(2));
+}
+
+

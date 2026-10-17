@@ -338,3 +338,28 @@ TEST(a_failed_global_reduction_is_fatal_not_an_empty_table) {
   secred::require_global_reduction(done, "firefly");   // must not throw
   REQUIRE(!done.reductions.empty());   // what the failed phase does not have to offer
 }
+
+// The box hands the elimination counters to the driver the way it hands the phase
+// timers: a thread's scratch outlives the probe, so the probe's share is the delta.
+TEST(firefly_box_reports_the_probe_elimination_fill_in) {
+  secred::SymbolicFFEvaluator ev = evaluator_of();
+  secred::SecRedFireFlyBlackBox box(ev, 1);
+  box.prime_changed();
+  REQUIRE_EQ(box.fwd_merges(), std::uint64_t(0));
+  const std::vector<firefly::FFInt> x = {firefly::FFInt(5), firefly::FFInt(7)};
+  box(x);
+  REQUIRE(box.fwd_merges() > 0);
+  REQUIRE(box.fwd_moved() > 0);
+  REQUIRE(box.fwd_gathered() > 0);
+  REQUIRE(box.fwd_pivots() > 0); // the box eliminates the learn's selected subset
+  // The first probe's delta can carry a previous test's unreported tail (the scratch is
+  // thread_local and outlives the box), so compare the deltas of two later probes: in
+  // steady state each probe adds exactly its own point's work.
+  box(x);
+  const std::uint64_t a = box.fwd_merges();
+  box(x);
+  const std::uint64_t b = box.fwd_merges();
+  REQUIRE(b > a);
+  box(x);
+  REQUIRE_EQ(box.fwd_merges() - b, b - a);
+}

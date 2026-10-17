@@ -9,6 +9,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -17,6 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "arith/ffint.h"
@@ -34,12 +37,13 @@ enum class OrderingMode { Normal, Balance };
 // Defined below, but SectorConfig names it first; only a pointer to it is stored,
 // so the declaration suffices here.
 class RawIntegral;
+struct SeedTruncation;
 
 struct SectorConfig {
   std::string cache_dir = "cache";
   unsigned subsector_filter_n = 1;
   OrderingMode ordering_mode = OrderingMode::Balance;
-  // settings.sector_debug: append every reporting pass's probe report to the
+  // sector_debug: append every reporting pass's probe report to the
   // sector log, so a widening (or a sector given up on) can be checked by hand.
   // Off by default: it is a diagnostic, and a run with it on has to be the same
   // reduction as one without it.
@@ -52,6 +56,10 @@ struct SectorConfig {
   // default) is the feature off: the order is then exactly the one a file
   // without the key gets.
   const std::set<RawIntegral> *preferred = nullptr;
+  // Kira-style seed truncation (derive_seed_truncation), derived once from the
+  // input's targets and shared read-only by every sector.  nullptr (the default)
+  // is the feature off: every seed inside the box generates equations.
+  const SeedTruncation *truncation = nullptr;
 };
 
 class Reduce;
@@ -244,6 +252,80 @@ template <> struct convert<RawIntegral> {
   }
 };
 } // namespace YAML
+
+// The fixed relaxation of Kira's derived truncation level l: the calibrated
+// value (Kira's l = 3 where the formula gives 4 on F234).  This used to be the
+// settings.seed_level_offset option; the option was removed on 2026-10-17 and
+// the value written into the rule (derive_seed_truncation's default).
+inline constexpr unsigned kSeedLevelOffset = 1;
+
+// Kira 3's seed truncation (paper §3.1.2), read two ways at once.  Kira keeps a
+// seed when the sum of its negative powers (`sps`, this project's rank) is at
+// most max(1, t - l + 1, s_max,sector) and when its dots -- the positive powers
+// beyond one per line, i.e. depth - popcount(sector) -- stay within the sector's
+// `d`.  `l` and `d` are hand-tuned there; here both are derived from the input's
+// targets, so the user never types them:
+//
+//   free choice      kira's knobs          derived from the targets
+//   l                depth/rank tradeoff   popcount(top) - s_max - 1
+//   s_max,sector     per-sector `reduce`   largest rank among the sector's targets
+//   d                dots allowed          largest (depth - popcount) among targets
+//
+// `s_max` is the largest rank over every target and `top` the family's top sector,
+// so l starts where Kira's tuning formula (l = t_top - s_max) starts.  Encoding
+// it as a truncation rule changes nothing by itself: the same figure is what the
+// per-sector exception below already needs.
+//
+// The derived l is relaxed by kSeedLevelOffset, fixed at the calibrated value
+// (1) rather than exposed as a setting: l_eff = max(0, t_top - s_max - 1).
+// Kira's paper says to tune l down when over-truncation inflates the master list,
+// and an over-truncated seed is worse than a kept one here: its sector lifts the
+// exception entirely (SeedBound::widen_for), so a rule that cuts too deep buys
+// nothing but a discarded pass.  The calibration is now part of the rule.
+//
+// The rule is an *admission* layer, not a generation box: a truncated seed keeps
+// its column and its weight, so a request can still be expressed through it; it
+// only generates no equation.  The probe then detects over-truncation -- a seed
+// the rule cut that a target's reduction needs shows up as a needed independent
+// variable and reports bits 16/32 (see SeedBound::widen_for) -- and the sector
+// lifts its own exception.  That is Kira's tspexception, automated.
+struct SeedTruncation {
+  // False when the input has no targets at all: nothing to derive the rule from,
+  // and every seed keeps generating equations.
+  bool active = false;
+  // Kira's l after the calibrated relaxation:
+  // max(0, popcount(top) - s_max - kSeedLevelOffset).  Clamped at 0: a target
+  // carrying more rank than the top sector has lines, or an offset past the
+  // derived figure, asks for a rule that cuts nothing.
+  int l = 0;
+  // The largest dots figure among the targets, per sector clamped above by the
+  // depth hard cap when the caps are applied (truncated_seed_caps).
+  unsigned dots = 0;
+  // Per sector: the largest rank among that sector's own targets -- Kira's
+  // per-sector `reduce` entry, inherited by its subsectors there and applied to
+  // the sector alone here (a subsector's own entries cover its own targets).
+  std::unordered_map<unsigned, unsigned> s_exc;
+};
+
+// Derive the rule from the input's targets and the family's top sector (a
+// bitmask of its lines).  `top` sets t_top; a target's own sector sets t in the
+// per-sector cap.  `level_offset` relaxes Kira's l by that many levels; the
+// default is the calibrated kSeedLevelOffset (1), and 0 keeps the paper's
+// tuning formula unchanged (tests of the pure formula pass it explicitly).
+// Deterministic and independent of the targets' order.
+SeedTruncation derive_seed_truncation(
+    const std::vector<RawIntegral> &targets, unsigned top,
+    unsigned level_offset = kSeedLevelOffset);
+
+// The (depth, rank) admission caps truncation puts on sector `id`, given the hard
+// caps initial_seed_bounds derived.  Strict comparisons, like every other cap
+// here: a seed is admitted when depth < cap and rank < cap.  Kira's inclusive
+// keep condition becomes cap = keep + 1; both caps are clamped to the hard caps,
+// so a rule that would widen the box cannot, and an inactive rule returns the
+// hard caps unchanged.
+std::pair<unsigned, unsigned>
+truncated_seed_caps(unsigned id, unsigned depth, unsigned rank,
+                    const SeedTruncation &truncation);
 
 // ibp relation
 // first:  integral indices
@@ -514,9 +596,33 @@ struct ReductionContext {
   // (derived from
   //   targets) were sufficient -- the settling round reported nothing.
   // narrowingFail: sectors that had to widen the bounds at least once before
-  // settling.
+  // settling.  Lifting a truncation exception (SeedTruncation) discards a round
+  // but moves no box figure, so it does not count as a failure here -- the box the
+  // sector settled on is still the one initial_seed_bounds derived.
   std::atomic<unsigned> narrowingSuccess{0};
   std::atomic<unsigned> narrowingFail{0};
+
+  // Seed truncation (SeedTruncation).  truncatedSectors: sectors the derived rule
+  // cut at least one seed in (its two caps below the hard caps).  truncationLifted:
+  // sectors that then had to lift their exception because the probe reported a
+  // cut seed a target needed -- the over-truncation the rule is allowed to make
+  // and this counter measures.
+  std::atomic<unsigned> truncatedSectors{0};
+  std::atomic<unsigned> truncationLifted{0};
+
+  // Seed-box diagnostics (2026-10-17), final once the sector phase completes.
+  // boxSpillRaised: sectors whose request-driven box (targets + uptargets) is
+  // wider than the box their own input targets derive; the two sums are the
+  // extra depth and rank layers, in hard-cap units.
+  std::atomic<unsigned> boxSpillRaised{0};
+  std::atomic<unsigned> boxSpillExtraDepth{0};
+  std::atomic<unsigned> boxSpillExtraRank{0};
+
+  // Masters the box refused an equation for but the walk accepted because no
+  // input target needs them (ProbeCriterion::scope_skipped), summed over every
+  // reporting pass.  A large count is the Kira trade: a smaller box and fewer
+  // equations, at the price of a larger basis.
+  std::atomic<unsigned> probeScopeSkipped{0};
 
   // Total raw equations generated across all sectors, counting every round --
   // the discarded ones included.
@@ -653,6 +759,17 @@ struct SeedBound {
   // layer the boundary keeps out of the system's equations.
   unsigned limit = 0;
 
+  // The truncation admission caps (SeedTruncation -- Kira's truncate_sp on the
+  // rank axis and its dots limit on the depth axis).  Strict, like the hard caps:
+  // a seed past one of them generates no equation although it keeps its column.
+  // Disabled by default (UINT_MAX admits every seed the hard caps do); initial()
+  // starts a sector with them equal to the hard caps, i.e. with the rule lifted,
+  // and run_reduce_ff_n lowers them from the input's targets when the rule is
+  // active.  A sector that the probe reports truncating them (refusal bits 16 and
+  // 32) lifts them back to the hard caps, which is the exception.
+  unsigned trunc_depth = std::numeric_limits<unsigned>::max();
+  unsigned trunc_rank = std::numeric_limits<unsigned>::max();
+
   // The cap a box with these hard caps carries: one layer below the box corner
   // depth + rank - 2, so the strict comparison in admits() cuts exactly the
   // corner layer.  Signed, so a degenerate hand-built box (depth 0) cannot wrap.
@@ -667,6 +784,10 @@ struct SeedBound {
     b.depth = depth;
     b.rank = rank;
     b.limit = cap_for(depth, rank);
+    // No truncation until the caller applies the rule; the two caps follow the
+    // hard ones so a widening cannot leave a stale truncation behind.
+    b.trunc_depth = depth;
+    b.trunc_rank = rank;
     return b;
   }
 
@@ -688,11 +809,26 @@ struct SeedBound {
     return std::min((int)depth + (int)rank - 2, (int)limit - 1);
   }
 
-  // May this seed generate equations (a row of the sector's system)?
+  // May this seed generate equations (a row of the sector's system)?  Three
+  // layers of the same shape: the two hard caps, then the truncation caps
+  // (SeedTruncation), then the total-power cap.  A seed the truncation cuts keeps
+  // its column and weight -- _generate_seeds enumerates the whole box -- so only
+  // its equation is missing, never its representation.
   bool admits(const RawIntegral &i) const {
     if (i.depth() >= depth || i.rank() >= rank)
       return false;
+    if (i.depth() >= trunc_depth || i.rank() >= trunc_rank)
+      return false;
     return quantity(i) < boundary();
+  }
+
+  // Did the truncation rule -- not a hard cap -- cut this seed?  The hard caps are
+  // checked first: a seed either of them refuses was never going to generate an
+  // equation, and reporting it as truncated would ask a lift that cannot help.
+  bool truncation_refused(const RawIntegral &i) const {
+    if (i.depth() >= depth || i.rank() >= rank)
+      return false;
+    return i.depth() >= trunc_depth || i.rank() >= trunc_rank;
   }
 
   // The criterion itself: the seed's total power is one layer or more above the
@@ -732,11 +868,20 @@ struct SeedBound {
   // -- with the cap carried along, bit 4 -- for a seed past the top that pins one.
   // A pass that reports both takes one widening per figure, the cap first, which
   // the round cap (kMaxRounds) covers.
-  bool exceeded(const RawIntegral &i) const { return past_top(i); }
+  //
+  // A needed seed the truncation cut is reported too (truncation_refused): the
+  // reduction expected an equation from it and the rule refused to generate one.
+  // A seed that is both past the top and cut reads as the total-power failure --
+  // the box figure is further out and the lift would not admit it anyway -- and
+  // refusal() tells the two apart for the repair.
+  bool exceeded(const RawIntegral &i) const {
+    return past_top(i) || truncation_refused(i);
+  }
 
   // Which figure has to grow for a seed exceeded() reports to be admitted
   // again: bit 1 the depth hard cap, bit 2 the rank hard cap, bit 8 the
-  // total-power cap itself.  It names a figure, not the repair's cap policy --
+  // total-power cap itself, bit 16 the truncation depth cap and bit 32 the
+  // truncation rank cap.  It names a figure, not the repair's cap policy --
   // the caller pairs it with past_top() to decide whether a depth widening also
   // carries the cap along (widen_depth's carry_cap).  A seed both hard caps
   // admit is the box corner -- every seed inside them has total power at most
@@ -750,7 +895,18 @@ struct SeedBound {
       bits |= 1;
     if (i.rank() >= rank)
       bits |= 2;
-    return bits == 0 ? 8u : bits;
+    if (bits != 0)
+      return bits;
+    // The hard caps admit it.  A total-power report keeps the box-corner reading
+    // (bit 8) it had before truncation existed; only a seed inside the total-power
+    // cap can be a truncation report.
+    if (past_top(i))
+      return 8u;
+    if (i.depth() >= trunc_depth)
+      bits |= 16;
+    if (i.rank() >= trunc_rank)
+      bits |= 32;
+    return bits;
   }
 
   // The subsector filter, applied at both sites in
@@ -781,14 +937,24 @@ struct SeedBound {
   // 2026-10-16 -- it reports total-power failures only, so bit 4 rides along with
   // every depth report it makes -- and the flag is kept, with its tests, because it
   // is what tells the two deepenings apart.
+  //
+  // A truncation cap already lifted (equal to its hard cap) follows the hard cap
+  // up, so a sector that has taken its exception stays untruncated on that axis;
+  // a cap still below the hard cap is a live truncation and does not move.
   void widen_depth(bool carry_cap = true) {
+    const bool lifted = trunc_depth == depth;
     ++depth;
+    if (lifted)
+      trunc_depth = depth;
     if (carry_cap)
       limit = std::max(limit, cap_for(depth, rank));
   }
 
   void widen_rank() {
+    const bool lifted = trunc_rank == rank;
     ++rank;
+    if (lifted)
+      trunc_rank = rank;
     limit = std::max(limit, cap_for(depth, rank));
   }
 
@@ -818,7 +984,20 @@ struct SeedBound {
   // the widenings arrive in the order of the figures the levels are quoted in.
   // The two hard caps are not exclusive with each other: a seed past both pins
   // both, and one pass grows both.
+  //
+  // A truncation report is repaired first and alone: the sector lifts its
+  // exception (the caps go back to the hard ones, no box figure moves), which is
+  // the whole repair the rule asks for.  A box report in the same pass waits for
+  // the next one -- the lifted seeds may be all that was missing, and growing the
+  // box for a pass that never pinned a figure would over-widen it.
   void widen_for(unsigned refusalBits) {
+    if (refusalBits & 48u) {
+      if (refusalBits & 16u)
+        trunc_depth = depth;
+      if (refusalBits & 32u)
+        trunc_rank = rank;
+      return;
+    }
     if (refusalBits & 8) {
       widen_cap();
       return;
@@ -897,29 +1076,46 @@ std::string format_seed_box_line(const SeedBound &bound,
 struct ProbeCriterion {
   // What widen_for reads: 0 when the pass settles, otherwise bit 1 (the depth
   // hard cap), bit 2 (the rank hard cap), bit 4 (the total power was what was
-  // reported, so a depth widening has to carry the cap along) and bit 8 (the
+  // reported, so a depth widening has to carry the cap along), bit 8 (the
   // total-power cap itself refused the seed -- the box corner -- so the cap is
-  // the figure to grow).
+  // the figure to grow), bit 16 (the truncation depth cap) and bit 32 (the
+  // truncation rank cap) -- the last two repaired by lifting the sector's
+  // exception, not by growing the box.
   unsigned refusal_bits = 0;
   // The sector's own masters among the needed independent variables, in walk
   // order.  Filled only when the caller asks (sector_debug), since it is the only
   // consumer: a run without the option collects nothing.
   std::vector<RawIntegral> own_masters;
+  // Masters the box or the truncation refused an equation for but the walk did
+  // not report, because the scope handed to probe_criterion left them out (the
+  // masters the sector's input targets need).  They stay masters of the sector
+  // where they are; the count is kept even without sector_debug, the list only
+  // with it.
+  unsigned scope_skipped = 0;
+  std::vector<RawIntegral> accepted;
 };
 
 // The criterion of one pass: walk the needed independent variables (columns,
 // ascending = most complex first), skip the subsector entries -- a column at or
 // above nvars is a subsector integral, handed on through ctx.uptargets, which
 // generates no equation here and so may not report this sector's box -- and
-// report every master whose total power is past the level's total figure
-// (SeedBound::exceeded).  A master a hard cap refuses under that figure is not
-// reported: it stays a master of the sector, marked PAST-DEPTH-CAP in the probe
-// report.  It is the mark and sweep of Sector::sector_reduction_ff_n, kept here
+// report every master the box or the truncation refused an equation for
+// (SeedBound::exceeded).  A master a hard cap refuses under the total figure is
+// not reported: it stays a master of the sector, marked PAST-DEPTH-CAP in the
+// probe report.  It is the mark and sweep of Sector::sector_reduction_ff_n, kept here
 // whole so the scope of the criterion is testable without running a reduction.
+//
+// `scope` restricts which masters may report: a column it does not name is
+// accepted where it is, counted in scope_skipped and -- when `collect` -- listed
+// in `accepted`.  Every production run passes the masters the sector's input
+// targets reduce to (sector.cpp); null is the unscoped walk, kept only as the
+// reference the scoped walk is tested against.
 ProbeCriterion probe_criterion(const SeedBound &bound,
                                const std::vector<std::size_t> &needed_indep,
                                const std::vector<RawIntegral> &seeds,
-                               unsigned nvars, bool collect);
+                               unsigned nvars, bool collect,
+                               const std::unordered_set<std::size_t> *scope =
+                                   nullptr);
 
 // One probe report, as sector_debug writes it into a sector log: the box the pass
 // read, then one line per own master with the three figures the criterion reads
@@ -998,6 +1194,10 @@ private:
   // included -- before every pass; run_reduce_ff_n appends them to the log of the
   // round that settles.  Empty unless the option is on.
   std::string _probeReport;
+  // The sector's own input targets: ctx.targets[_id] as run_reduce_ff_n found it,
+  // before the pass merges the incoming spill requests into it.  Its reduction
+  // decides which masters may move the box (the probe's fixed target scope).
+  std::set<RawIntegral> _inputTargets;
   // lines
   std::vector<bool> _lines;
 

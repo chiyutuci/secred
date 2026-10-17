@@ -129,6 +129,19 @@ public:
                           std::memory_order_relaxed);
         bwd_ns_.fetch_add(ns_since(rep.bwd, scratch.bwd_seconds),
                           std::memory_order_relaxed);
+        // The elimination counters accumulate on the scratch by the same rule.
+        FwdStats &seen = reported_fwd();
+        fwd_rows_.fetch_add(scratch.fwd_stats.rows - seen.rows,
+                            std::memory_order_relaxed);
+        fwd_gathered_.fetch_add(scratch.fwd_stats.gathered - seen.gathered,
+                                std::memory_order_relaxed);
+        fwd_merges_.fetch_add(scratch.fwd_stats.merges - seen.merges,
+                              std::memory_order_relaxed);
+        fwd_moved_.fetch_add(scratch.fwd_stats.moved - seen.moved,
+                             std::memory_order_relaxed);
+        fwd_pivots_.fetch_add(scratch.fwd_stats.pivots - seen.pivots,
+                              std::memory_order_relaxed);
+        seen = scratch.fwd_stats;
       }
       for (unsigned i = 0; i < n; ++i)
         out[i] = Lane::make(&values[static_cast<std::size_t>(i)], n); // lane-major read
@@ -145,6 +158,20 @@ public:
   double eval_seconds() const { return eval_ns_.load(std::memory_order_relaxed) * 1e-9; }
   double fwd_seconds() const { return fwd_ns_.load(std::memory_order_relaxed) * 1e-9; }
   double bwd_seconds() const { return bwd_ns_.load(std::memory_order_relaxed) * 1e-9; }
+  // The forward elimination's work, summed over the same lanes: rows walked, terms
+  // gathered from them, substitutions, terms moved by those substitutions, and solutions
+  // registered.  What the driver prints as the fill-in line of the probe report.
+  std::uint64_t fwd_rows() const { return fwd_rows_.load(std::memory_order_relaxed); }
+  std::uint64_t fwd_gathered() const {
+    return fwd_gathered_.load(std::memory_order_relaxed);
+  }
+  std::uint64_t fwd_merges() const {
+    return fwd_merges_.load(std::memory_order_relaxed);
+  }
+  std::uint64_t fwd_moved() const { return fwd_moved_.load(std::memory_order_relaxed); }
+  std::uint64_t fwd_pivots() const {
+    return fwd_pivots_.load(std::memory_order_relaxed);
+  }
   bool hard_failure() const { return hard_failure_.load(std::memory_order_relaxed); }
   // Which PointResult stopped the run, as its own enum (0 == Ok): the driver needs to
   // tell "a right-hand side carried a master we never learned" (MissingItem, a stale or
@@ -187,6 +214,11 @@ private:
     thread_local PhaseSeconds reported{0.0, 0.0, 0.0};
     return reported;
   }
+  // The same deltas for the elimination counters: the thread's last reported tally.
+  static FwdStats &reported_fwd() {
+    thread_local FwdStats reported;
+    return reported;
+  }
   // The scratch accumulates for its whole life, so this probe's contribution is the
   // difference from what the previous probe at this thread reported.
   static std::uint64_t ns_since(double &reported, double now) {
@@ -206,6 +238,11 @@ private:
   std::atomic<std::uint64_t> eval_ns_{0};
   std::atomic<std::uint64_t> fwd_ns_{0};
   std::atomic<std::uint64_t> bwd_ns_{0};
+  std::atomic<std::uint64_t> fwd_rows_{0};
+  std::atomic<std::uint64_t> fwd_gathered_{0};
+  std::atomic<std::uint64_t> fwd_merges_{0};
+  std::atomic<std::uint64_t> fwd_moved_{0};
+  std::atomic<std::uint64_t> fwd_pivots_{0};
   std::atomic<std::uint64_t> primes_{0};
   std::atomic<bool> hard_failure_{false};
   std::atomic<int> fail_reason_{0}; // SymbolicFFEvaluator::PointResult, 0 == Ok

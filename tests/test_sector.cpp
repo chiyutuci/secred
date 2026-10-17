@@ -7,6 +7,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <map>
 #include <set>
 #include <thread>
 
@@ -1618,6 +1619,185 @@ TEST(seedbound_deep_low_rank_seed_is_left_to_the_masters) {
   REQUIRE(rect.admits(RI({8, -2})));
 }
 
+// ---------------------------------------------------------------------------
+// Kira-style seed truncation: admission caps derived from the input targets
+// ---------------------------------------------------------------------------
+
+TEST(seed_truncation_rule_is_derived_from_targets) {
+  // Kira 3 §3.1.2 with no hand-typed l / dots: s_max is the largest s among the
+  // targets, so l = popcount(top) - s_max; dots is the largest (depth - popcount)
+  // of a target; and each sector keeps its own s_exc, the largest s among the
+  // targets that live in it (Kira's per-sector `reduce` entry).
+  const unsigned top = 0b111;  // three lines
+  const std::vector<RawIntegral> targets{
+      RI({1, 1, 1}),     // sector 0b111: depth 3, rank 0, dots 0
+      RI({1, 0, -2}),    // sector 0b001: depth 1, rank 2, dots 0
+      RI({2, 0, 0}),     // sector 0b001: depth 2, rank 0, dots 1
+  };
+  // 0: the paper's formula alone, before the calibrated kSeedLevelOffset.
+  const SeedTruncation t = derive_seed_truncation(targets, top, 0);
+  REQUIRE(t.active);
+  REQUIRE(t.l == 1);              // 3 - s_max(2)
+  REQUIRE(t.dots == 1u);          // 2 - 1
+  REQUIRE(t.s_exc.at(0b111u) == 0u);
+  REQUIRE(t.s_exc.at(0b001u) == 2u);
+}
+
+TEST(seed_truncation_level_offset_relaxes_the_derived_l) {
+  // The relaxation lowers Kira's derived l by that many levels and never below
+  // 0.  Its default is the calibrated kSeedLevelOffset (1), part of the rule
+  // since the settings.seed_level_offset option was removed; 0 is the paper's
+  // formula, kept for the pure-formula test above.
+  const unsigned top = 0b11111;  // five lines
+  const std::vector<RawIntegral> targets{
+      RI({1, 0, 0, 0, -2}),  // s_max 2
+  };
+  REQUIRE(derive_seed_truncation(targets, top).l == 2);     // default: 5 - 2 - 1
+  REQUIRE(derive_seed_truncation(targets, top, 0).l == 3);  // 5 - 2
+  REQUIRE(derive_seed_truncation(targets, top, 2).l == 1);
+  REQUIRE(derive_seed_truncation(targets, top, 3).l == 0);
+  REQUIRE(derive_seed_truncation(targets, top, 9).l == 0);  // clamped, no wrap
+}
+
+TEST(seed_truncation_level_offset_widens_the_rank_cap) {
+  // The offset relaxes the rank figure of the per-sector caps (dots, the depth
+  // figure, is the other knob and does not move).  Sector 0b011 has two lines and
+  // no target of its own: at l = 1 its rank cap is max(1, 2 - 1 + 1) + 1 = 3, and
+  // a one-level relaxation lifts it to max(1, 2) + 1 = 4.
+  const unsigned top = 0b111;  // three lines
+  const std::vector<RawIntegral> targets{RI({1, 0, -2})};  // s_max 2, in 0b001
+  const auto plain = truncated_seed_caps(
+      0b011u, 32u, 32u, derive_seed_truncation(targets, top, 0));
+  const auto relaxed = truncated_seed_caps(
+      0b011u, 32u, 32u, derive_seed_truncation(targets, top, 1));
+  REQUIRE(plain.first == relaxed.first);
+  REQUIRE(plain.second == 3u);
+  REQUIRE(relaxed.second == 4u);
+}
+
+TEST(seed_truncation_caps_leave_every_target_admitted) {
+  // The auto-derived rule can never truncate a target: s_exc is the sector's own
+  // largest s and dots the largest dot count, so both caps sit strictly above
+  // every target of the sector.  The property is the safety net under the
+  // "derive it, do not type it" rule -- a target the caps refused would cost a
+  // guaranteed probe round.
+  const unsigned top = 0b1111;
+  const std::vector<RawIntegral> targets{
+      RI({1, 1, 1, 0}),      // depth 3, rank 0
+      RI({2, 0, -2, 1}),     // depth 3, rank 2, dots 1
+      RI({0, 0, 1, -3}),     // depth 1, rank 3, dots 0
+      RI({3, 1, 0, 0}),      // depth 4, rank 0, dots 2
+  };
+  const SeedTruncation t = derive_seed_truncation(targets, top);
+  for (const RawIntegral &target : targets) {
+    // A generous box: the rule's caps are the only admission limit here.
+    const auto [capDepth, capRank] =
+        truncated_seed_caps(target.sector(), 32u, 32u, t);
+    REQUIRE(target.depth() < capDepth);
+    REQUIRE(target.rank() < capRank);
+  }
+}
+
+TEST(seedbound_truncation_is_a_second_admission_layer) {
+  // Truncation cuts equations, not columns: a seed inside the hard box but past a
+  // truncation cap is refused by admits() and -- unlike the hard-cap refusals,
+  // which the old criterion deliberately leaves to the masters -- reported by
+  // exceeded().  refusal() names the truncation figure with its own bits (16 the
+  // depth, 32 the rank), so the driver can tell the repair from a box widening.
+  SeedBound b = SeedBound::initial(6, 5);
+  b.trunc_depth = 4;
+  b.trunc_rank = 2;
+
+  REQUIRE(b.admits(RI({3, 0})));       // inside every cap
+  REQUIRE(!b.admits(RI({4, 0})));      // past the truncation depth
+  REQUIRE(!b.past_top(RI({4, 0})));    // the box itself is large enough
+  REQUIRE(b.exceeded(RI({4, 0})));     // ... but the reduction may still need it
+  REQUIRE(b.refusal(RI({4, 0})) == 16u);
+
+  REQUIRE(!b.admits(RI({0, -2})));     // past the truncation rank
+  REQUIRE(!b.past_top(RI({0, -2})));
+  REQUIRE(b.exceeded(RI({0, -2})));
+  REQUIRE(b.refusal(RI({0, -2})) == 32u);
+
+  // The hard-cap refusals keep their old verdict: inside the box top, no report.
+  REQUIRE(!b.exceeded(RI({6, 0})));
+  REQUIRE(b.refusal(RI({6, 0})) == 1u);
+  REQUIRE(!b.exceeded(RI({0, -5})));
+  REQUIRE(b.refusal(RI({0, -5})) == 2u);
+
+  // With the truncation caps equal to the hard caps nothing is truncated: the
+  // cut is exactly the old box, and the corner still reports the cap (bit 8).
+  SeedBound plain = SeedBound::initial(6, 5);
+  REQUIRE(plain.trunc_depth == plain.depth);
+  REQUIRE(plain.trunc_rank == plain.rank);
+  REQUIRE(plain.refusal(RI({5, -4})) == 8u);
+}
+
+TEST(seedbound_widen_for_lifts_the_truncation_before_the_box) {
+  // The adaptive half: a truncation report is repaired by lifting the sector's
+  // exception in one pass -- truncation caps go back to the hard caps, which the
+  // generation box already fixed from the requests -- and the box does not grow.
+  // A later hard-cap report then widens as before, and the exception stays
+  // lifted (the caps follow the box).
+  SeedBound b = SeedBound::initial(6, 5);
+  b.trunc_depth = 4;
+  b.trunc_rank = 2;
+
+  b.widen_for(16u);
+  REQUIRE(b.trunc_depth == 6u);
+  REQUIRE(b.trunc_rank == 2u);
+  REQUIRE(b.depth == 6u);          // the box did not move
+  REQUIRE(b.limit == 9u);
+
+  b.widen_for(32u);
+  REQUIRE(b.trunc_rank == 5u);
+  REQUIRE(b.rank == 5u);
+
+  b.widen_for(1u | 4u);            // a hard depth report after the lift
+  REQUIRE(b.depth == 7u);
+  REQUIRE(b.limit == 10u);         // the carrying deepening
+  REQUIRE(b.trunc_depth == 7u);    // the exception follows the box
+
+  // A truncation bit and the total-power cap in one report: lift first, and the
+  // cap waits for the next pass (it may not even be needed once the exception is
+  // in place).
+  SeedBound c = SeedBound::initial(9, 5);
+  c.trunc_rank = 2;
+  c.widen_for(32u | 8u);
+  REQUIRE(c.trunc_rank == 5u);
+  REQUIRE(c.limit == 12u);
+}
+
+TEST(seedbound_truncation_line_reports_the_admission_caps) {
+  // The sector log's seed-box line names the admission caps only while they cut
+  // the box, read as levels like the leading triple: a settling sector that never
+  // lifted its exception shows what the truncation was.
+  SeedBound b = SeedBound::initial(6, 5);
+  b.trunc_depth = 4;
+  b.trunc_rank = 2;
+  REQUIRE(format_seed_box_line(b, SeedBound::initial(6, 5)) ==
+          " depth: 5 rank: 4 total: 8 trunc: depth 3 rank 1"
+          "  start: depth: 5 rank: 4 total: 8");
+  SeedBound plain = SeedBound::initial(6, 5);
+  REQUIRE(format_seed_box_line(plain, SeedBound::initial(6, 5)) ==
+          " depth: 5 rank: 4 total: 8  start: depth: 5 rank: 4 total: 8");
+}
+
+TEST(probe_criterion_reports_a_truncated_seed_with_the_exception_bit) {
+  // A needed seed the truncation cut is reported like a seed past the box top
+  // (bit 4 rides along), but with the truncation figure: the driver lifts the
+  // exception rather than growing a box that is already large enough.
+  SeedBound b = SeedBound::initial(6, 5);
+  b.trunc_depth = 4;
+  b.trunc_rank = 2;
+  REQUIRE(probe_criterion(b, {0u}, {RI({4, 0})}, 1u, false).refusal_bits ==
+          20u);  // 16 | 4
+  REQUIRE(probe_criterion(b, {0u}, {RI({0, -2})}, 1u, false).refusal_bits ==
+          36u);  // 32 | 4
+  // Inside the truncation caps: nothing to report.
+  REQUIRE(probe_criterion(b, {0u}, {RI({3, -1})}, 1u, false).refusal_bits == 0u);
+}
+
 TEST(seedbound_past_top_still_carries_the_cap) {
   // A report the *box top* makes asks for the rectangle (bit 4): the depth
   // widening carries the cap.  Both halves can fire for the same seed, and then
@@ -1970,6 +2150,55 @@ TEST(probe_criterion_ignores_the_subsector_columns) {
   REQUIRE(full.own_masters == own.own_masters);
 }
 
+TEST(probe_criterion_scope_reports_only_the_masters_the_input_targets_need) {
+  // The probe's fixed target scope.  The walk still visits every own master, but
+  // only a master the sector's input targets need may move the box: one that
+  // only a spill request needs is accepted where it is, so the scope keeps it
+  // out of the report.  With nvars 2, column 0 is seeds[1] and column 1 is
+  // seeds[0].
+  SeedBound b = SeedBound::initial(5, 4);  // cap 7, top 6
+  const std::vector<RawIntegral> seeds = {RI({2, 2, 2, -2}),   // column 1, bits 5
+                                          RI({1, 1, 1, -5})};  // column 0, bits 6
+  const std::unordered_set<std::size_t> scope{1};
+  const ProbeCriterion crit = probe_criterion(b, {0, 1}, seeds, 2u, true, &scope);
+  REQUIRE(crit.refusal_bits == 5u);  // column 1 alone
+  REQUIRE(crit.scope_skipped == 1u);
+  REQUIRE(crit.accepted == std::vector<RawIntegral>{seeds[1]});
+  // The unscoped walk still reports both: the switch is the scope alone.
+  REQUIRE(probe_criterion(b, {0, 1}, seeds, 2u, true).refusal_bits == 7u);
+}
+
+TEST(probe_criterion_scope_still_reports_a_truncated_seed) {
+  // A scoped master the truncation cut keeps its exception report; the same seed
+  // outside the scope is accepted instead of lifting the sector's exception.
+  SeedBound b = SeedBound::initial(6, 5);
+  b.trunc_depth = 4;
+  b.trunc_rank = 2;
+  const std::unordered_set<std::size_t> scope{0};
+  REQUIRE(probe_criterion(b, {0u}, {RI({4, 0})}, 1u, false, &scope).refusal_bits ==
+          20u);  // 16 | 4, unchanged from the unscoped walk
+  const std::unordered_set<std::size_t> other{7};
+  const ProbeCriterion crit =
+      probe_criterion(b, {0u}, {RI({4, 0})}, 1u, false, &other);
+  REQUIRE(crit.refusal_bits == 0u);
+  REQUIRE(crit.scope_skipped == 1u);
+}
+
+TEST(probe_report_marks_a_master_accepted_outside_the_scope) {
+  // sector_debug: an accepted master is still printed -- it is part of the basis
+  // the pass keeps -- and the verdict says the criterion let it go on purpose.
+  SeedBound b = SeedBound::initial(5, 4);  // cap 7, top 6
+  const std::vector<RawIntegral> seeds = {RI({2, 2, 2, -2}), RI({1, 1, 1, -5})};
+  const std::unordered_set<std::size_t> scope{1};
+  const ProbeCriterion crit = probe_criterion(b, {0, 1}, seeds, 2u, true, &scope);
+  REQUIRE(format_probe_report(1, b, crit) ==
+          "[probe] round 1 failed: depth: 5 rank: 4 limit: 7, seed top: 6\n"
+          "[probe] own masters: 2, refused: 1, accepted: 1, refusal bits: 5\n"
+          "[probe]   [1, 1, 1, -5]  depth: 3 rank: 5 total: 8  PAST-TOP ACCEPTED\n"
+          "[probe]   [2, 2, 2, -2]  depth: 6 rank: 2 total: 8  PAST-TOP"
+          " PAST-DEPTH-CAP\n");
+}
+
 TEST(probe_criterion_collects_the_own_masters_in_walk_order) {
   // Column 0 is the most complex seed, i.e. seeds[nvars - 1] -- the list the
   // report prints follows that walk.  Only probe_criterion fills it: with the
@@ -2000,7 +2229,7 @@ TEST(probe_report_prints_the_box_the_own_masters_and_their_verdicts) {
   REQUIRE(crit.own_masters.size() == 4u);
   REQUIRE(format_probe_report(3, b, crit) ==
           "[probe] round 3 failed: depth: 5 rank: 4 limit: 7, seed top: 6\n"
-          "[probe] own masters: 4, refused: 3, refusal bits: 7\n"
+          "[probe] own masters: 4, refused: 3, accepted: 0, refusal bits: 7\n"
           "[probe]   [1, 1, 0, 0]  depth: 2 rank: 0 total: 2  ok\n"
           "[probe]   [2, 2, 2, -2]  depth: 6 rank: 2 total: 8  PAST-TOP PAST-DEPTH-CAP\n"
           "[probe]   [2, 2, 2, 1]  depth: 7 rank: 0 total: 7  PAST-TOP PAST-DEPTH-CAP\n"

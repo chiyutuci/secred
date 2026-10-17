@@ -436,7 +436,9 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
                                FwdStore &store, const std::atomic<bool> *abort,
                                std::unordered_map<uint32_t, std::vector<uint32_t>>
                                    *fwd_deps,
-                               std::vector<uint32_t> *row_src) {
+                               std::vector<uint32_t> *row_src, FwdStats *stats) {
+  if (stats)
+    *stats = FwdStats{};
   // The rows handed in are the pool's rows minus whatever vanished at this point (a
   // numerator or a denominator that is 0 mod p), and a dropped coefficient moves its row
   // in the reference's order: the row is shorter, and if the front term went, its front
@@ -464,6 +466,8 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
   for (uint32_t k : *store.order_ptr) {
     if (abort && abort->load(std::memory_order_relaxed))
       return false;
+    if (stats)
+      ++stats->rows;
     // This point's row k, gathered on demand: the row's terms whose coefficient did not
     // vanish here.  Descending id, as the merge below assumes.
     deps.clear();
@@ -475,6 +479,8 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
     }
     if (pend.empty())
       continue; // reduced to 0 = 0
+    if (stats)
+      stats->gathered += pend.n;
 
     // Substitute the highest reducible term repeatedly.  Each substitution merges one
     // solved right-hand side into the pending row with an ordered merge, keeping it
@@ -553,6 +559,10 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
         ++j;
       }
       merged.n = static_cast<std::size_t>(oid - merged.ids.get());
+      if (stats) {
+        ++stats->merges;
+        stats->moved += merged.n;
+      }
       merged.swap(pend);
       scan = idx;
     }
@@ -574,6 +584,8 @@ bool forward_eliminate_planned(const SymRowTable &rows, const uint64_t *values,
     for (std::size_t t = 0; t < pend.n; ++t)
       store.vals.push_back(shoup_mul(pend.vals[t], neg_inv, np, p));
     store.mark(pivot, row);
+    if (stats)
+      ++stats->pivots;
     if (fwd_deps)
       (*fwd_deps)[pivot] = std::move(deps); // the reference inserts the empty ones too
     if (row_src)

@@ -202,6 +202,22 @@ TEST(family_parse_gthreads_custom) {
   REQUIRE(FamilyTestHelper::gthreads(f) == 32);
 }
 
+TEST(family_parse_rejects_the_removed_probe_options) {
+  // probe_mode and seed_level_offset were removed on 2026-10-17: the probe is
+  // always scoped to the input targets and the calibrated truncation offset is
+  // written into the rule.  A stale config must fail loudly rather than be
+  // silently reinterpreted -- the same rule the older removed settings follow.
+  clear_symtab();
+  YAML::Node probe = box_config("tc_removed_probe_mode");
+  probe["settings"]["probe_mode"] = "all";
+  REQUIRE_THROWS_AS(Family(probe), std::runtime_error);
+
+  clear_symtab();
+  YAML::Node offset = box_config("tc_removed_seed_level_offset");
+  offset["settings"]["seed_level_offset"] = 0;
+  REQUIRE_THROWS_AS(Family(offset), std::runtime_error);
+}
+
 TEST(family_parse_settings_cache_dir) {
   clear_symtab();
   YAML::Node cfg = box_config("my_custom_cache");
