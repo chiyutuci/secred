@@ -253,10 +253,11 @@ template <> struct convert<RawIntegral> {
 };
 } // namespace YAML
 
-// The fixed relaxation of Kira's derived truncation level l: the calibrated
-// value (Kira's l = 3 where the formula gives 4 on F234).  This used to be the
-// settings.seed_level_offset option; the option was removed on 2026-10-17 and
-// the value written into the rule (derive_seed_truncation's default).
+// The default relaxation of Kira's derived truncation level l, used when
+// settings.seed_level_offset is absent and the targets derive at least one dot.
+// A target set of pure denominators derives no dots; there the default lowers
+// the offset to 0 (automatic_seed_level_offset), which is the tuning that
+// reproduces tennis's 166 masters.
 inline constexpr unsigned kSeedLevelOffset = 1;
 
 // Kira 3's seed truncation (paper §3.1.2), read two ways at once.  Kira keeps a
@@ -264,24 +265,29 @@ inline constexpr unsigned kSeedLevelOffset = 1;
 // most max(1, t - l + 1, s_max,sector) and when its dots -- the positive powers
 // beyond one per line, i.e. depth - popcount(sector) -- stay within the sector's
 // `d`.  `l` and `d` are hand-tuned there; here both are derived from the input's
-// targets, so the user never types them:
+// targets, so the user never types them (the single relaxation, `offset` below,
+// is settings.seed_level_offset):
 //
 //   free choice      kira's knobs          derived from the targets
-//   l                depth/rank tradeoff   popcount(top) - s_max - 1
+//   l                depth/rank tradeoff   popcount(top) - s_max - offset
 //   s_max,sector     per-sector `reduce`   largest rank among the sector's targets
-//   d                dots allowed          largest (depth - popcount) among targets
+//   d                dots allowed          largest (depth - popcount) among targets,
+//                                           floored at 1 for an active rule
 //
 // `s_max` is the largest rank over every target and `top` the family's top sector,
 // so l starts where Kira's tuning formula (l = t_top - s_max) starts.  Encoding
 // it as a truncation rule changes nothing by itself: the same figure is what the
 // per-sector exception below already needs.
 //
-// The derived l is relaxed by kSeedLevelOffset, fixed at the calibrated value
-// (1) rather than exposed as a setting: l_eff = max(0, t_top - s_max - 1).
-// Kira's paper says to tune l down when over-truncation inflates the master list,
-// and an over-truncated seed is worse than a kept one here: its sector lifts the
-// exception entirely (SeedBound::widen_for), so a rule that cuts too deep buys
-// nothing but a discarded pass.  The calibration is now part of the rule.
+// The derived l is relaxed by settings.seed_level_offset (default
+// kSeedLevelOffset = 1): l_eff = max(0, t_top - s_max - offset).  When the
+// config sets no offset, the default reads the targets first
+// (automatic_seed_level_offset): a target set of pure denominators derives no
+// dots, and there the offset drops to 0 while the dots limit is floored at 1.
+// Kira's paper says to tune l down when over-truncation inflates the master
+// list, and an over-truncated seed is worse than a kept one here: its sector
+// lifts the exception entirely (SeedBound::widen_for), so a rule that cuts too
+// deep buys nothing but a discarded pass.
 //
 // The rule is an *admission* layer, not a generation box: a truncated seed keeps
 // its column and its weight, so a request can still be expressed through it; it
@@ -293,13 +299,19 @@ struct SeedTruncation {
   // False when the input has no targets at all: nothing to derive the rule from,
   // and every seed keeps generating equations.
   bool active = false;
-  // Kira's l after the calibrated relaxation:
-  // max(0, popcount(top) - s_max - kSeedLevelOffset).  Clamped at 0: a target
+  // Kira's l after the relaxation:
+  // max(0, popcount(top) - s_max - level_offset).  Clamped at 0: a target
   // carrying more rank than the top sector has lines, or an offset past the
   // derived figure, asks for a rule that cuts nothing.
   int l = 0;
-  // The largest dots figure among the targets, per sector clamped above by the
-  // depth hard cap when the caps are applied (truncated_seed_caps).
+  // The relaxation the rule was derived with (settings.seed_level_offset, or
+  // automatic_seed_level_offset when the config does not set it).  Kept so the
+  // run's report prints the value the rule used rather than the constant.
+  unsigned level_offset = kSeedLevelOffset;
+  // The largest dots figure among the targets, floored at 1 for an active rule
+  // (a pure-denominator target set would otherwise keep only the denominators
+  // themselves) and clamped above by the depth hard cap when the caps are
+  // applied (truncated_seed_caps).
   unsigned dots = 0;
   // Per sector: the largest rank among that sector's own targets -- Kira's
   // per-sector `reduce` entry, inherited by its subsectors there and applied to
@@ -307,11 +319,25 @@ struct SeedTruncation {
   std::unordered_map<unsigned, unsigned> s_exc;
 };
 
+// The dots figure the targets derive on their own: the largest
+// (depth - popcount(sector)) among them, without the floor of one that an
+// active rule applies.  0 for an empty set.  This is the figure the default
+// offset reads (automatic_seed_level_offset).
+unsigned seed_dots_from_targets(const std::vector<RawIntegral> &targets);
+
+// The offset the rule uses when settings.seed_level_offset is absent.  Targets
+// that derive dots (numerator powers) keep kSeedLevelOffset; pure denominators
+// derive none, and there the paper's formula (offset 0) with the dots floor of
+// one is the tuning that reproduces tennis's 166 masters.  An empty target set
+// returns kSeedLevelOffset: no rule is active, so the value is only reported.
+unsigned automatic_seed_level_offset(const std::vector<RawIntegral> &targets);
+
 // Derive the rule from the input's targets and the family's top sector (a
 // bitmask of its lines).  `top` sets t_top; a target's own sector sets t in the
 // per-sector cap.  `level_offset` relaxes Kira's l by that many levels; the
-// default is the calibrated kSeedLevelOffset (1), and 0 keeps the paper's
-// tuning formula unchanged (tests of the pure formula pass it explicitly).
+// default is kSeedLevelOffset (1, the default of settings.seed_level_offset),
+// and 0 keeps the paper's tuning formula unchanged.  An active rule floors the
+// dots limit at 1.
 // Deterministic and independent of the targets' order.
 SeedTruncation derive_seed_truncation(
     const std::vector<RawIntegral> &targets, unsigned top,

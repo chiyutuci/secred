@@ -149,7 +149,7 @@ void Family::run_reduce(Reduce &reduce) {
             << "truncated sectors:   " << trunc << "\n"
             << "truncation lifted:   " << lifted << "\n"
             << "truncation l:        " << reduce._truncation.l << "\n"
-            << "truncation offset:   " << kSeedLevelOffset << "\n"
+            << "truncation offset:   " << reduce._truncation.level_offset << "\n"
             << "box spill raised:    " << spillRaised << "\n"
             << "box spill extra:     " << spillDepth << " depth, " << spillRank
             << " rank\n"
@@ -164,7 +164,7 @@ void Family::run_reduce(Reduce &reduce) {
 
     std::cout << "\n  Seed truncation: " << trunc << " sectors cut, " << lifted
               << " lifted by the probe (l = " << reduce._truncation.l
-              << ", offset " << kSeedLevelOffset << ")"
+              << ", offset " << reduce._truncation.level_offset << ")"
               << std::endl;  // flush: same reason
 
     std::cout << "\n  Seed box: spill raised " << spillRaised
@@ -596,10 +596,7 @@ Family::Family(const YAML::Node &config) {
              {"global_finiteflow_threads", "use settings.gthreads"},
              {"probe_mode",
               "the probe scope is fixed to the input targets: only a master the "
-              "sector's input targets need may widen its box"},
-             {"seed_level_offset",
-              "the calibrated offset is written into the rule "
-              "(kSeedLevelOffset = 1)"}}) {
+              "sector's input targets need may widen its box"}}) {
       if (s[key])
         throw std::runtime_error("settings." + std::string(key) +
                                  " was removed; " + replacement);
@@ -620,6 +617,15 @@ Family::Family(const YAML::Node &config) {
     // integral.
     if (s["subsector_filter_n"])
       _subsector_filter_n = s["subsector_filter_n"].as<unsigned>();
+    // seed_level_offset: how many levels the derived Kira truncation level l is
+    // relaxed by (derive_seed_truncation).  Larger relaxes more, generating more
+    // equations and cutting fewer seeds.  Unset, the rule chooses between the
+    // default and 0 by reading the targets (automatic_seed_level_offset), so the
+    // explicit/absent distinction is recorded.
+    if (s["seed_level_offset"]) {
+      _seed_level_offset = s["seed_level_offset"].as<unsigned>();
+      _seed_level_offset_set = true;
+    }
     // sector_debug: a diagnostic -- a pass that reports its seed box as too small
     // leaves its own masters, the figures the criterion read and the verdicts it
     // reached in the sector log, so a widening (or a sector given up on) can be
@@ -691,6 +697,8 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
 
   // find the top sector
   reduce._nprops = _nprops;
+  reduce._seed_level_offset = _seed_level_offset;
+  reduce._seed_level_offset_set = _seed_level_offset_set;
   std::vector<bool> hasLine(_nprops, false);
   for (const auto &integral : reduce._rawTargets) {
     if (integral.size() != _nprops) {
@@ -1216,10 +1224,16 @@ void Reduce::print() const {
 }
 
 void Reduce::prepare_sectors() {
-  // Kira-style seed truncation, derived once from the input's targets: no user
-  // knob (derive_seed_truncation).  Built here, before any worker starts, so every
-  // sector reads the same read-only rule.
-  _truncation = derive_seed_truncation(_rawTargets, _top);
+  // Kira-style seed truncation, derived once from the input's targets and the
+  // configured relaxation (settings.seed_level_offset; derive_seed_truncation).
+  // When the config names no offset, the rule reads the targets and picks 0 for
+  // a pure-denominator set and the shipped default otherwise
+  // (automatic_seed_level_offset).  Built here, before any worker starts, so
+  // every sector reads the same read-only rule.
+  const unsigned level_offset =
+      _seed_level_offset_set ? _seed_level_offset
+                             : automatic_seed_level_offset(_rawTargets);
+  _truncation = derive_seed_truncation(_rawTargets, _top, level_offset);
 
   _lines = std::vector<bool>(_nprops, false);
   for (unsigned i = 0; i < _nprops; ++i)

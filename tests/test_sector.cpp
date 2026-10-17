@@ -1634,7 +1634,7 @@ TEST(seed_truncation_rule_is_derived_from_targets) {
       RI({1, 0, -2}),    // sector 0b001: depth 1, rank 2, dots 0
       RI({2, 0, 0}),     // sector 0b001: depth 2, rank 0, dots 1
   };
-  // 0: the paper's formula alone, before the calibrated kSeedLevelOffset.
+  // 0: the paper's formula alone, before the fixed kSeedLevelOffset.
   const SeedTruncation t = derive_seed_truncation(targets, top, 0);
   REQUIRE(t.active);
   REQUIRE(t.l == 1);              // 3 - s_max(2)
@@ -1643,20 +1643,67 @@ TEST(seed_truncation_rule_is_derived_from_targets) {
   REQUIRE(t.s_exc.at(0b001u) == 2u);
 }
 
+TEST(seed_truncation_lifts_a_zero_dots_limit_to_one) {
+  // A target set made only of denominators derives no dots at all.  A dots limit
+  // of 0 would keep only the exact denominator, cutting the seeds its own
+  // reduction needs, so the rule floors dots at 1 for an active rule.
+  const unsigned top = 0b111;
+  const std::vector<RawIntegral> targets{RI({1, 1, 1}), RI({1, 0, 1})};
+  const SeedTruncation t = derive_seed_truncation(targets, top, 0);
+  REQUIRE(t.active);
+  REQUIRE(t.dots == 1u);
+  // The depth cap follows: two lines + dots 1 + 1 = 4 for sector 0b011.
+  REQUIRE(truncated_seed_caps(0b011u, 32u, 32u, t).first == 4u);
+}
+
+TEST(seed_truncation_inactive_keeps_the_dots_limit_at_zero) {
+  // With no targets there is nothing to derive, and the rule stays inactive: the
+  // floor of one dot belongs to an active rule, not to an empty record.
+  const SeedTruncation t = derive_seed_truncation({}, 0b111);
+  REQUIRE(!t.active);
+  REQUIRE(t.dots == 0u);
+}
+
+TEST(automatic_seed_level_offset_reads_the_derived_dots) {
+  // The offset the default picks when the config names none: targets carrying
+  // dots (numerator powers) keep the relaxation kSeedLevelOffset, pure
+  // denominators use offset 0 -- the Kira tuning that reproduces tennis's 166
+  // masters -- and an input with no targets has nothing to derive.
+  REQUIRE(kSeedLevelOffset == 1u);
+  REQUIRE(seed_dots_from_targets({RI({2, 0, 0})}) == 1u);
+  REQUIRE(automatic_seed_level_offset({RI({2, 0, 0})}) == 1u);
+  REQUIRE(seed_dots_from_targets({RI({1, 1, 0}), RI({1, 0, 1})}) == 0u);
+  REQUIRE(automatic_seed_level_offset({RI({1, 1, 0}), RI({1, 0, 1})}) == 0u);
+  REQUIRE(automatic_seed_level_offset({}) == kSeedLevelOffset);
+}
+
 TEST(seed_truncation_level_offset_relaxes_the_derived_l) {
   // The relaxation lowers Kira's derived l by that many levels and never below
-  // 0.  Its default is the calibrated kSeedLevelOffset (1), part of the rule
-  // since the settings.seed_level_offset option was removed; 0 is the paper's
-  // formula, kept for the pure-formula test above.
+  // 0.  Its default is kSeedLevelOffset (1), the default of
+  // settings.seed_level_offset; 0 is the paper's formula, kept for the
+  // pure-formula test above.
   const unsigned top = 0b11111;  // five lines
   const std::vector<RawIntegral> targets{
       RI({1, 0, 0, 0, -2}),  // s_max 2
   };
   REQUIRE(derive_seed_truncation(targets, top).l == 2);     // default: 5 - 2 - 1
   REQUIRE(derive_seed_truncation(targets, top, 0).l == 3);  // 5 - 2
+  REQUIRE(derive_seed_truncation(targets, top, 1).l == 2);
   REQUIRE(derive_seed_truncation(targets, top, 2).l == 1);
   REQUIRE(derive_seed_truncation(targets, top, 3).l == 0);
   REQUIRE(derive_seed_truncation(targets, top, 9).l == 0);  // clamped, no wrap
+}
+
+TEST(seed_truncation_records_the_level_offset_it_used) {
+  // The offset is part of the rule: the derived record keeps the value the
+  // caller passed, so the run's report can print what the config asked for
+  // rather than a compile-time constant.
+  const unsigned top = 0b11111;
+  const std::vector<RawIntegral> targets{RI({1, 0, 0, 0, -2})};
+  REQUIRE(derive_seed_truncation(targets, top).level_offset == kSeedLevelOffset);
+  REQUIRE(derive_seed_truncation(targets, top, 0).level_offset == 0);
+  REQUIRE(derive_seed_truncation(targets, top, 2).level_offset == 2);
+  REQUIRE(derive_seed_truncation({}, top, 4).level_offset == 4);
 }
 
 TEST(seed_truncation_level_offset_widens_the_rank_cap) {

@@ -169,9 +169,23 @@ initial_seed_bounds(unsigned id, const std::set<RawIntegral> &targets,
   return {depth, rank};
 }
 
+unsigned seed_dots_from_targets(const std::vector<RawIntegral> &targets) {
+  unsigned dots = 0;
+  for (const RawIntegral &target : targets)
+    dots = std::max(dots, target.depth() - std::popcount(target.sector()));
+  return dots;
+}
+
+unsigned automatic_seed_level_offset(const std::vector<RawIntegral> &targets) {
+  if (targets.empty())
+    return kSeedLevelOffset;
+  return seed_dots_from_targets(targets) == 0 ? 0u : kSeedLevelOffset;
+}
+
 SeedTruncation derive_seed_truncation(const std::vector<RawIntegral> &targets,
                                       unsigned top, unsigned level_offset) {
   SeedTruncation truncation;
+  truncation.level_offset = level_offset;
   if (targets.empty())
     return truncation;
   truncation.active = true;
@@ -183,8 +197,13 @@ SeedTruncation derive_seed_truncation(const std::vector<RawIntegral> &targets,
     unsigned &s_exc = truncation.s_exc[target.sector()];
     s_exc = std::max(s_exc, target.rank());
   }
+  // A pure-denominator target set derives no dots, and a dots limit of 0 would
+  // keep only the denominators themselves -- including the seeds their own
+  // reduction needs.  The rule therefore always allows one dot.
+  truncation.dots = std::max(truncation.dots, 1u);
   // Kira's tuning formula (l = t_top - s_max), with t_top the top sector's line
-  // count, relaxed by the fixed calibrated offset (kSeedLevelOffset, 1).
+  // count, relaxed by `level_offset` (settings.seed_level_offset, default
+  // kSeedLevelOffset = 1).
   // Clamped at 0: a target carrying more rank than the top has lines, or an
   // offset past the derived figure, asks for a rule that cuts nothing, which the
   // max(1, ...) inside the caps then says anyway.

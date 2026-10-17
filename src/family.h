@@ -116,6 +116,13 @@ private:
   std::string _cache_dir = "cache";
   // Offset n of the subsector filter (see SectorConfig).
   unsigned _subsector_filter_n = 1;
+  // settings.seed_level_offset: how many levels the derived Kira truncation
+  // level l is relaxed by (see derive_seed_truncation; default 1).  When the
+  // setting is absent the rule picks its offset from the targets
+  // (automatic_seed_level_offset), which is why the explicit/absent distinction
+  // is recorded.
+  unsigned _seed_level_offset = kSeedLevelOffset;
+  bool _seed_level_offset_set = false;
   // settings.sector_debug: print each reporting pass's own masters into the sector
   // log (default false; see SectorConfig).
   bool _sector_debug = false;
@@ -203,10 +210,15 @@ private:
   std::set<RawIntegral> _preferred;
   std::set<unsigned> _targetSectors;
   // Kira-style seed truncation derived from _rawTargets and _top in
-  // prepare_sectors (derive_seed_truncation, with the calibrated
-  // kSeedLevelOffset relaxation); every sector reads it read-only through
+  // prepare_sectors (derive_seed_truncation, relaxed by settings
+  // seed_level_offset); every sector reads it read-only through
   // SectorConfig::truncation.
   SeedTruncation _truncation;
+  // settings.seed_level_offset, copied from the Family in init_reduce.  The
+  // derivation in prepare_sectors reads it when the setting was explicit and
+  // automatic_seed_level_offset otherwise.
+  unsigned _seed_level_offset = kSeedLevelOffset;
+  bool _seed_level_offset_set = false;
   // top sector
   unsigned _top = 0;
   // number of propagators

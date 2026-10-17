@@ -121,6 +121,12 @@ public:
   static unsigned subsector_filter_n(const Family &f) {
     return f._subsector_filter_n;
   }
+  static unsigned seed_level_offset(const Family &f) {
+    return f._seed_level_offset;
+  }
+  static bool seed_level_offset_set(const Family &f) {
+    return f._seed_level_offset_set;
+  }
   static bool sector_debug(const Family &f) { return f._sector_debug; }
   static const std::string &cache_dir(const Family &f) {
     return f._cache_dir;
@@ -202,20 +208,40 @@ TEST(family_parse_gthreads_custom) {
   REQUIRE(FamilyTestHelper::gthreads(f) == 32);
 }
 
-TEST(family_parse_rejects_the_removed_probe_options) {
-  // probe_mode and seed_level_offset were removed on 2026-10-17: the probe is
-  // always scoped to the input targets and the calibrated truncation offset is
-  // written into the rule.  A stale config must fail loudly rather than be
-  // silently reinterpreted -- the same rule the older removed settings follow.
+TEST(family_parse_rejects_the_removed_probe_mode) {
+  // probe_mode was removed on 2026-10-17: the probe is always scoped to the
+  // input targets.  A stale config must fail loudly rather than be silently
+  // reinterpreted -- the same rule the older removed settings follow.
   clear_symtab();
   YAML::Node probe = box_config("tc_removed_probe_mode");
   probe["settings"]["probe_mode"] = "all";
   REQUIRE_THROWS_AS(Family(probe), std::runtime_error);
+}
 
+TEST(family_parse_seed_level_offset_default) {
+  // The truncation offset's default is 1: without the key the rule is
+  // l = popcount(top) - s_max - 1.  When the targets derive no dots at all, the
+  // default rule lowers the offset to 0 instead (automatic_seed_level_offset,
+  // applied in Reduce::prepare_sectors).
   clear_symtab();
-  YAML::Node offset = box_config("tc_removed_seed_level_offset");
-  offset["settings"]["seed_level_offset"] = 0;
-  REQUIRE_THROWS_AS(Family(offset), std::runtime_error);
+  YAML::Node cfg = box_config("tc_seed_level_offset_default");
+  Family f(cfg);
+  REQUIRE(kSeedLevelOffset == 1);
+  REQUIRE(FamilyTestHelper::seed_level_offset(f) == kSeedLevelOffset);
+  // No key: prepare_sectors is free to read the targets and choose 0.
+  REQUIRE(!FamilyTestHelper::seed_level_offset_set(f));
+}
+
+TEST(family_parse_seed_level_offset) {
+  // An explicit offset is stored and reaches the rule.  2 is used rather than 1
+  // so the test still discriminates against the default.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_seed_level_offset");
+  cfg["settings"]["seed_level_offset"] = 2;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::seed_level_offset(f) == 2);
+  // An explicit key pins the offset: the automatic target read does not apply.
+  REQUIRE(FamilyTestHelper::seed_level_offset_set(f));
 }
 
 TEST(family_parse_settings_cache_dir) {

@@ -27,6 +27,11 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
+  # seed_level_offset is optional: when absent, the rule reads the targets --
+  # offset 1 when they carry dots (this file derives 2), and offset 0 when they
+  # are pure denominators.  Setting it fixes the relaxation:
+  # l = max(0, popcount(top) - s_max - offset) (larger relaxes more, generating
+  # more equations).
   ordering_mode: balance      # integral ordering: normal (generation order) | balance (default;
                               # seeds, subsector columns and the global numbering all follow the
                               # balance key: total power, depth, rank, max denominator power,
