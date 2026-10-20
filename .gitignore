@@ -1,0 +1,23 @@
+# build tree
+build/
+build-prof/
+build-native/
+
+# local-only notes and benchmark records (not part of the released package)
+ARCHITECTURE.md
+bench/
+docs/
+CLAUDE.md
+
+# run output
+cache*/
+sector_timing.csv
+results/
+tmp/
+sectormappings/
+firefly.log
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store

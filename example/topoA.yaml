@@ -1,0 +1,54 @@
+# family configuration
+family:
+  # family name
+  name: topoA
+  # loop momenta
+  internals: [ k1, k2 ]
+  # external momenta
+  externals: [ q1, q2, q3 ]
+  # kinematics invariants
+  # format: - [variable, dimension]
+  invariants:
+    - [ s, 2 ]
+    - [ t, 2 ]
+    - [ u, 2 ]
+    - [ m, 1 ]
+  # [optional] the invariant set to one
+  invar_one:
+
+  # propagators
+  # format: - [momentum, mass]
+  # mass must be contained in invariants and have dimension 1
+  propagators:
+    - [ k1, m ]
+    - [ k2, m ]
+    - [ k1-k2, 0 ]
+    - [ k1-q1, m ]
+    - [ k2-q1, m ]
+    - [ k1-q1-q2, m ]
+    - [ k2-q1-q2, m ]
+    - [ k1-q1-q2-q3, m ]
+    - [ k2-q1-q2-q3, m ]
+  # scalar products rules
+  # format: - [momentum1, momentum2, expression]
+  # symbols in expression must be contained in invariants
+  sps_rules:
+    - [ q1, q1, 0 ]
+    - [ q2, q2, 0 ]
+    - [ q3, q3, 0]
+    - [ q1, q2, s/2 ]
+    - [ q1, q3, t/2 ]
+    - [ q2, q3, u/2 ]
+
+
+settings:
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
+  parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
+  subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
+                              # its boundary quantity (depth + rank) falls more than n below
+                              # the boundary (0 = drop every subsector integral)
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
+  cache_dir: cache_topoA      # directory for the run's output (reductions, masters, logs)
+
+targets:
+  - [ 1, 1, 1, 1, -1, 1, -1, 1, 1]
