@@ -933,6 +933,12 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
         for (const PropPrescription &p : pres) {
           if (!p.has_numeric_rows) {
 
+            // Held from before the expression vectors are built until after they are
+            // destroyed (locals die in reverse order): GiNaC's reference counts are
+            // plain integers and a default-constructed ex points at GiNaC's
+            // process-wide zero, so building, copying or destroying these vectors off
+            // the lock raced with another sector worker doing the same.
+            std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
             std::vector<std::vector<GiNaC::ex>> f_ex(p.f.rows(),
                                                      std::vector<GiNaC::ex>(p.f.cols()));
             std::vector<GiNaC::ex> c_ex(p.c.rows());
@@ -941,7 +947,6 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
                 f_ex[i][j] = p.f(i, j);
             for (unsigned i = 0; i < p.c.rows(); ++i)
               c_ex[i] = p.c(i, 0);
-            std::lock_guard<std::mutex> ginac_guard(ginac_mutex);
 
             for (const RawIntegral &seed : sym_seeds) {
               std::vector<SymTerm<GiNaC::ex>> terms;

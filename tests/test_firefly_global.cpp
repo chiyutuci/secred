@@ -273,6 +273,45 @@ TEST(firefly_ratreconst_statics_are_owned_by_libfirefly) {
   }
 }
 
+// The needed-feed hand-off is fixed in the executable's copy of RatReconst.cpp (the
+// same lib/firefly_patch mechanism as the prime table).  A link-order regression would
+// silently bring back libfirefly.so's unlocked move with no compile error, so pin the
+// binding: the getter the reconstruction calls must not resolve into libfirefly.so.
+// The cast is an address lookup, not a call; GCC warns about member-function pointers.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpmf-conversions"
+#endif
+TEST(firefly_patched_needed_feed_vec_is_linked) {
+  using Getter = std::vector<std::pair<std::uint32_t, std::uint32_t>> (
+      firefly::RatReconst::*)();
+  const Getter getter = &firefly::RatReconst::get_needed_feed_vec;
+  Dl_info info{};
+  REQUIRE(::dladdr(reinterpret_cast<void *>(getter), &info) != 0);
+  REQUIRE(info.dli_fname != nullptr);
+  REQUIRE_MSG(std::string(info.dli_fname).find("libfirefly") == std::string::npos,
+              std::string("get_needed_feed_vec resolves to ") + info.dli_fname +
+                  "; the patched definition in lib/firefly_patch must win");
+}
+
+// get_zi_orders() is the second getter in that patch: it read coef_mat while the
+// worker that owned the interpolation could be appending to it.  Pin its binding too.
+TEST(firefly_patched_get_zi_orders_is_linked) {
+  using Order = std::pair<std::vector<std::uint32_t>, std::uint32_t>;
+  using Getter =
+      std::pair<std::vector<Order>, std::uint32_t> (firefly::RatReconst::*)() const;
+  const Getter getter = &firefly::RatReconst::get_zi_orders;
+  Dl_info info{};
+  REQUIRE(::dladdr(reinterpret_cast<void *>(getter), &info) != 0);
+  REQUIRE(info.dli_fname != nullptr);
+  REQUIRE_MSG(std::string(info.dli_fname).find("libfirefly") == std::string::npos,
+              std::string("get_zi_orders resolves to ") + info.dli_fname +
+                  "; the patched definition in lib/firefly_patch must win");
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 // The point of lib/firefly_patch: a reconstruction can run past FireFly's 300-entry
 // table.  The walk runs in a child process -- FireFly's sampling stream and DenseSolver
 // state are per-process and the suite otherwise runs exactly one real reconstruction --
@@ -885,4 +924,79 @@ TEST(firefly_box_reports_the_probe_elimination_fill_in) {
   REQUIRE(b > a);
   box(x);
   REQUIRE_EQ(box.fwd_merges() - b, b - a);
+}
+
+// Two workers that return from RatReconst::interpolate() for the same function both
+// ask for the next sampling plan; in FireFly 2.0.3 that getter moved and cleared
+// needed_feed_vec without mutex_status, so the two moves raced.  Hammer the hand-off
+// from several threads.  A normal build only checks that nothing is lost or corrupted;
+// under ThreadSanitizer the pre-patch getter reports a data race here even with an
+// empty plan, and the patched getter is clean.  This test ends the file because it
+// constructs a bare RatReconst after this file's in-process reconstruction.
+TEST(firefly_needed_feed_vec_handoff_is_serialized) {
+  firefly::RatReconst rec(2);
+  constexpr unsigned kThreads = 4;
+  constexpr unsigned kIterations = 20000;
+  std::atomic<unsigned> ready{0};
+  std::atomic<unsigned> calls{0};
+  std::atomic<unsigned> non_empty{0};
+  std::atomic<bool> start{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (unsigned t = 0; t < kThreads; ++t)
+    threads.emplace_back([&]() {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      for (unsigned i = 0; i < kIterations; ++i) {
+        const std::vector<std::pair<std::uint32_t, std::uint32_t>> plan =
+            rec.get_needed_feed_vec();
+        if (!plan.empty())
+          non_empty.fetch_add(1, std::memory_order_relaxed);
+        calls.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  while (ready.load(std::memory_order_acquire) != kThreads) {
+  }
+  start.store(true, std::memory_order_release);
+  for (auto &t : threads)
+    t.join();
+  REQUIRE_EQ(calls.load(), kThreads * kIterations);
+  REQUIRE_EQ(non_empty.load(), 0u);
+}
+
+// The second getter in that patch: get_zi_orders() now also takes mutex_status and
+// refuses to read coef_mat while another worker owns the interpolation.  With no
+// interpolation in flight it must still answer normally from several threads.
+TEST(firefly_get_zi_orders_is_serialized) {
+  firefly::RatReconst rec(2);
+  constexpr unsigned kThreads = 4;
+  constexpr unsigned kIterations = 20000;
+  std::atomic<unsigned> ready{0};
+  std::atomic<unsigned> calls{0};
+  std::atomic<unsigned> unexpected{0};
+  std::atomic<bool> start{false};
+  std::vector<std::thread> threads;
+  threads.reserve(kThreads);
+  for (unsigned t = 0; t < kThreads; ++t)
+    threads.emplace_back([&]() {
+      ready.fetch_add(1, std::memory_order_release);
+      while (!start.load(std::memory_order_acquire)) {
+      }
+      for (unsigned i = 0; i < kIterations; ++i) {
+        const auto orders = rec.get_zi_orders();
+        // zi == 1: one order, nothing solved yet, system size 0.
+        if (orders.first.size() != 1 || orders.first.front().second != 0 ||
+            orders.second != 0)
+          unexpected.fetch_add(1, std::memory_order_relaxed);
+        calls.fetch_add(1, std::memory_order_relaxed);
+      }
+    });
+  while (ready.load(std::memory_order_acquire) != kThreads) {
+  }
+  start.store(true, std::memory_order_release);
+  for (auto &t : threads)
+    t.join();
+  REQUIRE_EQ(calls.load(), kThreads * kIterations);
+  REQUIRE_EQ(unexpected.load(), 0u);
 }

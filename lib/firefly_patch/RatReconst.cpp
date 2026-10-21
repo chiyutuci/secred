@@ -3651,6 +3651,22 @@ namespace firefly {
   }
 
   std::vector<std::pair<uint32_t, uint32_t>> RatReconst::get_needed_feed_vec() {
+    // PATCH (see README.md): FireFly 2.0.3 moved and cleared needed_feed_vec without
+    // taking mutex_status.  interpolate() releases that mutex around the call to the
+    // private interpolate(), which writes needed_feed_vec in check_if_done(); the
+    // worker returns from interpolate() and only then asks for the plan, so a second
+    // worker can enter interpolate() for the same RatReconst in that window.  Both
+    // then move the same vector.  Take the mutex for the whole hand-off.
+    //
+    // Every writer of needed_feed_vec runs inside interpolate() while is_interpolating
+    // is set, and is_interpolating is set and cleared under mutex_status.  Returning
+    // nothing while it is set therefore never reads a vector being written; the worker
+    // that owns the interpolation takes the plan when it returns, so no plan is lost.
+    std::lock_guard<std::mutex> lock(mutex_status);
+
+    if (is_interpolating)
+      return {};
+
     std::vector<std::pair<uint32_t, uint32_t>> needed_feed_vec_tmp = std::move(needed_feed_vec);
     needed_feed_vec.clear();
 
@@ -3748,7 +3764,20 @@ namespace firefly {
   }
 
   std::pair<std::vector<std::pair<std::vector<uint32_t>, uint32_t>>, uint32_t> RatReconst::get_zi_orders() const {
+    // PATCH (see README.md): same window as get_needed_feed_vec().  interpolate()
+    // releases mutex_status around its private interpolate(), which appends to
+    // coef_mat in build_uni_gauss()/build_factor_uni_gauss()/
+    // build_homogenized_multi_gauss(); taking mutex_status here therefore does not
+    // exclude that writer, and FireFly 2.0.3 read coef_mat.size() while the vector
+    // could be reallocated.  Every writer runs while is_interpolating is set, so
+    // report no orders for now instead of reading the vector; the worker that owns
+    // the interpolation asks again when it returns, after the flag is cleared under
+    // the same mutex, and schedules the probes from the newer state.
     std::lock_guard<std::mutex> lock(mutex_status);
+
+    if (is_interpolating)
+      return std::make_pair(std::vector<std::pair<std::vector<uint32_t>, uint32_t>>(), uint32_t(0));
+
     uint32_t sub_term = 0;
     if (saved_ti.find(curr_zi_order) != saved_ti.end())
       sub_term = saved_ti.at(curr_zi_order).size();

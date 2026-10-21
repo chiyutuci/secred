@@ -1,4 +1,4 @@
-# lib/firefly_patch — FireFly without the 300-prime cap
+# lib/firefly_patch — FireFly without the 300-prime cap, with locked sampling-plan getters
 
 FireFly 2.0.3 ships a fixed table of exactly 300 63-bit primes and exits when a
 reconstruction needs one more:
@@ -13,7 +13,9 @@ reconstruction needs one more:
 This directory holds patched copies of the two `.cpp` files, taken verbatim from
 FireFly 2.0.3 (`firefly-master`, the same version the installed
 `libfirefly.so` and headers report in `firefly/version.hpp`), with the changes
-below.  `RatReconst.cpp` refuses to compile against a different FireFly version.
+below: the prime-table changes, and fixes for two data races in the multi-threaded
+sampling-plan hand-off that FireFly 2.0.3's public API cannot reach.
+`RatReconst.cpp` refuses to compile against a different FireFly version.
 
 ## Changes
 
@@ -36,6 +38,34 @@ below.  `RatReconst.cpp` refuses to compile against a different FireFly version.
 - `set_safe_interpolation()` sets `interpolations` to the table size (300 unless
   `ensure_primes` was asked for more); `set_prime_to_max()` starts at the last
   table entry.
+- `get_needed_feed_vec()` takes `mutex_status` and returns an empty plan while
+  `is_interpolating` is set.  FireFly 2.0.3 moved and cleared `needed_feed_vec`
+  without a lock.  `interpolate()` releases `mutex_status` around its private
+  `interpolate()`, which fills the vector in `check_if_done()`; the worker then
+  returns from `interpolate()` — the lock is gone — and only afterwards asks
+  `get_needed_feed_vec()` for the plan.  A second worker can enter `interpolate()`
+  for the same `RatReconst` in that window, so both move the same vector.  Every
+  writer of the vector runs while `is_interpolating` is set, and that flag is
+  set and cleared under `mutex_status`, so the patched getter is serialized both
+  against the writers and against another consumer; the worker that owns the
+  interpolation takes the plan when it returns, so returning empty loses none.
+  ThreadSanitizer reports six races at the unlocked move in the unpatched
+  getter and none in the patched one; the unit tests
+  `firefly_patched_needed_feed_vec_is_linked` and
+  `firefly_needed_feed_vec_handoff_is_serialized` pin, respectively, that the
+  executable's getter is the one linked and that the hand-off survives four
+  concurrent callers.
+- `get_zi_orders()` gets the same treatment.  It takes `mutex_status` and read
+  `coef_mat.size()`, but the private `interpolate()` appends to `coef_mat`
+  (in `build_uni_gauss()`, `build_factor_uni_gauss()` and
+  `build_homogenized_multi_gauss()`) while the public `interpolate()` holds that
+  mutex released, so the lock does not exclude the writer — ThreadSanitizer
+  reports the `emplace_back` against `get_zi_orders()` on a plain `box.yaml`
+  run.  The patched getter returns no orders and a zero system size while
+  `is_interpolating` is set; the caller schedules nothing for that round, and
+  the worker that owns the interpolation asks again once the flag is cleared,
+  scheduling from the newer state.  `firefly_patched_get_zi_orders_is_linked`
+  pins the binding.
 - The file defines the patched **methods** and none of `RatReconst`'s static
   data members.  `shift`, `curr_shift`, `global_anchor_points`,
   `singular_system_set` and `mutex_statics` are defined by `libfirefly.so`; the

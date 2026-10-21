@@ -17,8 +17,15 @@ std::vector<GiNaC::symbol> generate_symbols(const std::string &pre,
 void time_stamp(std::ostream &out, const std::string &msg) {
   auto now = std::chrono::system_clock::now();
   std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
-  std::tm *localtime = std::localtime(&currentTime);
-  out << msg << std::asctime(localtime) << std::endl;
+  // localtime() and asctime() return pointers into process-wide static buffers,
+  // and glibc's localtime() also rewrites the shared timezone state; every sector
+  // worker calls this, so concurrent calls were a data race.  The _r forms write
+  // into caller-owned storage, and asctime_r keeps the exact format asctime used.
+  std::tm local {};
+  ::localtime_r(&currentTime, &local);
+  char stamp[32];
+  ::asctime_r(&local, stamp);
+  out << msg << stamp << std::endl;
 }
 
 SystemMemory system_memory() {
