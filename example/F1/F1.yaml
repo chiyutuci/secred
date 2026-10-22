@@ -49,8 +49,7 @@ settings:
                               # the boundary (0 = drop every subsector integral)
   cache_dir: cache_F1         # directory for the run's output (reductions, masters, logs)
   gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
-  probe_mode: all
-  mandatory_list: false
+  truncate: false
 
 targets:
   - [ 1, 1, 1, -3, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0 ]

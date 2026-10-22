@@ -129,6 +129,7 @@ public:
     return f._seed_level_offset_set;
   }
   static ProbeMode probe_mode(const Family &f) { return f._probe_mode; }
+  static bool truncate(const Family &f) { return f._truncate; }
   static bool mandatory_list(const Family &f) { return f._mandatory_list; }
   static bool sector_debug(const Family &f) { return f._sector_debug; }
   static const std::string &cache_dir(const Family &f) {
@@ -237,22 +238,77 @@ TEST(family_parse_max_primes_rejects_zero) {
   REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
-TEST(family_parse_probe_mode_defaults_to_targets) {
-  // Without the key the probe reports only the masters the input targets need:
-  // a master only a spill request needs may not widen the box.
+TEST(family_parse_truncate_off_by_default) {
+  // The all-default run is the pre-2026-10-17 walk: the seed truncation is off,
+  // the probe is unscoped whatever probe_mode says, and the mandatory rows
+  // default off.
   clear_symtab();
-  YAML::Node cfg = box_config("tc_probe_mode_default");
+  YAML::Node cfg = box_config("tc_truncate_default");
   Family f(cfg);
-  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::Targets);
+  REQUIRE(!FamilyTestHelper::truncate(f));
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
+  REQUIRE(!FamilyTestHelper::mandatory_list(f));
 }
 
-TEST(family_parse_probe_mode_all) {
-  // "all" restores the unscoped walk: every out-of-box master reports.
+TEST(family_parse_probe_mode_alone_enables_the_truncation) {
+  // With no truncate key, naming a probe option opts the run into the
+  // truncation, whichever value it takes; the scope stays what was named and
+  // the mandatory default follows it.
   clear_symtab();
-  YAML::Node cfg = box_config("tc_probe_mode_all");
+  YAML::Node cfg = box_config("tc_truncate_probe_targets");
+  cfg["settings"]["probe_mode"] = "targets";
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::truncate(f));
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::Targets);
+  REQUIRE(FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_probe_mode_all_alone_enables_the_truncation) {
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_truncate_probe_all");
   cfg["settings"]["probe_mode"] = "all";
   Family f(cfg);
+  REQUIRE(FamilyTestHelper::truncate(f));
   REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
+  REQUIRE(!FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_truncate_false_overrides_an_explicit_probe_mode) {
+  // truncate: false force-overrides the probe scope: `all` and no mandatory
+  // rows, even when the config names targets.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_truncate_off_probe");
+  cfg["settings"]["probe_mode"] = "targets";
+  cfg["settings"]["truncate"] = false;
+  Family f(cfg);
+  REQUIRE(!FamilyTestHelper::truncate(f));
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
+  REQUIRE(!FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_truncate_true_alone_keeps_the_targets_default) {
+  // Only an explicit truncate: true leaves the probe defaulting to targets,
+  // with Kira 3's mandatory rows on.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_truncate_on_alone");
+  cfg["settings"]["truncate"] = true;
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::truncate(f));
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::Targets);
+  REQUIRE(FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_truncate_true_with_an_explicit_all_probe) {
+  // Under truncate: true the explicit scope wins; all leaves the mandatory
+  // default off.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_truncate_on_probe_all");
+  cfg["settings"]["truncate"] = true;
+  cfg["settings"]["probe_mode"] = "all";
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::truncate(f));
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
+  REQUIRE(!FamilyTestHelper::mandatory_list(f));
 }
 
 TEST(family_parse_probe_mode_rejects_an_unknown_value) {
@@ -264,13 +320,24 @@ TEST(family_parse_probe_mode_rejects_an_unknown_value) {
   REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
 }
 
-TEST(family_parse_mandatory_list_defaults_to_on) {
-  // Under the scoped probe (the default, probe_mode: targets) the key absent
-  // leaves the spill carrying Kira 3's mandatory rows: every raw row that
-  // relates a subsector master no target depends on stays in the global system,
-  // which reproduces Kira's basis (box 8, F234_N 309, Jpsi 43).
+TEST(family_parse_mandatory_list_defaults_to_off) {
+  // Without the truncation the key absent leaves Kira 3's mandatory rows out:
+  // the pre-2026-10-17 walk never spilled them.
   clear_symtab();
   YAML::Node cfg = box_config("tc_mandatory_default");
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
+  REQUIRE(!FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_mandatory_list_defaults_to_on_with_the_truncation) {
+  // Under truncate: true and the targets default the key absent leaves the
+  // spill carrying Kira 3's mandatory rows: every raw row that relates a
+  // subsector master no target depends on stays in the global system, which
+  // reproduces Kira's basis (box 8, F234_N 309, Jpsi 43).
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_mandatory_truncate_default");
+  cfg["settings"]["truncate"] = true;
   Family f(cfg);
   REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::Targets);
   REQUIRE(FamilyTestHelper::mandatory_list(f));
@@ -282,18 +349,29 @@ TEST(family_parse_mandatory_list_defaults_to_off_under_unscoped_probe) {
   // follows the probe scope and turns them off.
   clear_symtab();
   YAML::Node cfg = box_config("tc_mandatory_all_default");
+  cfg["settings"]["truncate"] = true;
   cfg["settings"]["probe_mode"] = "all";
   Family f(cfg);
   REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
   REQUIRE(!FamilyTestHelper::mandatory_list(f));
 }
 
-TEST(family_parse_mandatory_list_key_overrides_the_probe_default) {
+TEST(family_parse_probe_mode_rejects_none) {
+  // The pre-2026-10-17 walk is `truncate: false` now; `none` is not a probe
+  // scope and must fail loudly rather than fall back silently.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_probe_mode_none");
+  cfg["settings"]["probe_mode"] = "none";
+  REQUIRE_THROWS_AS(Family(cfg), std::runtime_error);
+}
+
+TEST(family_parse_mandatory_list_key_overrides_the_default) {
   // The key wins over the scope-derived default: an explicit true keeps Kira's
   // rows even under the unscoped probe.  (The other direction -- explicit false
   // under `targets` -- is family_parse_mandatory_list_disabled.)
   clear_symtab();
   YAML::Node cfg = box_config("tc_mandatory_all_on");
+  cfg["settings"]["truncate"] = true;
   cfg["settings"]["probe_mode"] = "all";
   cfg["settings"]["mandatory_list"] = true;
   Family f(cfg);
@@ -306,6 +384,7 @@ TEST(family_parse_mandatory_list_disabled) {
   // masters where Kira's mandatory list gives 43 on the Jpsi family).
   clear_symtab();
   YAML::Node cfg = box_config("tc_mandatory_off");
+  cfg["settings"]["truncate"] = true;
   cfg["settings"]["mandatory_list"] = false;
   Family f(cfg);
   REQUIRE(!FamilyTestHelper::mandatory_list(f));
@@ -314,6 +393,7 @@ TEST(family_parse_mandatory_list_disabled) {
 TEST(family_init_reduce_copies_mandatory_list) {
   clear_symtab();
   YAML::Node cfg = box_config("tc_mandatory_reduce");
+  cfg["settings"]["truncate"] = true;
   cfg["settings"]["mandatory_list"] = false;
   Family f(cfg);
   f.init();
@@ -325,9 +405,8 @@ TEST(family_init_reduce_copies_mandatory_list) {
 }
 
 TEST(family_prepare_sectors_all_mode_voids_the_level_offset) {
-  // probe_mode = all is the pre-2026-10-17 walk, calibrated at offset 0: the
-  // truncation rule is derived at offset 0 even when the config sets
-  // seed_level_offset explicitly.
+  // An explicit probe_mode alone turns the truncation on; with `all` the rule
+  // is derived at offset 0 even when the config sets seed_level_offset.
   clear_symtab();
   YAML::Node cfg = box_config("tc_probe_all_offset");
   cfg["settings"]["probe_mode"] = "all";
@@ -342,11 +421,49 @@ TEST(family_prepare_sectors_all_mode_voids_the_level_offset) {
   std::filesystem::remove_all("tc_probe_all_offset");
 }
 
+TEST(family_prepare_sectors_truncate_off_by_default) {
+  // The default run derives no rule: the whole seed box is admitted under the
+  // forced unscoped probe, an explicit seed_level_offset is void and the
+  // returned truncation stays inactive.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_truncate_off_default");
+  cfg["settings"]["seed_level_offset"] = 3;
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  REQUIRE(!r.truncate());
+  REQUIRE(r.probe_mode() == ProbeMode::All);
+  REQUIRE(!r.truncation().active);
+  REQUIRE(r.truncation().level_offset == 0u);
+  std::filesystem::remove_all("tc_truncate_off_default");
+}
+
+TEST(family_prepare_sectors_truncate_true_alone_derives_the_rule) {
+  // truncate: true with no probe key derives the rule at the probe's targets
+  // default and honours seed_level_offset.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_truncate_on_alone");
+  cfg["settings"]["truncate"] = true;
+  cfg["settings"]["seed_level_offset"] = 2;
+  Family f(cfg);
+  f.init();
+  Reduce r;
+  f.init_reduce(cfg, r);
+  REQUIRE(r.truncate());
+  REQUIRE(r.probe_mode() == ProbeMode::Targets);
+  REQUIRE(r.truncation().active);
+  REQUIRE(r.truncation().level_offset == 2u);
+  std::filesystem::remove_all("tc_truncate_on_alone");
+}
+
 TEST(family_prepare_sectors_targets_mode_honours_the_level_offset) {
-  // The default mode leaves seed_level_offset in charge: an explicit 3 reaches
-  // the derived rule (the same config under probe_mode = all reads 0).
+  // An explicit targets probe turns the truncation on and leaves
+  // seed_level_offset in charge: an explicit 3 reaches the derived rule (the
+  // same config under probe_mode = all reads 0).
   clear_symtab();
   YAML::Node cfg = box_config("tc_probe_targets_offset");
+  cfg["settings"]["probe_mode"] = "targets";
   cfg["settings"]["seed_level_offset"] = 3;
   Family f(cfg);
   f.init();

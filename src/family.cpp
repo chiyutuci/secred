@@ -102,8 +102,8 @@ void Family::run_reduce(Reduce &reduce) {
       const unsigned spillDepth = reduce._ctx.boxSpillExtraDepth.load();
       const unsigned spillRank = reduce._ctx.boxSpillExtraRank.load();
 
-      const bool probeAll = reduce._probe_mode == ProbeMode::All;
-      const char *probeMode = probeAll ? "all" : "targets";
+      const bool probeTargets = reduce._probe_mode == ProbeMode::Targets;
+      const char *probeMode = probeTargets ? "targets" : "all";
       const unsigned accepted = reduce._ctx.probeScopeSkipped.load();
 
       std::ofstream sfile(_cache_dir + "/sectors/sectors", std::ios::trunc);
@@ -133,23 +133,27 @@ void Family::run_reduce(Reduce &reduce) {
                     probeSeconds, fullSeconds, probeShare);
       std::cout << atpsLine << std::endl;
 
-      std::cout << "\n  Seed truncation: " << trunc << " sectors cut, " << lifted
-                << " lifted by the probe (l = " << reduce._truncation.l
-                << ", offset " << reduce._truncation.level_offset << ")"
-                << std::endl;
+      if (reduce._truncation.active)
+        std::cout << "\n  Seed truncation: " << trunc << " sectors cut, "
+                  << lifted << " lifted by the probe (l = "
+                  << reduce._truncation.l << ", offset "
+                  << reduce._truncation.level_offset << ")" << std::endl;
+      else
+        std::cout << "\n  Seed truncation: off (the whole seed box is admitted)"
+                  << std::endl;
 
       std::cout << "\n  Seed box: spill raised " << spillRaised
                 << " sectors (+" << spillDepth << " depth, +" << spillRank
                 << " rank over targets-only)" << std::endl;
 
-      if (probeAll)
-        std::cout << "\n  Probe scope (all): every out-of-box master report"
-                  << " widens the box; seed_level_offset is void (offset 0)"
-                  << std::endl;
-      else
+      if (probeTargets)
         std::cout << "\n  Probe scope (targets): " << accepted
                   << " out-of-box master reports accepted, not needed by the"
                   << " input targets" << std::endl;
+      else
+        std::cout << "\n  Probe scope (all): every out-of-box master report"
+                  << " widens the box; seed_level_offset is void (offset 0)"
+                  << std::endl;
 
       if (!have_global_system)
         std::cout << "\n Probe narrowing: succeeded " << ok << " / failed " << fail
@@ -603,15 +607,32 @@ Family::Family(const YAML::Node &config) {
       else
         throw std::runtime_error(
             "probe_mode must be 'targets' or 'all', got '" + pm + "'");
+      _probe_mode_set = true;
     }
 
-    // The default follows the probe scope: under `targets` a sector's box only
-    // widens for a master its own targets need, so Kira's mandatory rows (the raw
-    // rows carrying a subsector integral the sector never reduces) are what let
-    // the global stage eliminate a subsector master no target depends on -- they
-    // are on.  Under `all` every out-of-box master report already widens the box,
-    // so those rows buy nothing and the default is off.  The key overrides either.
-    _mandatory_list = _probe_mode != ProbeMode::All;
+    if (s["truncate"]) {
+      _truncate = s["truncate"].as<bool>();
+      _truncate_set = true;
+    }
+
+    // With no `truncate` key, naming a probe option opts the run into the seed
+    // truncation, whichever value it takes; with neither key the truncation is
+    // off.  An explicit `truncate: false` force-overrides the probe: the walk is
+    // unscoped (`all`) and the mandatory rows default off -- the
+    // pre-2026-10-17 behaviour, whatever `probe_mode` says.  While the rule is
+    // on, the probe scope defaults to `targets` and the mandatory default
+    // follows it.
+    if (!_truncate_set)
+      _truncate = _probe_mode_set;
+
+    if (!_truncate) {
+      _probe_mode = ProbeMode::All;
+      _mandatory_list = false;
+    } else {
+      if (!_probe_mode_set)
+        _probe_mode = ProbeMode::Targets;
+      _mandatory_list = _probe_mode == ProbeMode::Targets;
+    }
     if (s["mandatory_list"]) _mandatory_list = s["mandatory_list"].as<bool>();
 
     if (s["sector_debug"]) _sector_debug = s["sector_debug"].as<bool>();
@@ -686,6 +707,7 @@ void Family::init_reduce(const YAML::Node &config, Reduce &reduce) const {
   reduce._seed_level_offset = _seed_level_offset;
   reduce._seed_level_offset_set = _seed_level_offset_set;
   reduce._probe_mode = _probe_mode;
+  reduce._truncate = _truncate;
   reduce._mandatory_list = _mandatory_list;
   std::vector<bool> hasLine(_nprops, false);
   for (const auto &integral : reduce._rawTargets) {
@@ -1183,12 +1205,19 @@ void Reduce::print() const {
 // Derive the truncation and build the sector list.
 void Reduce::prepare_sectors() {
 
-  const unsigned level_offset =
-      _probe_mode == ProbeMode::All
-          ? 0
-          : (_seed_level_offset_set ? _seed_level_offset
-                                    : automatic_seed_level_offset(_rawTargets));
-  _truncation = derive_seed_truncation(_rawTargets, _top, level_offset);
+  if (!_truncate) {
+    // Truncation off (the default): the whole seed box is admitted, no rule is
+    // derived and seed_level_offset is void.
+    _truncation = SeedTruncation{};
+    _truncation.level_offset = 0;
+  } else {
+    const unsigned level_offset =
+        _probe_mode == ProbeMode::All
+            ? 0
+            : (_seed_level_offset_set ? _seed_level_offset
+                                      : automatic_seed_level_offset(_rawTargets));
+    _truncation = derive_seed_truncation(_rawTargets, _top, level_offset);
+  }
 
   _lines = std::vector<bool>(_nprops, false);
   for (unsigned i = 0; i < _nprops; ++i)

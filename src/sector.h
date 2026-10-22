@@ -35,7 +35,8 @@
 // Integral ordering used when seeding a sector.
 enum class OrderingMode { Normal, Balance };
 
-// Probe scope: only input-target masters may widen, or every out-of-box master.
+// Probe scope: only input-target masters may widen (`targets`), or every
+// out-of-box master may widen (`all`).
 enum class ProbeMode { Targets, All };
 
 class RawIntegral;

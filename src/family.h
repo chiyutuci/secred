@@ -124,6 +124,13 @@ private:
   bool _seed_level_offset_set = false;
 
   ProbeMode _probe_mode = ProbeMode::Targets;
+  bool _probe_mode_set = false;
+
+  // Seed truncation (Kira's truncate_sp): off by default, on when a probe option
+  // is named.  An explicit `truncate: false` forces the pre-2026-10-17 walk --
+  // unscoped probe and no mandatory rows -- overriding `probe_mode`.
+  bool _truncate = false;
+  bool _truncate_set = false;
 
   bool _mandatory_list = true;
 
@@ -187,6 +194,8 @@ public:
 
   ProbeMode probe_mode() const { return _probe_mode; }
 
+  bool truncate() const { return _truncate; }
+
   bool mandatory_list() const { return _mandatory_list; }
 
   friend class Family;
@@ -207,6 +216,8 @@ private:
   bool _seed_level_offset_set = false;
 
   ProbeMode _probe_mode = ProbeMode::Targets;
+
+  bool _truncate = false;
 
   bool _mandatory_list = true;
 
