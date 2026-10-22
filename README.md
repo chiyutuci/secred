@@ -181,9 +181,11 @@ described by FireFly's own log, `firefly.log` in the cache directory.
 | `example/dbox.yaml` | massless double box, 9 propagators | symbolic `d`, `s`, `t` | FireFly | seconds |
 | `example/sunrise.yaml` | two-loop massive sunrise, 5 propagators | symbolic `d` | FireFly | seconds |
 | `example/topoA.yaml` | two-loop three-point with masses, 9 propagators | symbolic `d`, `s`, `t`, `u`, `m` | FireFly | minutes |
-| `example/F234_N.yaml` | two-loop five-point non-planar, 9 propagators | numeric | FiniteFlow | minutes |
-| `example/F234_S.yaml` | the same family | numeric `d`, symbolic `s`, `t` | FireFly | hours |
-| `example/F1.yaml` | four-loop, 14 propagators | numeric | FiniteFlow | days |
+| `example/F234/F234D.yaml` | two-loop five-point non-planar, 9 propagators | symbolic `d` | FireFly | minutes |
+| `example/F234/F234ST.yaml` | the same family (symbolic `s`, `t`) | numeric `d` | FireFly | hours |
+| `example/F234/kira/` | its Kira 3.1 counterpart: `config/`, `target`, and both job files (untruncated, and per-sector truncated) | symbolic `d` | FireFly | minutes–hours |
+| `example/F1/F1.yaml` | four-loop, 14 propagators | numeric | FiniteFlow | days |
+| `example/F1/kira/` | its Kira counterpart: `config/`, `target`, the per-sector truncated job of the 2026-10-19 run, and an untruncated counterpart | numeric `d = 1999/500` | FireFly | hours–days |
 
 ## Tests
 

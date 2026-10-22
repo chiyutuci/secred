@@ -1,7 +1,10 @@
-# F234_N: two-loop five-point non-planar family, numeric (dimension = 1999/500),
-# reduced in-process with FiniteFlow.  The J/psi leg p4 appears as two c-cbar
-# constituent legs of p4/2 each, hence 5 external legs but only E = 3 independent
-# external momenta (the three externals below, with p4 = p1+p2+p3).
+# F234 at symbolic dimension d: two-loop five-point non-planar family.  A symbolic
+# system is reconstructed in-process by FireFly.  The J/psi leg p4 appears as two
+# c-cbar constituent legs of p4/2 each, hence 5 external legs but only E = 3
+# independent external momenta (the three externals below, with p4 = p1+p2+p3).
+# The Kira counterpart of this family is in kira/ (top_level_sectors: [255]: eight
+# propagators; line 9 `(l1+p1)^2` is an auxiliary numerator line, never positive in
+# the 860 targets).  Both programs end with 309 master integrals.
 family:
   name: F234
   dimension: d
@@ -32,7 +35,7 @@ settings:
   subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
                               # its boundary quantity (depth + rank) falls more than n below
                               # the boundary (0 = drop every subsector integral)
-  cache_dir: cache_F234_N     # directory for the run's output (reductions, masters, logs)
+  cache_dir: cache_F234       # directory for the run's output (reductions, masters, logs)
   gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
 
 targets:
