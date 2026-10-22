@@ -265,11 +265,37 @@ TEST(family_parse_probe_mode_rejects_an_unknown_value) {
 }
 
 TEST(family_parse_mandatory_list_defaults_to_on) {
-  // With the key absent the spill carries Kira 3's mandatory rows: every raw row
-  // that relates a subsector master no target depends on stays in the global
-  // system, which reproduces Kira's basis (box 8, F234_N 309, Jpsi 43).
+  // Under the scoped probe (the default, probe_mode: targets) the key absent
+  // leaves the spill carrying Kira 3's mandatory rows: every raw row that
+  // relates a subsector master no target depends on stays in the global system,
+  // which reproduces Kira's basis (box 8, F234_N 309, Jpsi 43).
   clear_symtab();
   YAML::Node cfg = box_config("tc_mandatory_default");
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::Targets);
+  REQUIRE(FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_mandatory_list_defaults_to_off_under_unscoped_probe) {
+  // Under probe_mode: all every out-of-box master report widens the box, so the
+  // mandatory rows add nothing the probe has not already reached; the default
+  // follows the probe scope and turns them off.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_mandatory_all_default");
+  cfg["settings"]["probe_mode"] = "all";
+  Family f(cfg);
+  REQUIRE(FamilyTestHelper::probe_mode(f) == ProbeMode::All);
+  REQUIRE(!FamilyTestHelper::mandatory_list(f));
+}
+
+TEST(family_parse_mandatory_list_key_overrides_the_probe_default) {
+  // The key wins over the scope-derived default: an explicit true keeps Kira's
+  // rows even under the unscoped probe.  (The other direction -- explicit false
+  // under `targets` -- is family_parse_mandatory_list_disabled.)
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_mandatory_all_on");
+  cfg["settings"]["probe_mode"] = "all";
+  cfg["settings"]["mandatory_list"] = true;
   Family f(cfg);
   REQUIRE(FamilyTestHelper::mandatory_list(f));
 }

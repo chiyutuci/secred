@@ -605,6 +605,13 @@ Family::Family(const YAML::Node &config) {
             "probe_mode must be 'targets' or 'all', got '" + pm + "'");
     }
 
+    // The default follows the probe scope: under `targets` a sector's box only
+    // widens for a master its own targets need, so Kira's mandatory rows (the raw
+    // rows carrying a subsector integral the sector never reduces) are what let
+    // the global stage eliminate a subsector master no target depends on -- they
+    // are on.  Under `all` every out-of-box master report already widens the box,
+    // so those rows buy nothing and the default is off.  The key overrides either.
+    _mandatory_list = _probe_mode != ProbeMode::All;
     if (s["mandatory_list"]) _mandatory_list = s["mandatory_list"].as<bool>();
 
     if (s["sector_debug"]) _sector_debug = s["sector_debug"].as<bool>();
