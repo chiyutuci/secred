@@ -621,12 +621,30 @@ Family::Family(const YAML::Node &config) {
 
   _name = familyConfig["name"].as<std::string>();
 
+  // The dimension is either a fixed rational space-time dimension or one
+  // symbolic parameter.  Anything else (an expression such as 4-2*eps, or a
+  // float) cannot be carried by the reduction; it used to be replaced by `d`
+  // silently, so the run used a dimension the config never named.
   if (familyConfig["dimension"]) {
+    const std::string text = familyConfig["dimension"].as<std::string>();
     GiNaC::parser parser;
-    _dimension = parser(familyConfig["dimension"].as<std::string>());
-  } else
+    _dimension = parser(text);
+    if (GiNaC::is_a<GiNaC::numeric>(_dimension)) {
+      if (!_dimension.info(GiNaC::info_flags::rational))
+        throw std::runtime_error(
+            "dimension must be a rational number or a single symbol: " + text);
+    } else if (GiNaC::is_a<GiNaC::symbol>(_dimension)) {
+      const std::string name =
+          GiNaC::ex_to<GiNaC::symbol>(_dimension).get_name();
+      _symbols.emplace_back(name);
+      _dimension = _symbols.back();
+      symtab[name] = _dimension;
+    } else {
+      throw std::runtime_error(
+          "dimension must be a rational number or a single symbol: " + text);
+    }
+  } else {
     _dimension = GiNaC::possymbol("d");
-  if (!is_a<GiNaC::numeric>(_dimension)) {
     _symbols.emplace_back("d");
     _dimension = _symbols.back();
     symtab["d"] = _dimension;
@@ -663,6 +681,23 @@ Family::Family(const YAML::Node &config) {
       if (inv.first != one)
         _symbols.emplace_back(_invariants.back().first);
     }
+  }
+
+  // The numeric IBP generator substitutes a prime for each symbol by position,
+  // and it has kNumPrimeSubs primes.  A symbol past that limit would survive
+  // into the coefficient text and be parsed as a number, so the config is
+  // refused here, with the names, before any reduction starts.
+  if (_symbols.size() > kNumPrimeSubs) {
+    std::string names;
+    for (std::size_t i = 0; i < _symbols.size(); ++i) {
+      if (i)
+        names += ", ";
+      names += _symbols[i].get_name();
+    }
+    throw std::runtime_error(
+        "family has " + std::to_string(_symbols.size()) +
+        " symbolic parameters but at most " + std::to_string(kNumPrimeSubs) +
+        " are supported: " + names);
   }
 
   if (familyConfig["invar_one"] && !familyConfig["invar_one"].IsNull()) {

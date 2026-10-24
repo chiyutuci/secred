@@ -28,6 +28,31 @@ TEST(rational_construct_from_string) {
   REQUIRE(!r.is_zero());
 }
 
+TEST(rational_rejects_a_malformed_string) {
+  // fmpq_set_str reports failure; a silent zero would hide a coefficient the
+  // reduction cannot represent.
+  bool threw = false;
+  try {
+    rational r("not a number");
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("not a number") != std::string::npos);
+  }
+  REQUIRE(threw);
+}
+
+TEST(rational_rejects_a_partially_parsed_string) {
+  // Only a whole numerator and denominator parse; the rest is not ignored.
+  bool threw = false;
+  try {
+    rational r("1/2/3");
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("1/2/3") != std::string::npos);
+  }
+  REQUIRE(threw);
+}
+
 TEST(rational_str_integer) {
   rational r(7);
   REQUIRE(r.str() == "7");
@@ -146,6 +171,18 @@ TEST(mpoly_nonzero_from_string) {
   REQUIRE(!p.is_zero());
 }
 
+TEST(mpoly_rejects_a_malformed_string) {
+  bool threw = false;
+  try {
+    mpoly p("not a polynomial");
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("not a polynomial") !=
+            std::string::npos);
+  }
+  REQUIRE(threw);
+}
+
 TEST(mpoly_addition_zeros) {
   mpoly a, b;
   a.set_zero();
@@ -219,6 +256,19 @@ TEST(ffint_construct_from_negative_int) {
 TEST(ffint_construct_from_string) {
   ffint f("5");
   REQUIRE(f.str() == "5");
+}
+
+TEST(ffint_rejects_a_malformed_string) {
+  // The finite-field element delegates to rational, so the refusal reaches
+  // the caller with the original text.
+  bool threw = false;
+  try {
+    ffint f("not a number");
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("not a number") != std::string::npos);
+  }
+  REQUIRE(threw);
 }
 
 TEST(ffint_addition) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 
 #include "flint/fmpq.h"
@@ -26,7 +27,10 @@ public:
 
   explicit rational(const std::string &s) {
     fmpq_init(_q);
-    fmpq_set_str(_q, s.c_str(), 10);
+    if (fmpq_set_str(_q, s.c_str(), 10) != 0) {
+      fmpq_clear(_q);
+      throw std::runtime_error("cannot parse rational: " + s);
+    }
   }
 
   // 底层 fmpq 访问(供多项式 GCD 约分等直接使用)

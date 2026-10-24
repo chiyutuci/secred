@@ -1,6 +1,7 @@
 #pragma once
 
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,10 @@ public:
 
   explicit mpoly(const std::string &s) {
     fmpq_poly_init(_p);
-    fmpq_poly_set_str(_p, s.c_str());
+    if (fmpq_poly_set_str(_p, s.c_str()) != 0) {
+      fmpq_poly_clear(_p);
+      throw std::runtime_error("cannot parse polynomial: " + s);
+    }
   }
 
   ~mpoly() { fmpq_poly_clear(_p); }

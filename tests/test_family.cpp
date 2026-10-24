@@ -1678,3 +1678,88 @@ TEST(reductions_writer_keeps_the_old_file_when_the_result_is_invalid) {
   REQUIRE_EQ(slurp_text(path), std::string("previous\n"));
   std::filesystem::remove(path);
 }
+
+// ---------------------------------------------------------------------------
+// Configuration checks: the dimension is a fixed number or one symbol, and the
+// numeric path can substitute at most kNumPrimeSubs symbols with primes.
+// ---------------------------------------------------------------------------
+
+// Helper: append a quadratic invariant to a loaded family node.
+static void add_power_invariant(YAML::Node family, const std::string &name) {
+  YAML::Node entry;
+  entry.push_back(name);
+  entry.push_back(2);
+  family["invariants"].push_back(entry);
+}
+
+TEST(family_rejects_a_dimension_expression) {
+  // A dimension written as an expression used to be replaced by `d` without a
+  // word, so the reduction ran in a different dimension than the config asked
+  // for.  The expression cannot be carried, so it must be refused.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_dimension_expression");
+  cfg["family"]["dimension"] = "4-2*eps";
+  bool threw = false;
+  try {
+    Family f(cfg);
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    const std::string what = e.what();
+    REQUIRE(what.find("dimension") != std::string::npos);
+    REQUIRE(what.find("4-2*eps") != std::string::npos);
+  }
+  REQUIRE(threw);
+}
+
+TEST(family_keeps_a_rational_dimension) {
+  // A numeric dimension is the fixed-space case; no symbol is introduced.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_dimension_rational");
+  cfg["family"]["dimension"] = "1999/500";
+  Family f(cfg);
+  REQUIRE_EQ(FamilyTestHelper::symbols(f).size(), std::size_t(2)); // s, t
+}
+
+TEST(family_uses_the_symbol_given_as_the_dimension) {
+  // `dimension: x` names this symbol; renaming it to `d` would silently put a
+  // symbol in the rule set that the family never uses.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_dimension_named_symbol");
+  cfg["family"]["dimension"] = "x";
+  Family f(cfg);
+  const auto &syms = FamilyTestHelper::symbols(f);
+  REQUIRE_EQ(syms.size(), std::size_t(3)); // x, s, t
+  REQUIRE_EQ(std::string(syms[0].get_name()), std::string("x"));
+}
+
+TEST(family_accepts_a_full_set_of_symbolic_parameters) {
+  // 24 is the number of prime substitutions the numeric IBP generator applies;
+  // exactly 24 fits.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_symbols_at_limit");
+  for (unsigned i = 0; i < 21; ++i) // d, s, t already
+    add_power_invariant(cfg["family"], "a" + std::to_string(i));
+  Family f(cfg);
+  REQUIRE_EQ(FamilyTestHelper::symbols(f).size(), std::size_t(24));
+}
+
+TEST(family_rejects_more_symbolic_parameters_than_the_numeric_path_substitutes) {
+  // A 25th symbol would not be replaced by a prime: its coefficient would be
+  // stringified with the symbol still in it and parsed as a number.  Refuse
+  // the config up front, naming what has to go.
+  clear_symtab();
+  YAML::Node cfg = box_config("tc_symbols_over_limit");
+  for (unsigned i = 0; i < 22; ++i)
+    add_power_invariant(cfg["family"], "a" + std::to_string(i));
+  bool threw = false;
+  try {
+    Family f(cfg);
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    const std::string what = e.what();
+    REQUIRE(what.find("a21") != std::string::npos);
+    REQUIRE(what.find("25") != std::string::npos);
+    REQUIRE(what.find("24") != std::string::npos);
+  }
+  REQUIRE(threw);
+}
