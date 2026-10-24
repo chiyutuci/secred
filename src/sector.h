@@ -473,6 +473,16 @@ struct ReductionContext {
     integrals.swap(spillIntegrals);
   }
 
+  // Release the interning tables once the spill file is complete.  The global
+  // phase reads the file back and uses the integral list finishSpill handed to
+  // the caller, never these tables.  Swapping with empty containers returns the
+  // heap, which clear() alone would keep.
+  void releaseSpillTables() {
+    std::unordered_map<RawIntegral, std::uint32_t>().swap(spillIntegralIndex);
+    std::unordered_map<std::string, std::uint32_t>().swap(spillCoeffIndex);
+    std::vector<std::string>().swap(spillCoeffs);
+  }
+
   // Drop the spill file.
   void discardSpill() {
     if (rawEqOut)

@@ -746,6 +746,59 @@ TEST(append_raw_equation_thread_safe) {
   std::filesystem::remove(path);
 }
 
+// The global stage reads the spill back from its file and already holds the
+// integral order, so the interning tables may go as soon as the file is closed.
+TEST(release_spill_tables_drops_the_interning_tables) {
+  ReductionContext ctx;
+  const std::string path = "/tmp/secred_test_raw_eqs_release.bin";
+  open_raw_spill(ctx, path);
+
+  GlobalEquation eq;
+  eq.emplace_back(RI({1, 1}), "2");
+  eq.emplace_back(RI({1, 0}), "-1");
+  ctx.appendRawEquation(eq);
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);
+  REQUIRE(ctx.spillCoeffs.size() == 2u);
+  REQUIRE(!ctx.spillCoeffIndex.empty());
+  REQUIRE(!ctx.spillIntegralIndex.empty());
+
+  const std::string bytes = slurp(path);
+  ctx.releaseSpillTables();
+
+  REQUIRE(ctx.spillCoeffs.empty());
+  REQUIRE(ctx.spillCoeffs.capacity() == 0u);
+  REQUIRE(ctx.spillCoeffIndex.empty());
+  REQUIRE(ctx.spillIntegralIndex.empty());
+  // The caller keeps the ordering and the spill file is untouched.
+  REQUIRE(integrals.size() == 2u);
+  REQUIRE(integrals[0] == RI({1, 1}));
+  REQUIRE(integrals[1] == RI({1, 0}));
+  REQUIRE(slurp(path) == bytes);
+  std::filesystem::remove(path);
+}
+
+TEST(release_spill_tables_is_idempotent_and_safe_without_a_spill) {
+  ReductionContext ctx;
+  ctx.releaseSpillTables();
+  REQUIRE(ctx.spillCoeffs.empty());
+
+  const std::string path = "/tmp/secred_test_raw_eqs_release_twice.bin";
+  open_raw_spill(ctx, path);
+  GlobalEquation eq;
+  eq.emplace_back(RI({0, 1}), "3");
+  ctx.appendRawEquation(eq);
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);
+
+  ctx.releaseSpillTables();
+  ctx.releaseSpillTables();
+  REQUIRE(ctx.spillCoeffs.empty());
+  REQUIRE(ctx.spillCoeffIndex.empty());
+  REQUIRE(ctx.spillIntegralIndex.empty());
+  std::filesystem::remove(path);
+}
+
 // ---------------------------------------------------------------------------
 // ReductionContext::resetRunStatistics — a retry starts from zero
 // ---------------------------------------------------------------------------

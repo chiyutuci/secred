@@ -549,6 +549,7 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce,
 
   std::vector<RawIntegral> all_integrals;
   ctx.finishSpill(all_integrals);
+  ctx.releaseSpillTables();
 
   secred::order_global_integrals(all_integrals, _ordering_mode,
                                  &reduce._preferred);
