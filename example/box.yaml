@@ -1,0 +1,45 @@
+family:
+  name: box
+  dimension: d
+  internals: [ l1 ]
+  externals: [ p1, p2, p3 ]
+  invariants:
+    - [ s, 2 ]
+    - [ t, 2 ]
+    - [ m, 1 ]
+  sps_rules:
+    - [ p1, p1, m^2 ]
+    - [ p2, p2, m^2 ]
+    - [ p3, p3, m^2 ]
+    - [ p1, p2, t-m^2 ]
+    - [ p1, p3, s-m^2 ]
+    - [ p2, p3, -t-s-m^2 ]
+  propagators:
+    - [ l1, m ]
+    - [ l1+p1, 0 ]
+    - [ l1+p1+p2, m ]
+    - [ l1+p1+p2+p3, 0 ]
+  # cut: [0, 0, 0, 0]
+
+settings:
+  sthreads: 64                # worker threads for the sector-wise reduction (default: 64)
+  parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
+  # truncate: false           # seed truncation (Kira's truncate_sp), off by default; a probe_mode key
+  #                           # turns it on, and an explicit false force-overrides the probe (all + no
+  #                           # mandatory rows -- the pre-2026-10-17 walk)
+  # probe_mode: targets       # probe scope: targets (default) | all (all widens on every out-of-box
+  #                           # master and voids seed_level_offset)
+  subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
+  ordering_mode: balance      # integral ordering: normal (generation order) | balance (default;
+                              # seeds, subsector columns and the global numbering all follow the
+                              # balance key: total power, depth, rank, max denominator power,
+                              # max numerator power)
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
+  cache_dir: cache_box        # directory for the run's output (reductions, masters, logs)
+
+
+targets:
+  - [ 2, 2, 1, 1 ]
+  - [ 1, 2, 1, 1 ]
+  - [ 1, 1, 2, 1 ]
+  - [ 1, 1, -1, 2 ]
