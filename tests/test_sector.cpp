@@ -2549,3 +2549,47 @@ TEST(symmetry_seed_masters_is_empty_when_no_master_is_a_seed) {
   // Every entry at or above nvars: subsector integrals only.
   REQUIRE(symmetry_seed_masters({3u, 2u}, seeds, 2u).empty());
 }
+
+// ---------------------------------------------------------------------------
+// P0-1: a sector that gives up is a failed run, not a quiet short spill
+// ---------------------------------------------------------------------------
+
+// A refusal at the last probe round means the sector's seed box never covered
+// its reduction.  The context records that as a run failure, and the caller
+// checks it after the sector phase; the global stage must never read a spill
+// this sector silently left short.
+TEST(reduction_context_records_a_sector_give_up_as_a_run_failure) {
+  ReductionContext ctx;
+  REQUIRE(!ctx.hasFailed());
+  REQUIRE_NOTHROW(ctx.throwIfFailed());
+
+  ctx.noteSectorFailure(7u, kMaxRounds, "seed box still refuses masters");
+  REQUIRE(ctx.hasFailed());
+
+  bool threw = false;
+  try {
+    ctx.throwIfFailed();
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    const std::string message = e.what();
+    REQUIRE(message.find("sector 7") != std::string::npos);
+    REQUIRE(message.find("seed box still refuses masters") != std::string::npos);
+  }
+  REQUIRE(threw);
+}
+
+// Only the first failure is kept, so a later sector cannot overwrite the cause
+// while the workers drain.
+TEST(reduction_context_keeps_the_first_failure_message) {
+  ReductionContext ctx;
+  ctx.noteSectorFailure(3u, kMaxRounds, "first");
+  ctx.noteSectorFailure(4u, kMaxRounds, "second");
+  bool threw = false;
+  try {
+    ctx.throwIfFailed();
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("first") != std::string::npos);
+  }
+  REQUIRE(threw);
+}

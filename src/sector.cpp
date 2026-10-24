@@ -492,6 +492,12 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
       std::cerr << "warning: sector " << _id << ": still finds seeds outside the"
                 << " box after " << kMaxRounds << " passes (depth " << _bound.depth
                 << ", rank " << _bound.rank << ", total " << _bound.limit << ")\n";
+      ctx.noteSectorFailure(
+          _id, kMaxRounds,
+          "seed box still refuses masters (depth " +
+              std::to_string(_bound.depth) + ", rank " +
+              std::to_string(_bound.rank) + ", total " +
+              std::to_string(_bound.limit) + ")");
       break;
     }
     expanded = true;

@@ -23,6 +23,10 @@
 struct GlobalReductionResult {
   std::vector<RawIntegral> masters;
   std::vector<std::pair<RawIntegral, std::string>> reductions;
+  // Index in `reductions` of each target block's own `(target, "-1")` row.  The
+  // coefficient text is not a boundary marker: a master can also reduce to
+  // exactly "-1", so the writer must use these recorded starts.
+  std::vector<std::size_t> target_starts;
   std::uint64_t raw_equations = 0;
   std::uint64_t selected_equations = 0;
   bool ok = false;
@@ -31,6 +35,12 @@ struct GlobalReductionResult {
   double reconstruction_seconds = 0.0;
 
   bool reconstruction_skipped = false;
+
+  // Start one target block: its own row is the block's first row.
+  void add_target(const RawIntegral &target) {
+    target_starts.push_back(reductions.size());
+    reductions.emplace_back(target, std::string("-1"));
+  }
 };
 
 // Settled-basis check on a reconstructed master list.
@@ -126,6 +136,12 @@ inline void require_global_reduction(const GlobalReductionResult &result,
   if (!result.ok)
     throw std::runtime_error(tool + " global reduction did not complete cleanly");
 }
+
+// Write `reductions` in the README's block format.  The write goes to a
+// temporary file in the same directory and is renamed into place only after it
+// is complete and durable, so a failed run cannot leave a truncated result.
+void write_reductions_file(const std::string &path,
+                           const GlobalReductionResult &result);
 
 // Global reduction through FireFly.
 GlobalReductionResult reduce_global_firefly_symbolic(

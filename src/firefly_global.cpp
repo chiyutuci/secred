@@ -101,7 +101,7 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
 
   if (learn.dep_targets.empty() || nnindeps == 0) {
     for (const auto &t : targets)
-      res.reductions.emplace_back(t, std::string("-1"));
+      res.add_target(t);
     res.reconstruction_seconds = 0.0;
     res.ok = true;
     return res;
@@ -216,7 +216,7 @@ GlobalReductionResult secred::reduce_global_firefly_symbolic(
     for (unsigned i = 0; i < learn.dep_targets.size(); ++i)
       dep_index[learn.dep_targets[i]] = i;
     for (const auto &t : targets) {
-      res.reductions.emplace_back(t, std::string("-1"));
+      res.add_target(t);
       auto it = integral_id.find(t);
       if (it == integral_id.end())
         continue;

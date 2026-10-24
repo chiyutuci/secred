@@ -19,7 +19,9 @@
 #include <limits>
 #include <numeric>
 #include <sstream>
+#include <system_error>
 #include <unordered_map>
+#include <unordered_set>
 
 static constexpr const char *kPrimeSubs[] = {
     "2147483647", "2147483629", "2147483587", "2147483579",
@@ -32,6 +34,155 @@ static constexpr const char *kPrimeSubs[] = {
 constexpr unsigned kNumPrimeSubs = sizeof(kPrimeSubs) / sizeof(kPrimeSubs[0]);
 
 GiNaC::symtab Family::symtab;
+
+namespace secred {
+
+namespace {
+
+bool path_has_prefix(const std::filesystem::path &prefix,
+                     const std::filesystem::path &path) {
+  auto p = prefix.begin();
+  auto q = path.begin();
+  for (; p != prefix.end(); ++p, ++q) {
+    if (q == path.end() || *p != *q)
+      return false;
+  }
+  return true;
+}
+
+// A symlink on the way to the cache would redirect the recursive delete, so the
+// guard refuses such a path instead of resolving it.
+bool has_symlink_component(const std::filesystem::path &path) {
+  namespace fs = std::filesystem;
+  fs::path prefix = path.root_path();
+  const fs::path relative = path.relative_path();
+  for (const fs::path &part : relative) {
+    prefix /= part;
+    std::error_code ec;
+    const fs::file_status status = fs::symlink_status(prefix, ec);
+    if (ec) {
+      if (ec == std::errc::no_such_file_or_directory ||
+          ec == std::errc::not_a_directory)
+        return false;
+      throw std::runtime_error("cannot inspect the cache path " +
+                               prefix.string() + ": " + ec.message());
+    }
+    if (fs::is_symlink(status))
+      return true;
+  }
+  return false;
+}
+
+// Names SecRed itself writes at the top of a cache.  An unmarked directory made
+// only of these is a 1.0 cache and is adopted; anything else is refused.
+bool is_known_cache_entry(const std::string &name) {
+  static const std::unordered_set<std::string> known{
+      kCacheMarkerFile, "firefly.log", "masters_global", "masters_sector",
+      "raw_equations",  "reductions",  "secred.log",     "sectors"};
+  return known.contains(name);
+}
+
+} // namespace
+
+std::filesystem::path prepare_cache_directory(const std::string &cache_dir) {
+  namespace fs = std::filesystem;
+
+  if (cache_dir.empty())
+    throw std::runtime_error("refusing an empty cache directory");
+
+  std::error_code ec;
+  fs::path path = fs::absolute(fs::path(cache_dir), ec);
+  if (ec)
+    throw std::runtime_error("cannot resolve the cache directory \"" + cache_dir +
+                             "\": " + ec.message());
+  path = path.lexically_normal();
+  if (path.empty() || path == path.root_path())
+    throw std::runtime_error(
+        "refusing the filesystem root as a cache directory");
+
+  if (has_symlink_component(path))
+    throw std::runtime_error(
+        "refusing a cache directory reached through a symlink: " +
+        path.string());
+
+  const fs::path resolved = fs::weakly_canonical(path, ec);
+  if (ec)
+    throw std::runtime_error("cannot resolve the cache directory \"" + cache_dir +
+                             "\": " + ec.message());
+
+  const fs::path cwd = fs::weakly_canonical(fs::current_path(), ec);
+  if (ec)
+    throw std::runtime_error("cannot resolve the current directory: " +
+                             ec.message());
+  if (resolved == cwd || path_has_prefix(resolved, cwd))
+    throw std::runtime_error(
+        "refusing a cache directory that is the current directory or one of "
+        "its ancestors: " +
+        resolved.string());
+
+  if (const char *home = std::getenv("HOME"); home && *home) {
+    std::error_code home_ec;
+    const fs::path home_path = fs::weakly_canonical(fs::path(home), home_ec);
+    if (!home_ec && home_path != home_path.root_path() &&
+        (resolved == home_path || path_has_prefix(resolved, home_path)))
+      throw std::runtime_error(
+          "refusing a cache directory that is the home directory or one of its "
+          "ancestors: " +
+          resolved.string());
+  }
+
+  ec.clear();
+  const fs::file_status status = fs::symlink_status(resolved, ec);
+  if (ec && ec != std::errc::no_such_file_or_directory)
+    throw std::runtime_error("cannot inspect the cache directory \"" +
+                             resolved.string() + "\": " + ec.message());
+  const bool exists = !ec && status.type() != fs::file_type::not_found;
+
+  if (exists) {
+    if (!fs::is_directory(status))
+      throw std::runtime_error(
+          "refusing a cache path that is not a directory: " +
+          resolved.string());
+
+    std::error_code marker_ec;
+    const bool marked =
+        fs::is_regular_file(fs::symlink_status(resolved / kCacheMarkerFile,
+                                               marker_ec));
+    if (!marked) {
+      fs::directory_iterator it(resolved, ec);
+      if (ec)
+        throw std::runtime_error("cannot list the cache directory \"" +
+                                 resolved.string() + "\": " + ec.message());
+      for (const fs::directory_entry &entry : it) {
+        const std::string name = entry.path().filename().string();
+        if (!is_known_cache_entry(name))
+          throw std::runtime_error(
+              "refusing to clear the cache directory \"" + resolved.string() +
+              "\": unexpected entry \"" + name + "\"");
+      }
+    }
+
+    fs::remove_all(resolved, ec);
+    if (ec)
+      throw std::runtime_error("cannot clear the cache directory \"" +
+                               resolved.string() + "\": " + ec.message());
+  }
+
+  fs::create_directories(resolved, ec);
+  if (ec && !fs::is_directory(resolved))
+    throw std::runtime_error("cannot create the cache directory \"" +
+                             resolved.string() + "\": " + ec.message());
+
+  std::ofstream marker(resolved / kCacheMarkerFile, std::ios::trunc);
+  marker << "secred cache directory\n";
+  marker.flush();
+  if (!marker)
+    throw std::runtime_error("cannot write the cache marker in \"" +
+                             resolved.string() + "\"");
+  return resolved;
+}
+
+} // namespace secred
 
 // Run repeated sector passes until the seed basis settles, then the global stage.
 void Family::run_reduce(Reduce &reduce) {
@@ -65,6 +216,10 @@ void Family::run_reduce(Reduce &reduce) {
       _run_reduce_fine(reduce);
     else
       _run_reduce_layer(reduce);
+    // A sector that exhausted its probe rounds left its part of the spill
+    // short.  The workers only recorded it; fail here, after every worker has
+    // joined and before any global stage can read the incomplete system.
+    reduce._ctx.throwIfFailed();
     const auto sector_t1 = std::chrono::steady_clock::now();
     const double passSectorSeconds =
         std::chrono::duration<double>(sector_t1 - sector_t0).count();
@@ -440,20 +595,8 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce,
 
     secred::require_global_reduction(result, tool);
 
-    if (!result.reconstruction_skipped) {
-      std::ofstream of(_cache_dir + "/reductions");
-      bool first = true;
-      for (const auto &[integ, coeff] : result.reductions) {
-        if (coeff == "-1") {
-          if (!first)
-            of << "\n";
-          of << integ << "*(-1)\n";
-          first = false;
-        } else {
-          of << integ << "*(" << coeff << ")\n";
-        }
-      }
-    }
+    if (!result.reconstruction_skipped)
+      secred::write_reductions_file(_cache_dir + "/reductions", result);
   }
   return result;
 }
@@ -672,10 +815,7 @@ Family::Family(const YAML::Node &config) {
 void Family::init() {
   std::cout << "\n #0.1   Initializing integral family...\n";
 
-  namespace fs = std::filesystem;
-  if (fs::exists(_cache_dir))
-    fs::remove_all(_cache_dir);
-  fs::create_directories(_cache_dir);
+  secred::prepare_cache_directory(_cache_dir);
 
   _compute_sps();
   _compute_symanzik();

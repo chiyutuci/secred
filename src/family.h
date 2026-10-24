@@ -1,5 +1,6 @@
 #pragma once
 
+#include <filesystem>
 #include <iostream>
 #include <ranges>
 #include <string>
@@ -18,6 +19,22 @@
 // engine (FiniteFlowSymbolic) is no longer selected by any symbol count; its
 // branch and unit tests stay, and reduce_global_finiteflow_symbolic is still
 // callable directly.
+namespace secred {
+
+// The marker a directory acquires once SecRed has created it as a cache.  It
+// lets a later run tell its own directory from an arbitrary path it must not
+// recursively delete.
+inline constexpr const char *kCacheMarkerFile = ".secred_cache";
+
+// Validate, clear and create the run's cache directory.  Refuses the root, the
+// current working directory, symlinks, ancestors of the working directory or
+// the home directory, and directories whose entries are not SecRed's own.  A
+// directory without the marker is adopted only when every entry is a known
+// cache artifact, so existing 1.0 caches keep working.
+std::filesystem::path prepare_cache_directory(const std::string &cache_dir);
+
+} // namespace secred
+
 enum class GlobalEngine { FiniteFlowNumeric, FiniteFlowSymbolic, FireFlySymbolic };
 
 inline GlobalEngine global_engine_for(std::size_t nsymbols) {

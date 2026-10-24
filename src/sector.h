@@ -372,6 +372,33 @@ struct ReductionContext {
   std::atomic<std::size_t> globalEquationsCount{0};
   std::mutex globalEqMutex;
 
+  // A sector that exhausts its probe rounds has not covered its reduction; its
+  // equations are therefore absent from the spill.  The first such failure is
+  // recorded here and checked after the sector phase, so the global stage never
+  // reads a silently short system.
+  std::atomic<bool> failed{false};
+  mutable std::mutex failureMutex;
+  std::string failureMessage;
+
+  void noteSectorFailure(unsigned sector, unsigned round,
+                         const std::string &detail) {
+    std::lock_guard<std::mutex> lock(failureMutex);
+    if (failed.load(std::memory_order_relaxed))
+      return;
+    failureMessage = "sector " + std::to_string(sector) + ": " + detail +
+                     " (after " + std::to_string(round) + " probe round(s))";
+    failed.store(true, std::memory_order_release);
+  }
+
+  bool hasFailed() const { return failed.load(std::memory_order_acquire); }
+
+  void throwIfFailed() const {
+    if (!failed.load(std::memory_order_acquire))
+      return;
+    std::lock_guard<std::mutex> lock(failureMutex);
+    throw std::runtime_error(failureMessage);
+  }
+
   // Start a new spilled equation system.
   void openSpill() {
     if (rawEquationsPath.empty())

@@ -6,6 +6,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <gmp.h>
@@ -19,6 +20,8 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include <unistd.h>
 
 #include <fflow/alg_mp_reconstruction.hh>
 #include <fflow/common.hh>
@@ -178,6 +181,71 @@ void NumericEvalPlan::fill_values(std::uint64_t p,
 }
 
 namespace secred {
+
+void write_reductions_file(const std::string &path,
+                           const GlobalReductionResult &result) {
+  const auto &rows = result.reductions;
+  const auto &starts = result.target_starts;
+  if (starts.empty()) {
+    if (!rows.empty())
+      throw std::runtime_error("invalid reduction result: rows exist but no "
+                               "target block boundaries were recorded");
+  } else {
+    if (starts.front() != 0)
+      throw std::runtime_error("invalid reduction result: the first target "
+                               "block boundary is not row 0");
+    for (std::size_t i = 0; i < starts.size(); ++i) {
+      if (starts[i] >= rows.size())
+        throw std::runtime_error("invalid reduction result: a target block "
+                                 "boundary is past the rows");
+      if (i != 0 && starts[i] <= starts[i - 1])
+        throw std::runtime_error("invalid reduction result: target block "
+                                 "boundaries are not increasing");
+    }
+  }
+
+  const std::filesystem::path destination(path);
+  const std::filesystem::path temporary =
+      destination.string() + ".tmp." + std::to_string(::getpid());
+  std::error_code ec;
+
+  {
+    std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+    if (!out)
+      throw std::runtime_error("cannot open the reductions temporary file " +
+                               temporary.string());
+    for (std::size_t block = 0; block < starts.size(); ++block) {
+      if (block != 0)
+        out << '\n';
+      const std::size_t end =
+          block + 1 < starts.size() ? starts[block + 1] : rows.size();
+      for (std::size_t i = starts[block]; i < end; ++i)
+        out << rows[i].first << "*(" << rows[i].second << ")\n";
+    }
+    out.flush();
+    if (!out) {
+      out.close();
+      std::filesystem::remove(temporary, ec);
+      throw std::runtime_error("cannot write the reductions file " + path);
+    }
+    out.close();
+    if (!out) {
+      std::filesystem::remove(temporary, ec);
+      throw std::runtime_error("cannot close the reductions file " + path);
+    }
+  }
+
+  // The rename below publishes the complete file atomically, so a reader never
+  // sees a partial block.  It deliberately does not fsync: durability across a
+  // power loss is not part of the reduction contract, and an fsync of even a
+  // small reductions file costs more than the rest of a short run's I/O.
+  std::filesystem::rename(temporary, destination, ec);
+  if (ec) {
+    std::filesystem::remove(temporary, ec);
+    throw std::runtime_error("cannot replace the reductions file " + path +
+                             ": " + ec.message());
+  }
+}
 
 void solve_subset_planned(const std::vector<Eq> &system,
                           const std::vector<std::uint32_t> &eq_idx, std::uint64_t p,
@@ -841,7 +909,7 @@ GlobalReductionResult reduce_global_finiteflow(
     dep_index[dep_targets[i]] = i;
 
   for (const auto &t : targets) {
-    res.reductions.emplace_back(t, std::string("-1"));
+    res.add_target(t);
     auto it = integral_id.find(t);
     if (it == integral_id.end())
       continue;
@@ -1687,7 +1755,7 @@ GlobalReductionResult reduce_global_finiteflow_symbolic(
     dep_index[learn.dep_targets[i]] = i;
 
   for (const auto &t : targets) {
-    res.reductions.emplace_back(t, std::string("-1"));
+    res.add_target(t);
     auto it = integral_id.find(t);
     if (it == integral_id.end())
       continue;

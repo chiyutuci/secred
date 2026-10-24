@@ -2,6 +2,8 @@
 #include "family.h"
 #include "row_coeff.h"
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <sstream>
 
 // ---------------------------------------------------------------------------
@@ -1529,4 +1531,150 @@ TEST(row_coeff_precompiles_real_box_ibp_rows) {
   REQUIRE_EQ(table.fast_rows, checked);
   REQUIRE_EQ(table.slow_rows, 0u);
   std::filesystem::remove_all("tc_row_coeff_box");
+}
+
+// ---------------------------------------------------------------------------
+// P0-1: the cache directory guard (C5) and the reductions writer (C7)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::string slurp_text(const std::filesystem::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  return std::string(std::istreambuf_iterator<char>(in),
+                     std::istreambuf_iterator<char>());
+}
+
+void write_text(const std::filesystem::path &path, const std::string &text) {
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  out << text;
+}
+
+} // namespace
+
+// A directory that is not a SecRed cache must not be recursively deleted: an
+// accidental `cache_dir: $HOME` (or a source tree) would otherwise be lost on
+// startup.  The guard refuses it and leaves every byte in place.
+TEST(cache_directory_guard_refuses_unknown_entries) {
+  const std::filesystem::path dir = "/tmp/secred_cache_guard_unknown";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir);
+  write_text(dir / "keep.txt", "keep me");
+  bool threw = false;
+  try {
+    secred::prepare_cache_directory(dir.string());
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("refus") != std::string::npos);
+  }
+  REQUIRE(threw);
+  REQUIRE_EQ(slurp_text(dir / "keep.txt"), std::string("keep me"));
+  std::filesystem::remove_all(dir);
+}
+
+// The root, the current directory and a symlink are never cache directories.
+TEST(cache_directory_guard_refuses_root_cwd_and_symlinks) {
+  const auto refused = [](const std::string &path) {
+    try {
+      secred::prepare_cache_directory(path);
+    } catch (const std::runtime_error &e) {
+      return std::string(e.what()).find("refus") != std::string::npos;
+    }
+    return false;
+  };
+  REQUIRE(refused("/"));
+  REQUIRE(refused("."));
+
+  const std::filesystem::path target = "/tmp/secred_cache_guard_symlink_target";
+  const std::filesystem::path link = "/tmp/secred_cache_guard_symlink";
+  std::filesystem::remove_all(target);
+  std::filesystem::remove(link);
+  std::filesystem::create_directories(target);
+  write_text(target / "keep.txt", "keep me");
+  std::filesystem::create_directory_symlink(target, link);
+  REQUIRE(refused(link.string()));
+  REQUIRE_EQ(slurp_text(target / "keep.txt"), std::string("keep me"));
+  std::filesystem::remove(link);
+  std::filesystem::remove_all(target);
+}
+
+// A fresh cache is created and marked; a marked cache may be reused and cleared.
+TEST(cache_directory_guard_owns_and_cleans_its_cache) {
+  const std::filesystem::path dir = "/tmp/secred_cache_guard_owned";
+  std::filesystem::remove_all(dir);
+  secred::prepare_cache_directory(dir.string());
+  REQUIRE(std::filesystem::is_directory(dir));
+  REQUIRE(std::filesystem::exists(dir / secred::kCacheMarkerFile));
+  write_text(dir / "reductions", "old\n");
+  secred::prepare_cache_directory(dir.string());
+  REQUIRE(!std::filesystem::exists(dir / "reductions"));
+  REQUIRE(std::filesystem::exists(dir / secred::kCacheMarkerFile));
+  std::filesystem::remove_all(dir);
+}
+
+// Caches written by 1.0 have no marker; their contents are all known artifacts,
+// so they are adopted instead of forcing the user to delete them by hand.
+TEST(cache_directory_guard_adopts_a_legacy_cache_of_known_files) {
+  const std::filesystem::path dir = "/tmp/secred_cache_guard_legacy";
+  std::filesystem::remove_all(dir);
+  std::filesystem::create_directories(dir / "sectors");
+  write_text(dir / "reductions", "old\n");
+  write_text(dir / "secred.log", "old\n");
+  secred::prepare_cache_directory(dir.string());
+  REQUIRE(!std::filesystem::exists(dir / "reductions"));
+  REQUIRE(std::filesystem::exists(dir / secred::kCacheMarkerFile));
+  std::filesystem::remove_all(dir);
+}
+
+// C7's exact failure: a master coefficient may print as "-1", which is also
+// the text of a target's own row.  The writer must use the recorded target
+// boundaries, not the coefficient text, so this file has two blocks and no
+// spurious blank line before the first master.
+TEST(reductions_writer_uses_target_boundaries_not_the_coefficient_text) {
+  const std::filesystem::path path = "/tmp/secred_reductions_writer_test";
+  std::filesystem::remove(path);
+
+  GlobalReductionResult result;
+  result.add_target(RIf({2, 1}));
+  result.reductions.emplace_back(RIf({1, 0}), std::string("-1"));
+  result.reductions.emplace_back(RIf({0, 1}), std::string("3/2"));
+  result.add_target(RIf({1, 2}));
+  result.reductions.emplace_back(RIf({1, 0}), std::string("-1"));
+
+  REQUIRE_EQ(result.target_starts.size(), std::size_t(2));
+  REQUIRE_EQ(result.target_starts[0], std::size_t(0));
+  REQUIRE_EQ(result.target_starts[1], std::size_t(3));
+
+  secred::write_reductions_file(path.string(), result);
+  REQUIRE_EQ(slurp_text(path),
+             std::string("[2, 1]*(-1)\n"
+                         "[1, 0]*(-1)\n"
+                         "[0, 1]*(3/2)\n"
+                         "\n"
+                         "[1, 2]*(-1)\n"
+                         "[1, 0]*(-1)\n"));
+  std::filesystem::remove(path);
+}
+
+// A malformed result is refused before the destination is touched: the old
+// reductions file survives a failed write.
+TEST(reductions_writer_keeps_the_old_file_when_the_result_is_invalid) {
+  const std::filesystem::path path = "/tmp/secred_reductions_writer_atomic";
+  std::filesystem::remove(path);
+  write_text(path, "previous\n");
+
+  GlobalReductionResult result;
+  result.target_starts.push_back(1); // no row at index 0: invalid boundary
+  result.reductions.emplace_back(RIf({1, 1}), std::string("-1"));
+
+  bool threw = false;
+  try {
+    secred::write_reductions_file(path.string(), result);
+  } catch (const std::runtime_error &e) {
+    threw = true;
+    REQUIRE(std::string(e.what()).find("boundar") != std::string::npos);
+  }
+  REQUIRE(threw);
+  REQUIRE_EQ(slurp_text(path), std::string("previous\n"));
+  std::filesystem::remove(path);
 }
