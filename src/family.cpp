@@ -602,6 +602,20 @@ GlobalReductionResult Family::_run_global_reduction(Reduce &reduce,
   return result;
 }
 
+// Collect the distinct free symbols of an expression, in the order they first
+// appear.  Only symbols are collected: constants such as Pi are not parameters.
+static void collect_symbol_names(const GiNaC::ex &e,
+                                 std::vector<std::string> &names) {
+  if (GiNaC::is_a<GiNaC::symbol>(e)) {
+    const std::string name = GiNaC::ex_to<GiNaC::symbol>(e).get_name();
+    if (std::find(names.begin(), names.end(), name) == names.end())
+      names.push_back(name);
+    return;
+  }
+  for (std::size_t i = 0; i < e.nops(); ++i)
+    collect_symbol_names(e.op(i), names);
+}
+
 // Read the input node into the family settings.
 Family::Family(const YAML::Node &config) {
   if (!config["family"])
@@ -621,27 +635,43 @@ Family::Family(const YAML::Node &config) {
 
   _name = familyConfig["name"].as<std::string>();
 
-  // The dimension is either a fixed rational space-time dimension or one
-  // symbolic parameter.  Anything else (an expression such as 4-2*eps, or a
-  // float) cannot be carried by the reduction; it used to be replaced by `d`
-  // silently, so the run used a dimension the config never named.
+  // The dimension may be a rational number or an expression in one symbol
+  // (d = 4-2*eps).  The expression's symbol becomes a symbolic parameter, like
+  // an invariant: the numeric path substitutes a prime for it and the symbolic
+  // path reconstructs the dependence.  More than one symbol has no meaning.
   if (familyConfig["dimension"]) {
     const std::string text = familyConfig["dimension"].as<std::string>();
     GiNaC::parser parser;
-    _dimension = parser(text);
-    if (GiNaC::is_a<GiNaC::numeric>(_dimension)) {
-      if (!_dimension.info(GiNaC::info_flags::rational))
+    const GiNaC::ex parsed = parser(text);
+    std::vector<std::string> names;
+    collect_symbol_names(parsed, names);
+    if (names.empty()) {
+      if (!GiNaC::is_a<GiNaC::numeric>(parsed) ||
+          !parsed.info(GiNaC::info_flags::rational))
         throw std::runtime_error(
-            "dimension must be a rational number or a single symbol: " + text);
-    } else if (GiNaC::is_a<GiNaC::symbol>(_dimension)) {
-      const std::string name =
-          GiNaC::ex_to<GiNaC::symbol>(_dimension).get_name();
-      _symbols.emplace_back(name);
-      _dimension = _symbols.back();
-      symtab[name] = _dimension;
+            "dimension must be a rational number or an expression in one "
+            "symbol: " + text);
+      _dimension = parsed;
+    } else if (names.size() == 1) {
+      if (symtab.contains(names[0]))
+        throw std::runtime_error("symbol " + names[0] +
+                                 " defined more than once");
+      _symbols.emplace_back(names[0]);
+      symtab[names[0]] = _symbols.back();
+      // Re-read through the table so the expression uses the registered
+      // possymbol, not the plain symbol the default parser made.
+      GiNaC::parser reader(symtab);
+      _dimension = reader(text);
     } else {
+      std::string list;
+      for (std::size_t i = 0; i < names.size(); ++i) {
+        if (i)
+          list += ", ";
+        list += names[i];
+      }
       throw std::runtime_error(
-          "dimension must be a rational number or a single symbol: " + text);
+          "dimension must be a rational number or an expression in one "
+          "symbol: " + text + " (symbols: " + list + ")");
     }
   } else {
     _dimension = GiNaC::possymbol("d");
