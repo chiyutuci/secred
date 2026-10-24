@@ -164,6 +164,73 @@ void NumericEvalPlan::build(const std::vector<secred::Eq> &system,
   secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
 }
 
+void NumericEvalPlan::select_rows(const std::vector<std::uint32_t> &keep) {
+  std::vector<std::uint32_t> new_eq_begin;
+  new_eq_begin.reserve(keep.size() + 1);
+  new_eq_begin.push_back(0);
+  // Fresh slot numbering in first-use order reproduces the slot layout a
+  // build() over the kept rows would produce, so the plan stays canonical.
+  std::vector<secred::Rat64> new_coeffs;
+  std::unordered_map<std::uint32_t, std::uint32_t> slot_map;
+  std::size_t write = 0;
+  std::uint32_t max_id = 0;
+  for (std::uint32_t row : keep) {
+    for (std::size_t t = eq_begin[row]; t < eq_begin[row + 1]; ++t) {
+      const std::pair<std::uint32_t, std::uint32_t> term = terms[t];
+      auto it = slot_map.find(term.second);
+      std::uint32_t slot;
+      if (it == slot_map.end()) {
+        slot = static_cast<std::uint32_t>(new_coeffs.size());
+        new_coeffs.push_back(coeffs[term.second]);
+        slot_map.emplace(term.second, slot);
+      } else {
+        slot = it->second;
+      }
+      terms[write++] = {term.first, slot};
+      if (term.first > max_id)
+        max_id = term.first;
+    }
+    new_eq_begin.push_back(static_cast<std::uint32_t>(write));
+  }
+  terms.resize(write);
+  coeffs = std::move(new_coeffs);
+  eq_begin = std::move(new_eq_begin);
+  // `keep` is ascending, so every source row lies at or past its destination
+  // row and the forward copy never overwrites a row still to be read.
+  for (std::size_t r = 0; r < keep.size(); ++r)
+    sys_idx[r] = sys_idx[keep[r]];
+  sys_idx.resize(keep.size());
+  store_ids = static_cast<std::size_t>(max_id) + 1;
+
+  secred::build_fwd_plan(terms, eq_begin, sys_idx, plan);
+}
+
+NumericEvalPlan NumericEvalPlan::subset(
+    const std::vector<std::uint32_t> &eq_idx) const {
+  NumericEvalPlan out;
+  out.coeffs = coeffs;
+  out.sys_idx = eq_idx;
+  std::size_t n_terms = 0;
+  for (std::uint32_t i : eq_idx)
+    n_terms += eq_begin[i + 1] - eq_begin[i];
+  out.terms.reserve(n_terms);
+  out.eq_begin.reserve(eq_idx.size() + 1);
+  out.eq_begin.push_back(0);
+  std::uint32_t max_id = 0;
+  for (std::uint32_t i : eq_idx) {
+    for (std::size_t t = eq_begin[i]; t < eq_begin[i + 1]; ++t) {
+      out.terms.push_back(terms[t]);
+      if (terms[t].first > max_id)
+        max_id = terms[t].first;
+    }
+    out.eq_begin.push_back(static_cast<std::uint32_t>(out.terms.size()));
+  }
+  out.store_ids = static_cast<std::size_t>(max_id) + 1;
+
+  secred::build_fwd_plan(out.terms, out.eq_begin, out.sys_idx, out.plan);
+  return out;
+}
+
 secred::SymRowTable NumericEvalPlan::rows() const {
   secred::SymRowTable t;
   t.terms = terms.data();
@@ -253,15 +320,25 @@ void solve_subset_planned(const std::vector<Eq> &system,
                           const std::vector<std::uint32_t> *only_keys,
                           const std::vector<std::uint32_t> *solmap_keys,
                           FwdStats *fwd_stats) {
+  NumericEvalPlan plan;
+  plan.build(system, eq_idx);
+  std::vector<std::uint64_t> values;
+  plan.fill_values(p, values);
+  solve_plan(plan, values, p, out, want_fwd, want_bwd, only_keys, solmap_keys,
+             fwd_stats);
+}
+
+void solve_plan(const NumericEvalPlan &plan,
+                const std::vector<std::uint64_t> &values, std::uint64_t p,
+                SubSolve &out, bool want_fwd, bool want_bwd,
+                const std::vector<std::uint32_t> *only_keys,
+                const std::vector<std::uint32_t> *solmap_keys,
+                FwdStats *fwd_stats) {
   out.solmap.clear();
   out.eq_index.clear();
   out.fwd_deps.clear();
   out.bwd_deps.clear();
 
-  NumericEvalPlan plan;
-  plan.build(system, eq_idx);
-  std::vector<std::uint64_t> values;
-  plan.fill_values(p, values);
   FwdStore store;
   store.reset(plan.store_ids);
   std::vector<std::uint32_t> row_src;
@@ -627,17 +704,17 @@ GlobalReductionResult reduce_global_finiteflow(
   const auto t0 = std::chrono::steady_clock::now();
   std::cout << "\n  " << secred::kFlowTag << " reading spill file, building system...\n";
 
-  std::vector<secred::Eq> system;
+  NumericEvalPlan plan;
   secred::SpillReadStats stats;
   std::string read_error;
-  if (!secred::read_spill_numeric(raw_equations_path, integral_id, system, stats,
-                                  read_error)) {
+  if (!secred::read_spill_numeric_plan(raw_equations_path, integral_id, plan, stats,
+                                       read_error)) {
     std::cerr << "finiteflow global reduction: " << read_error << "\n";
     res.ok = false;
     return res;
   }
 
-  const unsigned neqs = system.size();
+  const std::size_t neqs = plan.n_rows();
   if (neqs == 0) {
     std::cerr << "finiteflow global reduction: empty system\n";
     return res;
@@ -671,14 +748,12 @@ GlobalReductionResult reduce_global_finiteflow(
   secred::SubSolve learn;
   secred::FwdStats learn_stats;
   double learn_s = 0.0;
+  std::vector<std::uint64_t> learn_values;
   {
     auto t_learn0 = std::chrono::steady_clock::now();
-    std::vector<uint32_t> all_eq_idx;
-    all_eq_idx.reserve(neqs);
-    for (std::size_t i = 0; i < system.size(); ++i)
-      all_eq_idx.push_back(static_cast<uint32_t>(i));
-    secred::solve_subset_planned(system, all_eq_idx, learn_prime, learn, true, true,
-                                 nullptr, nullptr, &learn_stats);
+    plan.fill_values(learn_prime, learn_values);
+    secred::solve_plan(plan, learn_values, learn_prime, learn, true, true, nullptr,
+                       nullptr, &learn_stats);
     auto t_learn1 = std::chrono::steady_clock::now();
     learn_s = std::chrono::duration<double>(t_learn1 - t_learn0).count();
   }
@@ -740,19 +815,24 @@ GlobalReductionResult reduce_global_finiteflow(
   const std::unordered_set<uint32_t> needed_fwd = sweep(false);
 
   if (neqs <= 1000) {
+    auto row_front = [&](std::size_t row) {
+      return plan.eq_begin[row] == plan.eq_begin[row + 1]
+                 ? 0u
+                 : plan.terms[plan.eq_begin[row]].first;
+    };
     std::cerr << "\n===== RAW equations (" << neqs << ") =====\n";
-    for (std::size_t i = 0; i < system.size(); ++i) {
-      std::cerr << "eq[" << i << "] front=" << system[i].front().first
-                << " :";
-      for (const auto &t : system[i])
-        std::cerr << " " << t.first << "(" << secred::rat_text(t.second) << ")";
+    for (std::size_t i = 0; i < plan.n_rows(); ++i) {
+      std::cerr << "eq[" << i << "] front=" << row_front(i) << " :";
+      for (std::size_t t = plan.eq_begin[i]; t < plan.eq_begin[i + 1]; ++t)
+        std::cerr << " " << plan.terms[t].first << "("
+                  << secred::rat_text(plan.coeffs[plan.terms[t].second]) << ")";
       std::cerr << "\n";
     }
     std::cerr << "\n===== forward reductions =====\n";
     for (const auto &kv : eq_index) {
       uint32_t w = kv.first, i = kv.second;
-      std::cerr << "pivot " << w << " (eq " << i << ", raw front "
-                << system[i].front().first << "):";
+      std::cerr << "pivot " << w << " (eq " << i << ", raw front " << row_front(i)
+                << "):";
       if (fwd_deps.count(w))
         for (uint32_t u : fwd_deps.at(w))
           std::cerr << " dep" << u;
@@ -794,9 +874,9 @@ GlobalReductionResult reduce_global_finiteflow(
   {
     auto solve_at_learn = [&](const std::vector<uint32_t> &idx,
                               secred::SubSolve &sub) {
-
-      secred::solve_subset_planned(system, idx, learn_prime, sub, false, true, nullptr,
-                                   &dep_targets);
+      const NumericEvalPlan sub_plan = plan.subset(idx);
+      secred::solve_plan(sub_plan, learn_values, learn_prime, sub, false, true,
+                         nullptr, &dep_targets);
     };
     GlobalSelection gsel =
         select_global_forward(eq_index, fwd_deps, bwd_deps, learn_solmap, dep_targets,
@@ -890,8 +970,7 @@ GlobalReductionResult reduce_global_finiteflow(
   const auto t2 = std::chrono::steady_clock::now();
 
   const auto tplan0 = std::chrono::steady_clock::now();
-  NumericEvalPlan plan;
-  plan.build(system, needed_eq_idx);
+  plan.select_rows(needed_eq_idx);
   const auto tplan1 = std::chrono::steady_clock::now();
   std::cout << "  " << secred::kFlowTag << " reconstruction plan: " << plan.n_rows()
             << " rows, " << plan.terms.size() << " terms, " << plan.n_slots()
@@ -901,7 +980,6 @@ GlobalReductionResult reduce_global_finiteflow(
             << ")\n"
             << std::flush;
 
-  std::vector<secred::Eq>().swap(system);
   bool ok = reconstruct_ffred(plan, bwd_chain, dep_targets, masters,
                               master_index, nthreads, max_primes, max_memory,
                               memory_reserve, resmp.get(), &elim_seconds);

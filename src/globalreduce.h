@@ -58,6 +58,18 @@ struct NumericEvalPlan {
   void build(const std::vector<secred::Eq> &system,
              const std::vector<std::uint32_t> &eq_idx);
 
+  // Compact the plan to the rows in `keep` (ascending, unique, in range),
+  // keeping the referenced coefficient values (renumbered in first-use order),
+  // then rebuild the elimination plan.  This is how the numeric driver drops
+  // the equations its selection did not need without keeping a second copy of
+  // the table alive.
+  void select_rows(const std::vector<std::uint32_t> &keep);
+
+  // Row-subset view of this plan.  The terms keep this plan's coefficient
+  // slots, so a caller must evaluate fill_values() on the full plan once and
+  // pass those residues to solve_plan().
+  NumericEvalPlan subset(const std::vector<std::uint32_t> &eq_idx) const;
+
   std::size_t n_rows() const { return sys_idx.size(); }
   std::size_t n_slots() const { return coeffs.size(); }
 
@@ -130,6 +142,16 @@ void solve_subset_planned(const std::vector<Eq> &system,
                           const std::vector<std::uint32_t> *only_keys = nullptr,
                           const std::vector<std::uint32_t> *solmap_keys = nullptr,
                           FwdStats *fwd_stats = nullptr);
+
+// Solve a prebuilt plan from coefficient residues already in the field.
+// `values` is the full plan's fill_values() output; a subset() keeps the same
+// slots, so the same residues serve it.
+void solve_plan(const NumericEvalPlan &plan,
+                const std::vector<std::uint64_t> &values, std::uint64_t p,
+                SubSolve &out, bool want_fwd, bool want_bwd,
+                const std::vector<std::uint32_t> *only_keys = nullptr,
+                const std::vector<std::uint32_t> *solmap_keys = nullptr,
+                FwdStats *fwd_stats = nullptr);
 
 inline void require_global_reduction(const GlobalReductionResult &result,
                                      const std::string &tool) {

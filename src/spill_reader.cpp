@@ -1,4 +1,5 @@
 #include "spill_reader.h"
+#include "globalreduce.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -514,6 +515,94 @@ struct NumericSink {
   }
 };
 
+struct PlanRatHash {
+  std::size_t operator()(const Rat64 &r) const {
+    std::uint64_t h = static_cast<std::uint64_t>(r.num);
+    h ^= static_cast<std::uint64_t>(r.den) + 0x9e3779b97f4a7c15ull + (h << 6) +
+         (h >> 2);
+    return static_cast<std::size_t>(h);
+  }
+};
+
+struct PlanRatEq {
+  bool operator()(const Rat64 &a, const Rat64 &b) const {
+    return a.num == b.num && a.den == b.den;
+  }
+};
+
+// Stream a numeric spill straight into a reconstruction plan.  The term layout
+// and the coefficient slots this leaves behind are the ones NumericEvalPlan::
+// build() would produce from the materialised Eq system, so the numeric driver
+// never has to hold the system at all.
+struct PlanSink {
+  static constexpr std::size_t kMaxCachedCoeffs = NumericSink::kMaxCachedCoeffs;
+
+  NumericEvalPlan &plan;
+  SpillReadStats &stats;
+  std::string &error;
+  std::vector<std::pair<unsigned, Rat64>> eq;
+  // Parse cache indexed by the spill file's coefficient index; den == -1 marks
+  // an entry no term has parsed yet.  Gated exactly like NumericSink's.
+  std::vector<Rat64> coeff_cache;
+  std::unordered_map<Rat64, std::uint32_t, PlanRatHash, PlanRatEq> slot_of;
+  std::uint32_t max_id = 0;
+
+  void begin_coeff_table(std::size_t n_coeff, std::uint64_t n_terms) {
+    if (n_coeff == 0 || n_coeff > kMaxCachedCoeffs || n_terms < 2 * n_coeff)
+      return;
+    coeff_cache.assign(n_coeff, Rat64{0, -1});
+  }
+
+  bool term(unsigned id, const char *b, const char *e) {
+    int64_t num = 0, den = 1;
+    if (!parse_coefficient(b, e, num, den, stats, error))
+      return false;
+    eq.emplace_back(id, Rat64{num, den});
+    return true;
+  }
+
+  bool term_indexed(unsigned id, std::uint32_t coeff_i, const char *b,
+                    const char *e) {
+    if (coeff_i >= coeff_cache.size())
+      return term(id, b, e);
+    Rat64 &entry = coeff_cache[coeff_i];
+    if (entry.den == -1 && !parse_coefficient(b, e, entry.num, entry.den, stats, error))
+      return false;
+    eq.emplace_back(id, entry);
+    return true;
+  }
+
+  void end_equation() {
+    if (eq.empty())
+      return;
+    std::sort(eq.begin(), eq.end(),
+              [](const auto &a, const auto &b) { return a.first > b.first; });
+    for (const auto &t : eq) {
+      // Zero coefficients are dropped here, as build() drops them; the term
+      // counters still see them, as they do for the materialised reader.
+      if (t.second.num == 0 && t.second.den != 0)
+        continue;
+      auto it = slot_of.find(t.second);
+      std::uint32_t slot;
+      if (it == slot_of.end()) {
+        slot = static_cast<std::uint32_t>(plan.coeffs.size());
+        plan.coeffs.push_back(t.second);
+        slot_of.emplace(t.second, slot);
+      } else {
+        slot = it->second;
+      }
+      plan.terms.emplace_back(t.first, slot);
+      if (t.first > max_id)
+        max_id = t.first;
+    }
+    stats.equations += 1;
+    stats.terms += eq.size();
+    plan.sys_idx.push_back(static_cast<std::uint32_t>(plan.sys_idx.size()));
+    plan.eq_begin.push_back(static_cast<std::uint32_t>(plan.terms.size()));
+    eq.clear();
+  }
+};
+
 enum class CoeffText { Ok, Zero, Fail };
 
 CoeffText parse_coeff_text(const char *b, const char *e,
@@ -888,6 +977,20 @@ bool read_spill_numeric(const std::string &path,
                         std::string &error) {
   NumericSink sink{system, stats, error};
   return scan_spill_file(path, sink, integral_id, stats, error);
+}
+
+bool read_spill_numeric_plan(
+    const std::string &path,
+    const std::unordered_map<RawIntegral, unsigned> &integral_id,
+    NumericEvalPlan &plan, SpillReadStats &stats, std::string &error) {
+  plan = NumericEvalPlan{};
+  plan.eq_begin.push_back(0);
+  PlanSink sink{plan, stats, error};
+  if (!scan_spill_file(path, sink, integral_id, stats, error))
+    return false;
+  plan.store_ids = static_cast<std::size_t>(sink.max_id) + 1;
+  build_fwd_plan(plan.terms, plan.eq_begin, plan.sys_idx, plan.plan);
+  return true;
 }
 
 bool read_spill_symbolic(const std::string &path,
