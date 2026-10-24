@@ -153,6 +153,17 @@ struct FwdStore {
 
   std::vector<uint32_t> eval_len, eval_front;
 
+  // Fill sizes measured from a probe point at the same plan.  reset reserves them
+  // (grow-only), so the first fill starts at the capacity it ends at instead of
+  // doubling through it.  Zero means no hint, which leaves reset as it was.
+  std::size_t fill_terms = 0;
+  std::size_t fill_rows = 0;
+
+  void set_fill_reserve(std::size_t terms, std::size_t rows) {
+    fill_terms = terms;
+    fill_rows = rows;
+  }
+
   void reset(std::size_t n_ids);
   bool has_row(uint32_t id) const { return (has[id >> 6] >> (id & 63)) & 1u; }
   void mark(uint32_t id, uint32_t row) {

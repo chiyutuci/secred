@@ -506,6 +506,15 @@ void FwdStore::reset(std::size_t n_ids) {
   len.clear();
   ids.clear();
   vals.clear();
+  // reserve only grows, so a worker whose arena already outgrew the probe keeps it.
+  if (fill_rows != 0) {
+    begin.reserve(fill_rows);
+    len.reserve(fill_rows);
+  }
+  if (fill_terms != 0) {
+    ids.reserve(fill_terms);
+    vals.reserve(fill_terms);
+  }
   order_ptr = nullptr;
 }
 

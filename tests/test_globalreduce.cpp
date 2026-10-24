@@ -304,6 +304,51 @@ TEST(numeric_prime_solve_matches_reference) {
   }
 }
 
+// The reconstruction pool runs prime 0 as a serial probe, then hands every worker store
+// the fill sizes that probe reached.  A store with that hint must produce the same block,
+// and because the hint is exactly what the point fills, must not reallocate while filling.
+TEST(numeric_prime_solve_with_the_probe_fill_reserve_matches) {
+  const std::vector<secred::Eq> system = toy_system();
+  NumericEvalPlan plan;
+  plan.build(system, kEqIdx);
+  const auto master_index = master_index_of();
+  const std::vector<std::uint32_t> chain = chain_of([] {
+    secred::SubSolve ref;
+    secred::solve_subset(toy_system(), kEqIdx, kBigPrime, ref, false, true, nullptr);
+    return ref.bwd_deps;
+  }());
+
+  secred::FwdStore probe;
+  std::vector<std::uint64_t> values, probe_xout;
+  std::uint32_t fail_target = 0, fail_integral = 0;
+  REQUIRE(solve_prime_numeric(plan, kBigPrime, chain, kTargets, kMasters, master_index,
+                              probe, values, probe_xout, fail_target, fail_integral));
+  // The hint is only taken when the probe replayed the plan rather than rebuilding an
+  // order of its own.
+  REQUIRE(probe.order_ptr == &plan.plan.order);
+
+  secred::FwdStore hinted;
+  hinted.set_fill_reserve(probe.ids.size(), probe.begin.size());
+  hinted.reset(plan.store_ids);
+  const std::size_t ids_capacity = hinted.ids.capacity();
+  const std::size_t rows_capacity = hinted.begin.capacity();
+  REQUIRE(ids_capacity >= probe.ids.size());
+  REQUIRE(rows_capacity >= probe.begin.size());
+
+  std::vector<std::uint64_t> values2, xout;
+  fail_target = fail_integral = 0;
+  REQUIRE(solve_prime_numeric(plan, kBigPrime, chain, kTargets, kMasters, master_index,
+                              hinted, values2, xout, fail_target, fail_integral));
+  REQUIRE(xout == probe_xout);
+  REQUIRE(hinted.ids == probe.ids);
+  REQUIRE(hinted.vals == probe.vals);
+  REQUIRE(hinted.begin == probe.begin);
+  REQUIRE(hinted.len == probe.len);
+  // The point filled the reserved capacity exactly, so the fill reallocated nothing.
+  REQUIRE_EQ(hinted.ids.capacity(), ids_capacity);
+  REQUIRE_EQ(hinted.begin.capacity(), rows_capacity);
+}
+
 // A right-hand side that carries an integral the master table does not know is a stale
 // selection: the solve must refuse and name the pair rather than emit a truncated block.
 TEST(numeric_prime_solve_rejects_non_master_rhs) {

@@ -1459,6 +1459,47 @@ TEST(ffred_planned_store_reset_keeps_its_arenas_in_place) {
   REQUIRE(store.vals.data() == vals_data);
 }
 
+// The reconstruction pool measures a probe point and hands each worker store the sizes it
+// reached, so the worker's first fill starts at the capacity it will end at instead of
+// doubling through it.  The hint is a floor: a reset reserves it after the purge, and
+// never shrinks an arena that already grew past it (shrink_to_fit would allocate the
+// smaller block before freeing the larger, which doubles a worker's arena mid-copy).
+TEST(ffred_planned_store_reset_reserves_the_measured_fill) {
+  secred::FwdStore store;
+  store.reset(129u);
+  // No hint is today's behaviour: a fresh reset allocates no arena.
+  REQUIRE_EQ(store.ids.capacity(), std::size_t(0));
+  REQUIRE_EQ(store.vals.capacity(), std::size_t(0));
+  REQUIRE_EQ(store.begin.capacity(), std::size_t(0));
+  REQUIRE_EQ(store.len.capacity(), std::size_t(0));
+
+  // A probe measured 600 rows over 2000 terms.
+  store.set_fill_reserve(2000u, 600u);
+  store.reset(129u);
+  REQUIRE_EQ(store.ids.size(), std::size_t(0));
+  REQUIRE_EQ(store.begin.size(), std::size_t(0));
+  REQUIRE(store.ids.capacity() >= 2000u);
+  REQUIRE(store.vals.capacity() >= 2000u);
+  REQUIRE(store.begin.capacity() >= 600u);
+  REQUIRE(store.len.capacity() >= 600u);
+
+  // Filling past the hint grows normally; a later, smaller hint keeps the larger arena.
+  store.ids.assign(3000u, 0u);
+  store.vals.assign(3000u, 0u);
+  store.begin.assign(700u, 0u);
+  store.len.assign(700u, 0u);
+  const std::uint32_t *const ids_data = store.ids.data();
+  const std::uint64_t *const vals_data = store.vals.data();
+  store.set_fill_reserve(100u, 10u);
+  store.reset(129u);
+  REQUIRE(store.ids.capacity() >= 3000u);
+  REQUIRE(store.vals.capacity() >= 3000u);
+  REQUIRE(store.begin.capacity() >= 700u);
+  REQUIRE(store.len.capacity() >= 700u);
+  REQUIRE(store.ids.data() == ids_data);
+  REQUIRE(store.vals.data() == vals_data);
+}
+
 // The trim's other half, which the store's own state cannot show: the pages are the OS's
 // again.  A vector whose capacity outruns its size keeps every page of that tail resident
 // and untouched until something writes it, and the point about dropping them is that the

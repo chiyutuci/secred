@@ -395,6 +395,9 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
       max_memory, memory_reserve, system_memory().total);
   const std::uint64_t rss_before = process_used_memory();
   std::uint64_t measured = 0;
+  // The probe's fill sizes, handed to every worker store before its first point.
+  std::size_t fill_terms = 0;
+  std::size_t fill_rows = 0;
   {
     secred::FwdStore probe_store;
     std::vector<std::uint64_t> probe_values;
@@ -410,6 +413,12 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
     const std::uint64_t rss_after = process_used_memory();
     if (probe_slot.ok && rss_after > rss_before)
       measured = rss_after - rss_before;
+    // A probe that replayed the plan reached the sizes every worker's first point will
+    // fill, so reserving them removes the growth reallocations without estimating.
+    if (probe_slot.ok && probe_store.order_ptr == &plan.plan.order) {
+      fill_terms = probe_store.ids.size();
+      fill_rows = probe_store.begin.size();
+    }
   }
 
   const std::uint64_t modelled =
@@ -438,6 +447,7 @@ bool reconstruct_ffred(const NumericEvalPlan &plan,
   for (unsigned w = 0; w < nworkers; ++w) {
     workers.emplace_back([&]() {
       secred::FwdStore store;
+      store.set_fill_reserve(fill_terms, fill_rows);
       std::vector<std::uint64_t> values;
       running.fetch_add(1, std::memory_order_relaxed);
       bool holds_store = true;
