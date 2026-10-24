@@ -2,8 +2,6 @@
 #include <ctime>
 #include <iostream>
 
-#include <malloc.h>
-
 #include "CLI11.hpp"
 #include "yaml-cpp/yaml.h"
 
@@ -12,9 +10,6 @@
 int main(int argc, char **argv) {
 
   secred::mark_run_start();
-
-  mallopt(M_MMAP_THRESHOLD, 64 * 1024);
-  mallopt(M_ARENA_MAX, 8);
 
   CLI::App app;
 

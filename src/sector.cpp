@@ -9,7 +9,6 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <malloc.h>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -539,8 +538,6 @@ void Sector::run_reduce_ff_n(const std::vector<IBPProtoFF> &ibps,
 
   clear();
   _print_progress(ctx);
-
-  malloc_trim(0);
 }
 
 // Reduce one sector on the numeric path.

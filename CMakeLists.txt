@@ -37,12 +37,13 @@ if (SECRED_LTO)
 endif ()
 
 # jemalloc is a required dependency, not a tuning option.  The sector stage runs 64
-# threads, each allocating GiNaC expressions, against glibc's M_ARENA_MAX=8 (main.cpp
-# caps it for the memory gate of ARCHITECTURE.md 8.3), and that cap serialises them.
-# Measured on F234 at 64 threads, back to back with the same binary: sector reduction
-# 1min1s -> 27.8s, total 3min13s -> 2min30s, peak 7.26 GB -> 6.20 GB, with the
-# reductions byte-identical.  Linking a library that defines malloc is enough --
-# libjemalloc comes before libc on the link line -- so no LD_PRELOAD is needed.
+# threads, each allocating GiNaC expressions, and those threads serialise on glibc's
+# arena locks.  Measured on F234 at 64 threads, back to back with the same binary:
+# sector reduction 1min1s -> 27.8s, total 3min13s -> 2min30s, peak 7.26 GB -> 6.20 GB,
+# with the reductions byte-identical.  Linking a library that defines malloc is
+# enough -- libjemalloc comes before libc on the link line -- so no LD_PRELOAD is
+# needed.  SecRed makes no runtime allocator-tuning calls; an operator who needs
+# different arena or decay behaviour can set MALLOC_CONF in the environment.
 #
 # This was `option(SECRED_JEMALLOC ...)` with a warning when the library was missing,
 # which produced builds that are correct and twice as slow with nothing saying so.  A
