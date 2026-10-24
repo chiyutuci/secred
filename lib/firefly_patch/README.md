@@ -78,8 +78,8 @@ sampling-plan hand-off that FireFly 2.0.3's public API cannot reach.
 executable.  Both the header-inlined `Reconstructor<BlackBox>` code and the
 `RatReconst` methods called from the executable bind to the definitions in the
 executable; the copies inside the `.so` are not used on SecRed's path.  The
-static archive is placed before `${FIREFLY_LIBRARY}` in both link lines
-(`CMakeLists.txt`, `tests/CMakeLists.txt`) so the linker takes the local
+static archive is placed before `${FIREFLY_LIBRARY}` in the executable's link
+line (`CMakeLists.txt`, and the local test build's) so the linker takes the local
 definitions.
 
 That rule applies to **functions**, and deliberately not to data.  A data
@@ -93,9 +93,8 @@ exit.  Under glibc's allocator that is `double free or corruption` and SIGABRT
 reconstruction followed by a crash on the way out; jemalloc silently tolerates
 the second free.  Leaving the definitions to `libfirefly.so` keeps exactly one
 construction and one destruction per static.  The executable still reaches them
-through copy relocations (`R_X86_64_COPY`), and
-`tests/test_firefly_global.cpp`'s
-`firefly_ratreconst_statics_are_owned_by_libfirefly` pins the invariant: each
+through copy relocations (`R_X86_64_COPY`), and the local
+`firefly_ratreconst_statics_are_owned_by_libfirefly` test pins the invariant: each
 symbol must resolve into `libfirefly.so` or carry a copy relocation in the
 executable — a definition in the executable's own objects would have neither.
 
