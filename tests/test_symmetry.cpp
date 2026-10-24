@@ -120,9 +120,9 @@ targets:
   return YAML::Load(yaml);
 }
 
-static Family make_sunrise(const std::string &cache_dir) {
+static Family make_sunrise(const std::string &tag) {
   Family::symtab.clear();
-  Family f(symmetry_sunrise_config(cache_dir));
+  Family f(symmetry_sunrise_config("/tmp/secred_tests/" + tag));
   f.init();
   return f;
 }
@@ -165,9 +165,9 @@ targets:
   return YAML::Load(yaml);
 }
 
-static Family make_dbox(const std::string &cache_dir) {
+static Family make_dbox(const std::string &tag) {
   Family::symtab.clear();
-  Family f(symmetry_dbox_config(cache_dir));
+  Family f(symmetry_dbox_config("/tmp/secred_tests/" + tag));
   f.init();
   return f;
 }
