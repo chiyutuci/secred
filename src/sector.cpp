@@ -95,12 +95,12 @@ void Sector::_order_subintegrals(std::vector<RawIntegral> &subInts,
                                  OrderingMode mode,
                                  const std::set<RawIntegral> *preferred) {
   if (mode == OrderingMode::Balance)
-    std::stable_sort(subInts.begin(), subInts.end(), _compare_balance);
+    sort_balance_stable(subInts);
   else
     std::sort(subInts.begin(), subInts.end(), _compare_subintegral);
   std::reverse(subInts.begin(), subInts.end());
 
-  if (preferred)
+  if (preferred && !preferred->empty())
     std::stable_partition(subInts.begin(), subInts.end(),
                           [preferred](const RawIntegral &x) {
                             return !preferred->contains(x);
@@ -364,10 +364,10 @@ void Sector::_generate_seeds(OrderingMode mode,
 
   if (mode == OrderingMode::Balance) {
 
-    std::stable_sort(_seeds.begin(), _seeds.end(), _compare_balance);
+    sort_balance_stable(_seeds);
   }
 
-  if (preferred)
+  if (preferred && !preferred->empty())
     std::stable_partition(_seeds.begin(), _seeds.end(),
                           [preferred](const RawIntegral &x) {
                             return preferred->contains(x);

@@ -999,6 +999,54 @@ TEST(compare_balance_is_strict_weak_ordering_on_ties) {
 }
 
 // ---------------------------------------------------------------------------
+// balance_key — packed order embedding of the balance comparator
+// ---------------------------------------------------------------------------
+
+TEST(balance_key_orders_exactly_like_balance_less) {
+  std::vector<RawIntegral> corpus = {
+      RI({}),        RI({0}),          RI({1}),          RI({-1}),
+      RI({1, -1}),   RI({-1, 1}),      RI({2, -1}),      RI({1, 1, -1}),
+      RI({1, 0, -2}), RI({2, 0, 0}),   RI({-1, -1}),     RI({3, -2}),
+      RI({1, -1, 1, -1}), RI({2, -2, 0}),
+      RI({1, 0, -1}), RI({0, 1, -1}),  RI({1, -2}),      RI({-2, 1}),
+      RawIntegral(std::vector<int>(32, 127)),
+      RawIntegral(std::vector<int>(32, -128)),
+      RI({127, 127, -128, -128})};
+  for (const RawIntegral &a : corpus)
+    for (const RawIntegral &b : corpus) {
+      const bool ab = SectorTestHelper::compare_balance(a, b);
+      const bool ba = SectorTestHelper::compare_balance(b, a);
+      const std::uint64_t ka = balance_key(a);
+      const std::uint64_t kb = balance_key(b);
+      REQUIRE((ka < kb) == ab);
+      REQUIRE((ka > kb) == ba);
+      if (!ab && !ba)
+        REQUIRE(ka == kb);
+    }
+}
+
+// Ties must keep their input order, because the sector pipeline relies on a
+// stable sort: changing the order of equal-key integrals would permute the
+// columns and change the reductions.
+TEST(sort_balance_stable_reproduces_the_stable_sort) {
+  std::vector<RawIntegral> input = {
+      RI({1, 0, -1}), RI({0, 1, -1}), RI({1, -1, 0}), RI({-1, 1, 0}),
+      RI({2, -1}),    RI({1, 1, -1}), RI({1, 0, -1}), RI({2, -2, 0}),
+      RI({-2, 1}),    RI({1, -2}),    RI({1, 1, 0, -2}), RI({0, 0}),
+      RI({2, 0, 0}),  RI({-1, -1})};
+
+  std::vector<RawIntegral> want = input;
+  std::stable_sort(want.begin(), want.end(), SectorTestHelper::compare_balance);
+
+  std::vector<RawIntegral> got = input;
+  sort_balance_stable(got);
+
+  REQUIRE(got.size() == want.size());
+  for (std::size_t i = 0; i < want.size(); ++i)
+    REQUIRE(got[i] == want[i]);
+}
+
+// ---------------------------------------------------------------------------
 // _order_subintegrals — the subsector column order
 // ---------------------------------------------------------------------------
 

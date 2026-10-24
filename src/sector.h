@@ -542,6 +542,44 @@ inline bool balance_less(const RawIntegral &a, const RawIntegral &b) {
   return -a.maxneg() < -b.maxneg();
 }
 
+// Packed order embedding of balance_less: two integrals compare by the key in
+// exactly the way the comparator orders them.  Field widths cover the whole
+// int8 index range: depth <= 32*127 = 4064 (13 bits), rank <= 32*128 = 4096
+// (13 bits), their sum <= 8160 (13 bits), maxpos <= 127 (7 bits) and
+// -maxneg <= 128 (8 bits).
+inline std::uint64_t balance_key(const RawIntegral &integral) {
+  const unsigned depth = integral.depth();
+  const unsigned rank = integral.rank();
+  return (static_cast<std::uint64_t>(depth + rank) << 41) |
+         (static_cast<std::uint64_t>(depth) << 28) |
+         (static_cast<std::uint64_t>(rank) << 15) |
+         (static_cast<std::uint64_t>(integral.maxpos()) << 8) |
+         static_cast<std::uint64_t>(-integral.maxneg());
+}
+
+// Sort as std::stable_sort with balance_less, but compare precomputed keys.
+// Sorting (key, original position) pairs gives the unique sequence ordered by
+// key with ties in input order -- the definition of a stable sort -- so the
+// permutation is identical to the comparator-based one.
+inline void sort_balance_stable(std::vector<RawIntegral> &integrals) {
+  struct Entry {
+    std::uint64_t key;
+    unsigned position;
+  };
+  std::vector<Entry> entries;
+  entries.reserve(integrals.size());
+  for (unsigned i = 0; i < integrals.size(); ++i)
+    entries.push_back({balance_key(integrals[i]), i});
+  std::sort(entries.begin(), entries.end(), [](const Entry &a, const Entry &b) {
+    return a.key != b.key ? a.key < b.key : a.position < b.position;
+  });
+  std::vector<RawIntegral> sorted;
+  sorted.reserve(integrals.size());
+  for (const Entry &entry : entries)
+    sorted.push_back(std::move(integrals[entry.position]));
+  integrals.swap(sorted);
+}
+
 // One equation as integral/coefficient pairs.
 using GlobalEquation = std::vector<std::pair<RawIntegral, std::string>>;
 
