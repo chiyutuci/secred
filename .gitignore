@@ -9,6 +9,10 @@ bench/
 docs/
 CLAUDE.md
 
+# local-only unit tests and build hooks (not part of the released package)
+/tests/
+/local/
+
 # run output
 cache*/
 sector_timing.csv

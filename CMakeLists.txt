@@ -121,5 +121,6 @@ target_link_libraries(secred firefly_patch ${FIREFLY_LIBRARY})
 # above).  It is not optional, so it is not guarded.
 target_link_libraries(secred ${JEMALLOC_LIBRARY})
 
-# unit tests
-add_subdirectory(tests)
+# Local-only build hooks.  The published tree carries no tests and no test
+# target; a checkout that keeps its tests locally can add them here.
+include(${CMAKE_CURRENT_SOURCE_DIR}/local/CMakeLists.local.cmake OPTIONAL)

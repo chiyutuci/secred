@@ -78,7 +78,7 @@ under a non-standard prefix must be passed in:
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/finiteflow
 ```
 
-This produces the program `build/secred` and the unit-test binary `build/secred_tests`.
+This produces the program `build/secred`.
 
 ## Run
 
@@ -186,12 +186,6 @@ described by FireFly's own log, `firefly.log` in the cache directory.
 | `example/F234/kira/` | its Kira 3.1 counterpart: `config/`, `target`, and both job files (untruncated, and per-sector truncated) | symbolic `d` | FireFly | minutes–hours |
 | `example/F1/F1.yaml` | four-loop, 14 propagators | numeric | FiniteFlow | days |
 | `example/F1/kira/` | its Kira counterpart: `config/`, `target`, the per-sector truncated job of the 2026-10-19 run, and an untruncated counterpart | numeric `d = 1999/500` | FireFly | hours–days |
-
-## Tests
-
-```bash
-cmake --build build --target secred_tests && ./build/secred_tests
-```
 
 ## Citation
 
