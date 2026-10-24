@@ -6,6 +6,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <cln/cln.h>
@@ -32,13 +33,29 @@ struct SymPoly {
   uint64_t mod_p = 0;
 };
 
-// A rational coefficient over symbol indices, with a GiNaC fallback.
+// A rational coefficient over symbol indices.  Exactly one form is stored: a
+// coefficient that compiled keeps only its two polynomials (the GiNaC expressions it
+// came from are released), and one that could not compile keeps the GiNaC expressions
+// and is evaluated by substitution.
 struct SymCoeff {
-  SymPoly num;
-  SymPoly den;
-  bool precompiled = false;
-  GiNaC::ex slow_num;
-  GiNaC::ex slow_den;
+  struct Compiled {
+    SymPoly num;
+    SymPoly den;
+  };
+  struct Slow {
+    GiNaC::ex num;
+    GiNaC::ex den;
+  };
+
+  std::variant<Compiled, Slow> form;
+
+  bool precompiled() const { return std::holds_alternative<Compiled>(form); }
+  const SymPoly &num() const { return std::get<Compiled>(form).num; }
+  SymPoly &num() { return std::get<Compiled>(form).num; }
+  const SymPoly &den() const { return std::get<Compiled>(form).den; }
+  SymPoly &den() { return std::get<Compiled>(form).den; }
+  const GiNaC::ex &slow_num() const { return std::get<Slow>(form).num; }
+  const GiNaC::ex &slow_den() const { return std::get<Slow>(form).den; }
 };
 
 using SymEq = std::vector<std::pair<uint32_t, SymCoeff>>;
@@ -126,10 +143,10 @@ inline void reduce_sym_poly(SymPoly &poly, uint64_t p) {
 inline void reduce_sym_system(std::vector<SymEq> &system, uint64_t p) {
   for (SymEq &eq : system)
     for (auto &pr : eq) {
-      if (!pr.second.precompiled)
+      if (!pr.second.precompiled())
         continue;
-      reduce_sym_poly(pr.second.num, p);
-      reduce_sym_poly(pr.second.den, p);
+      reduce_sym_poly(pr.second.num(), p);
+      reduce_sym_poly(pr.second.den(), p);
     }
 }
 
@@ -151,16 +168,27 @@ inline bool eval_sym_poly_mod(const SymPoly &poly,
   return true;
 }
 
+// A coefficient that keeps the GiNaC form, evaluated by substitution.  The parser uses
+// this when a coefficient cannot be compiled.
+inline SymCoeff make_slow_sym_coeff(const GiNaC::ex &num, const GiNaC::ex &den) {
+  SymCoeff c;
+  c.form = SymCoeff::Slow{num, den};
+  return c;
+}
+
 inline SymCoeff
 make_sym_coeff(const GiNaC::ex &e,
                const std::unordered_map<std::string, unsigned> &sym_index) {
+  const GiNaC::ex num = e.numer();
+  const GiNaC::ex den = e.denom();
+  SymCoeff::Compiled compiled;
+  if (!build_sym_poly(num, sym_index, compiled.num) ||
+      !build_sym_poly(den, sym_index, compiled.den))
+    return make_slow_sym_coeff(num, den);
+  if (den.is_equal(GiNaC::ex(1)))
+    compiled.den.terms.clear();
   SymCoeff c;
-  c.slow_num = e.numer();
-  c.slow_den = e.denom();
-  c.precompiled = build_sym_poly(c.slow_num, sym_index, c.num) &&
-                  build_sym_poly(c.slow_den, sym_index, c.den);
-  if (c.precompiled && c.slow_den.is_equal(GiNaC::ex(1)))
-    c.den.terms.clear();
+  c.form = std::move(compiled);
   return c;
 }
 
@@ -168,11 +196,14 @@ inline std::vector<unsigned> sym_max_exps(const std::vector<SymEq> &system,
                                           unsigned nvars) {
   std::vector<unsigned> mx(nvars, 0);
   for (const SymEq &eq : system)
-    for (const auto &pr : eq)
-      for (const SymPoly *poly : {&pr.second.num, &pr.second.den})
+    for (const auto &pr : eq) {
+      if (!pr.second.precompiled())
+        continue;
+      for (const SymPoly *poly : {&pr.second.num(), &pr.second.den()})
         for (const SymTerm &t : poly->terms)
           for (const auto &ve : t.vars)
             mx[ve.first] = std::max<unsigned>(mx[ve.first], ve.second);
+    }
   return mx;
 }
 
@@ -201,16 +232,17 @@ inline bool eval_sym_coeff_mod(
     const SymCoeff &c, const GiNaC::exmap &subs,
     const std::vector<std::vector<uint64_t>> &powers, uint64_t p, uint64_t &out,
     bool *zero_den = nullptr) {
-  if (c.precompiled) {
+  if (c.precompiled()) {
+    const SymCoeff::Compiled &k = std::get<SymCoeff::Compiled>(c.form);
     uint64_t n = 0;
-    if (!eval_sym_poly_mod(c.num, powers, p, n))
+    if (!eval_sym_poly_mod(k.num, powers, p, n))
       return false;
-    if (c.den.terms.empty()) {
+    if (k.den.terms.empty()) {
       out = n;
       return true;
     }
     uint64_t d = 0;
-    if (!eval_sym_poly_mod(c.den, powers, p, d))
+    if (!eval_sym_poly_mod(k.den, powers, p, d))
       return false;
     if (d == 0) {
       out = 0;
@@ -223,7 +255,8 @@ inline bool eval_sym_coeff_mod(
     return true;
   }
 
-  GiNaC::ex nval = c.slow_num.subs(subs);
+  const SymCoeff::Slow &s = std::get<SymCoeff::Slow>(c.form);
+  GiNaC::ex nval = s.num.subs(subs);
   if (!GiNaC::is_a<GiNaC::numeric>(nval)) {
     out = 0;
     return true;
@@ -236,8 +269,8 @@ inline bool eval_sym_coeff_mod(
   uint64_t n = cl_I_mod_u64(cln::the<cln::cl_I>(nv.to_cl_N()), p);
 
   uint64_t d = 1;
-  if (!c.slow_den.is_equal(GiNaC::ex(1))) {
-    GiNaC::ex dval = c.slow_den.subs(subs);
+  if (!s.den.is_equal(GiNaC::ex(1))) {
+    GiNaC::ex dval = s.den.subs(subs);
     if (!GiNaC::is_a<GiNaC::numeric>(dval)) {
       out = 0;
       return true;
@@ -348,29 +381,24 @@ inline std::uint64_t hash_sym_poly(const SymPoly &poly) {
   return h;
 }
 
-struct SymCoeffHash {
-  std::size_t operator()(const SymCoeff &c) const {
-    std::uint64_t h = 1469598103934665603ULL;
-    if (!c.precompiled) {
-      sym_hash_mix(h, c.slow_num.gethash());
-      sym_hash_mix(h, c.slow_den.gethash());
-      return static_cast<std::size_t>(h);
-    }
-    sym_hash_mix(h, hash_sym_poly(c.num));
-    sym_hash_mix(h, hash_sym_poly(c.den));
-    return static_cast<std::size_t>(h);
-  }
-};
+// Hashes of the two coefficient forms.  The tags keep a compiled coefficient and a
+// GiNaC coefficient with the same value on separate chains, since they are stored as
+// different slots.
+inline std::uint64_t sym_coeff_hash(const SymPoly &num, const SymPoly &den) {
+  std::uint64_t h = 1469598103934665603ULL;
+  sym_hash_mix(h, 1);
+  sym_hash_mix(h, hash_sym_poly(num));
+  sym_hash_mix(h, hash_sym_poly(den));
+  return h;
+}
 
-struct SymCoeffEq {
-  bool operator()(const SymCoeff &a, const SymCoeff &b) const {
-    if (a.precompiled != b.precompiled)
-      return false;
-    if (!a.precompiled)
-      return a.slow_num.is_equal(b.slow_num) && a.slow_den.is_equal(b.slow_den);
-    return sym_poly_equal(a.num, b.num) && sym_poly_equal(a.den, b.den);
-  }
-};
+inline std::uint64_t sym_coeff_hash(const GiNaC::ex &num, const GiNaC::ex &den) {
+  std::uint64_t h = 1469598103934665603ULL;
+  sym_hash_mix(h, 2);
+  sym_hash_mix(h, num.gethash());
+  sym_hash_mix(h, den.gethash());
+  return h;
+}
 
 // A sparse system whose coefficients are interned slots.
 struct SymCoeffPool {
@@ -381,47 +409,81 @@ struct SymCoeffPool {
   std::size_t n_terms() const { return terms.size(); }
 };
 
-// Builds a SymCoeffPool, deduplicating equal coefficients.
+// Builds a SymCoeffPool, deduplicating equal coefficients.  Equal coefficients are
+// found through a hash chain over the pool itself: the map stores only the hash and
+// the first slot, and each slot links to the next one with the same hash, so the
+// interning key does not keep a second copy of any coefficient.
 struct SymCoeffInterner {
+  static constexpr std::uint32_t kNoSlot = UINT32_MAX;
+
   SymCoeffPool pool;
-  std::unordered_map<SymCoeff, uint32_t, SymCoeffHash, SymCoeffEq> slot_of;
-  SymCoeff probe;
+  std::unordered_map<std::uint64_t, std::uint32_t> head_of_hash;
+  std::vector<std::uint32_t> next_slot;
+  // Canonical scratch reused by every intern(); only its capacity is retained.
+  SymPoly canon_num, canon_den;
 
   void begin_row() { pool.eq_begin.push_back(static_cast<uint32_t>(pool.terms.size())); }
 
-  void add_term(uint32_t id, const SymCoeff &c) { pool.terms.emplace_back(id, intern(c)); }
+  void add_slot_term(std::uint32_t id, std::uint32_t slot) {
+    pool.terms.emplace_back(id, slot);
+  }
+
+  void add_term(std::uint32_t id, const SymCoeff &c) { add_slot_term(id, intern(c)); }
 
   void finish() {
     pool.eq_begin.push_back(static_cast<uint32_t>(pool.terms.size()));
   }
 
   std::uint32_t intern(const SymCoeff &c) {
-    bool internable = true;
-    if (c.precompiled) {
-      internable = sym_poly_internable(c.num) && sym_poly_internable(c.den);
-      if (internable) {
-        sym_poly_canonical_into(c.num, probe.num);
-        sym_poly_canonical_into(c.den, probe.den);
+    if (c.precompiled()) {
+      if (!sym_poly_internable(c.num()) || !sym_poly_internable(c.den()))
+        return append(c);
+      sym_poly_canonical_into(c.num(), canon_num);
+      sym_poly_canonical_into(c.den(), canon_den);
+      const std::uint64_t h = sym_coeff_hash(canon_num, canon_den);
+      for (std::uint32_t s = first_slot(h); s != kNoSlot; s = next_slot[s]) {
+        const SymCoeff &p = pool.coeffs[s];
+        if (p.precompiled() && sym_poly_equal(p.num(), canon_num) &&
+            sym_poly_equal(p.den(), canon_den))
+          return s;
       }
-    } else {
-
-      probe.num.terms.clear();
-      probe.den.terms.clear();
+      SymCoeff out;
+      out.form = SymCoeff::Compiled{canon_num, canon_den};
+      return insert(h, std::move(out));
     }
-    probe.precompiled = c.precompiled;
-    probe.slow_num = c.slow_num;
-    probe.slow_den = c.slow_den;
 
-    if (!internable) {
-      pool.coeffs.push_back(c);
-      return static_cast<std::uint32_t>(pool.coeffs.size() - 1);
+    const std::uint64_t h = sym_coeff_hash(c.slow_num(), c.slow_den());
+    for (std::uint32_t s = first_slot(h); s != kNoSlot; s = next_slot[s]) {
+      const SymCoeff &p = pool.coeffs[s];
+      if (!p.precompiled() && p.slow_num().is_equal(c.slow_num()) &&
+          p.slow_den().is_equal(c.slow_den()))
+        return s;
     }
-    const auto it = slot_of.find(probe);
-    if (it != slot_of.end())
-      return it->second;
-    pool.coeffs.push_back(probe);
-    const std::uint32_t slot = static_cast<std::uint32_t>(pool.coeffs.size() - 1);
-    slot_of.emplace(pool.coeffs.back(), slot);
+    return insert(h, c);
+  }
+
+private:
+  std::uint32_t first_slot(std::uint64_t h) const {
+    const auto it = head_of_hash.find(h);
+    return it == head_of_hash.end() ? kNoSlot : it->second;
+  }
+
+  // A coefficient outside the interning grammar: kept once per occurrence.
+  std::uint32_t append(const SymCoeff &c) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(pool.coeffs.size());
+    pool.coeffs.push_back(c);
+    next_slot.push_back(kNoSlot);
+    return slot;
+  }
+
+  std::uint32_t insert(std::uint64_t h, SymCoeff c) {
+    const std::uint32_t slot = static_cast<std::uint32_t>(pool.coeffs.size());
+    pool.coeffs.push_back(std::move(c));
+    // A fresh bucket ends at kNoSlot; taking the value from the map keeps the chain's
+    // tail a sentinel rather than whatever slot 0 happens to be.
+    const auto head = head_of_hash.try_emplace(h, kNoSlot);
+    next_slot.push_back(head.first->second);
+    head.first->second = slot;
     return slot;
   }
 };
@@ -482,10 +544,10 @@ inline void retain_pool_rows(SymCoeffPool &pool, const std::vector<uint32_t> &eq
 }
 
 inline void reduce_pool_coeff(SymCoeff &c, uint64_t p) {
-  if (!c.precompiled)
+  if (!c.precompiled())
     return;
-  reduce_sym_poly(c.num, p);
-  reduce_sym_poly(c.den, p);
+  reduce_sym_poly(c.num(), p);
+  reduce_sym_poly(c.den(), p);
 }
 
 inline void reduce_pool_for_prime(SymCoeffPool &pool, uint64_t p) {
@@ -495,11 +557,14 @@ inline void reduce_pool_for_prime(SymCoeffPool &pool, uint64_t p) {
 
 inline std::vector<unsigned> sym_max_exps(const SymCoeffPool &pool, unsigned nvars) {
   std::vector<unsigned> mx(nvars, 0);
-  for (const SymCoeff &c : pool.coeffs)
-    for (const SymPoly *poly : {&c.num, &c.den})
+  for (const SymCoeff &c : pool.coeffs) {
+    if (!c.precompiled())
+      continue;
+    for (const SymPoly *poly : {&c.num(), &c.den()})
       for (const SymTerm &t : poly->terms)
         for (const auto &ve : t.vars)
           mx[ve.first] = std::max<unsigned>(mx[ve.first], ve.second);
+  }
   return mx;
 }
 

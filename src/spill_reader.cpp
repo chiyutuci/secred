@@ -10,6 +10,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstring>
+#include <memory>
 #include <numeric>
 
 namespace secred {
@@ -610,7 +611,7 @@ CoeffText parse_coeff_text(const char *b, const char *e,
                            GiNaC::parser &parser, SymCoeff &out, SpillReadStats &stats,
                            std::string &error) {
   if (parse_spill_coeff(b, e, sym_index, out))
-    return out.num.terms.empty() ? CoeffText::Zero : CoeffText::Ok;
+    return out.num().terms.empty() ? CoeffText::Zero : CoeffText::Ok;
   ++stats.fallbacks;
   try {
     GiNaC::ex ex = parser(std::string(b, e));
@@ -663,9 +664,14 @@ struct SymbolicSink {
   }
 };
 
+// One coefficient-table entry.  The parsed coefficient lives only until the first
+// equation that uses it ends; after interning, the entry keeps the pool slot instead,
+// so a file's whole coefficient table costs 16 bytes per entry rather than a
+// coefficient copy each.
 struct CoeffEntry {
   enum State : std::uint8_t { Unparsed, Ok, Zero, Failed };
-  SymCoeff value;
+  std::unique_ptr<SymCoeff> value;
+  std::uint32_t slot = SymCoeffInterner::kNoSlot;
   std::uint8_t state = Unparsed;
 };
 
@@ -712,7 +718,7 @@ struct InternedBinarySink {
   SpillReadStats &stats;
   std::string &error;
   std::vector<CoeffEntry> cache;
-  std::vector<std::pair<unsigned, const SymCoeff *>> eq;
+  std::vector<std::pair<unsigned, std::uint32_t>> eq;
   bool started = false;
 
   InternedBinarySink(SymCoeffInterner &in_,
@@ -725,8 +731,9 @@ struct InternedBinarySink {
   bool term_indexed(unsigned id, std::uint32_t ci, const char *b, const char *e) {
     CoeffEntry &entry = cache[ci];
     if (entry.state == CoeffEntry::Unparsed) {
+      entry.value.reset(new SymCoeff);
       const CoeffText r =
-          parse_coeff_text(b, e, sym_index, parser, entry.value, stats, error);
+          parse_coeff_text(b, e, sym_index, parser, *entry.value, stats, error);
       if (r == CoeffText::Fail) {
         entry.state = CoeffEntry::Failed;
         return false;
@@ -735,7 +742,7 @@ struct InternedBinarySink {
     }
     started = true;
     if (entry.state == CoeffEntry::Ok)
-      eq.emplace_back(id, &entry.value);
+      eq.emplace_back(id, ci);
     return true;
   }
 
@@ -749,8 +756,17 @@ struct InternedBinarySink {
     stats.equations += 1;
     stats.terms += eq.size();
     in.begin_row();
-    for (const auto &pr : eq)
-      in.add_term(pr.first, *pr.second);
+    // Slot numbering follows the first use in this row, exactly as the materialising
+    // reader followed by intern_sym_system assigns it.  A reused entry keeps its slot
+    // and has already released its parsed coefficient.
+    for (const auto &pr : eq) {
+      CoeffEntry &entry = cache[pr.second];
+      if (entry.slot == SymCoeffInterner::kNoSlot) {
+        entry.slot = in.intern(*entry.value);
+        entry.value.reset();
+      }
+      in.add_slot_term(pr.first, entry.slot);
+    }
     eq.clear();
   }
 };
@@ -915,14 +931,14 @@ bool parse_spill_coeff(const char *b, const char *e,
     for (const ParsedTerm &t : terms) {
       if (t.den != 1)
         return false;
-      out.num.terms.push_back(
+      out.num().terms.push_back(
           SymTerm{cln::cl_I(t.neg ? -t.num : t.num), t.vars});
     }
 
     SymTerm den;
     den.coef = cln::cl_I(static_cast<long>(q));
     den.vars = mono;
-    out.den.terms.push_back(std::move(den));
+    out.den().terms.push_back(std::move(den));
   } else {
 
     std::uint64_t l = 1;
@@ -938,36 +954,35 @@ bool parse_spill_coeff(const char *b, const char *e,
       if (t.num > INT64_MAX / scale)
         return false;
       const std::int64_t v = t.num * scale;
-      out.num.terms.push_back(SymTerm{cln::cl_I(t.neg ? -v : v), t.vars});
+      out.num().terms.push_back(SymTerm{cln::cl_I(t.neg ? -v : v), t.vars});
     }
     if (l != 1)
-      out.den.terms.push_back(SymTerm{cln::cl_I(static_cast<long>(l)), {}});
+      out.den().terms.push_back(SymTerm{cln::cl_I(static_cast<long>(l)), {}});
   }
 
   cln::cl_I g = 0;
-  if (!out.den.terms.empty()) {
-    for (const SymTerm &t : out.num.terms)
+  if (!out.den().terms.empty()) {
+    for (const SymTerm &t : out.num().terms)
       g = cln::gcd(g, t.coef);
-    for (const SymTerm &t : out.den.terms)
+    for (const SymTerm &t : out.den().terms)
       g = cln::gcd(g, t.coef);
   }
   if (g != 0 && g != 1) {
-    for (SymTerm &t : out.num.terms)
+    for (SymTerm &t : out.num().terms)
       t.coef = cln::exquo(t.coef, g);
-    for (SymTerm &t : out.den.terms)
+    for (SymTerm &t : out.den().terms)
       t.coef = cln::exquo(t.coef, g);
   }
 
-  out.num.terms.erase(std::remove_if(out.num.terms.begin(), out.num.terms.end(),
-                                     [](const SymTerm &t) { return cln::zerop(t.coef); }),
-                      out.num.terms.end());
-  if (out.num.terms.empty()) {
-    out.den.terms.clear();
-  } else if (out.den.terms.size() == 1 && out.den.terms[0].vars.empty() &&
-             out.den.terms[0].coef == 1) {
-    out.den.terms.clear();
+  out.num().terms.erase(std::remove_if(out.num().terms.begin(), out.num().terms.end(),
+                                       [](const SymTerm &t) { return cln::zerop(t.coef); }),
+                        out.num().terms.end());
+  if (out.num().terms.empty()) {
+    out.den().terms.clear();
+  } else if (out.den().terms.size() == 1 && out.den().terms[0].vars.empty() &&
+             out.den().terms[0].coef == 1) {
+    out.den().terms.clear();
   }
-  out.precompiled = true;
   return true;
 }
 

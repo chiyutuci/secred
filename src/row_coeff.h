@@ -247,12 +247,12 @@ inline bool build_row_coeff(const std::vector<GiNaC::ex> &row,
   RowVars mono;
   for (const GiNaC::ex &e : row) {
     const SymCoeff sc = make_sym_coeff(e.expand(), sym_index);
-    if (!sc.precompiled)
+    if (!sc.precompiled())
       return false;
     RowPoly c;
-    if (!sc.den.terms.empty()) {
-      const SymTerm &dn = sc.den.terms[0];
-      if (sc.den.terms.size() != 1 || !cln::plusp(dn.coef) ||
+    if (!sc.den().terms.empty()) {
+      const SymTerm &dn = sc.den().terms[0];
+      if (sc.den().terms.size() != 1 || !cln::plusp(dn.coef) ||
           dn.coef > cln::cl_I(static_cast<unsigned long>(kMaxDen)))
         return false;
       c.q = static_cast<std::uint32_t>(cln::cl_I_to_ulong(dn.coef));
@@ -267,7 +267,7 @@ inline bool build_row_coeff(const std::vector<GiNaC::ex> &row,
     if (f > kMaxDen / q_lcm)
       return false;
     q_lcm *= f;
-    c.num = sc.num;
+    c.num = sc.num();
     out.c.push_back(std::move(c));
   }
 

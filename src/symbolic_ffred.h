@@ -106,7 +106,7 @@ public:
     retain_pool_rows(pool_, eq_idx_);
     mx_ = sym_max_exps(pool_, symbols_.size());
     for (const SymCoeff &c : pool_.coeffs)
-      if (!c.precompiled)
+      if (!c.precompiled())
         all_precompiled_ = false;
 
     build_fwd_plan(pool_.terms, pool_.eq_begin, eq_idx_, plan_);
