@@ -19,6 +19,9 @@ struct SpillReadStats {
   std::uint64_t equations = 0;
   std::uint64_t terms = 0;
   std::uint64_t skipped_unknown = 0;
+  // Parse events that needed the fallback chain.  Text reads and binary reads
+  // without a parse cache count occurrences; a cached binary read parses each
+  // coefficient-table entry once.
   std::uint64_t fallbacks = 0;
 };
 

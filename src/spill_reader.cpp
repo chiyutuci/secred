@@ -360,6 +360,8 @@ template <typename Sink>
 bool scan_spill_binary(const SpillTables &t, Sink &sink,
                        const std::unordered_map<RawIntegral, unsigned> &integral_id,
                        SpillReadStats &stats, std::string &error) {
+  if constexpr (requires { sink.begin_coeff_table(t.coeff_text.size(), t.n_terms); })
+    sink.begin_coeff_table(t.coeff_text.size(), t.n_terms);
   const char *p = t.terms_begin;
   const char *const end = t.terms_end;
   std::uint64_t frames = 0;
@@ -433,27 +435,66 @@ bool scan_spill_file(const std::string &path, Sink &sink,
   return scan_spill_binary(tables, sink, integral_id, stats, error);
 }
 
+// Parse one coefficient text with the reader's fallback chain: the strict span
+// parser, then the std::string parser, then big-rational interning.  The fallback
+// counter records parse events, so a caller that caches by coefficient index counts
+// each table entry once.
+bool parse_coefficient(const char *b, const char *e, int64_t &num, int64_t &den,
+                       SpillReadStats &stats, std::string &error) {
+  num = 0;
+  den = 1;
+  if (parse_rat64_span(b, e, num, den))
+    return true;
+  const std::string s(b, e);
+  if (parse_rat64(s, num, den)) {
+    ++stats.fallbacks;
+  } else if (intern_big_rational(b, e, num)) {
+    den = 0;
+    ++stats.fallbacks;
+  } else {
+    error = "cannot parse coefficient: " + s;
+    return false;
+  }
+  return true;
+}
+
 struct NumericSink {
+  // Largest coefficient table whose parse results the binary reader caches; at 16
+  // bytes per entry this bounds the cache at 16 MiB.
+  static constexpr std::size_t kMaxCachedCoeffs = 1u << 20;
+
   std::vector<Eq> &system;
   SpillReadStats &stats;
   std::string &error;
   std::vector<std::pair<unsigned, Rat64>> eq;
+  // Parse cache indexed by the spill file's coefficient index (the writer stores
+  // each spelling once).  den == -1 marks an entry no term has parsed yet.
+  std::vector<Rat64> coeff_cache;
+
+  // Called by scan_spill_binary once the tables are decoded.  The cache pays for
+  // itself only when the table is bounded and each entry is used at least twice;
+  // text spills never call this, so their terms parse through term().
+  void begin_coeff_table(std::size_t n_coeff, std::uint64_t n_terms) {
+    if (n_coeff == 0 || n_coeff > kMaxCachedCoeffs || n_terms < 2 * n_coeff)
+      return;
+    coeff_cache.assign(n_coeff, Rat64{0, -1});
+  }
 
   bool term(unsigned id, const char *b, const char *e) {
     int64_t num = 0, den = 1;
-    if (!parse_rat64_span(b, e, num, den)) {
-      const std::string s(b, e);
-      if (parse_rat64(s, num, den)) {
-        ++stats.fallbacks;
-      } else if (intern_big_rational(b, e, num)) {
-        den = 0;
-        ++stats.fallbacks;
-      } else {
-        error = "cannot parse coefficient: " + s;
-        return false;
-      }
-    }
+    if (!parse_coefficient(b, e, num, den, stats, error))
+      return false;
     eq.emplace_back(id, Rat64{num, den});
+    return true;
+  }
+
+  bool term_indexed(unsigned id, std::uint32_t coeff_i, const char *b, const char *e) {
+    if (coeff_i >= coeff_cache.size())
+      return term(id, b, e);
+    Rat64 &entry = coeff_cache[coeff_i];
+    if (entry.den == -1 && !parse_coefficient(b, e, entry.num, entry.den, stats, error))
+      return false;
+    eq.emplace_back(id, entry);
     return true;
   }
 

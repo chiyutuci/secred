@@ -831,3 +831,119 @@ TEST(spill_binary_empty_file_scans_as_text) {
   REQUIRE_EQ(system.size(), std::size_t(0));
   REQUIRE_EQ(stats.equations, std::uint64_t(0));
 }
+
+// --- the coefficient parse cache ------------------------------------------------
+
+// The binary file stores each spelling in its coefficient table once, and the reader
+// parses each table entry once.  A coefficient beyond int64 that appears in three
+// equations is therefore one fallback parse, and every occurrence still reads back as
+// the same interned big rational.
+TEST(spill_binary_numeric_parses_a_repeated_coefficient_once) {
+  const std::string big = "18446744073709551616";
+  std::vector<GlobalEquation> eqs(3);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), big);
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{0, 1}), big);
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{0, 0}), "1/3");
+  eqs[2].emplace_back(RawIntegral(std::vector<int>{1, 0}), big);
+  const std::string bin = write_binary_spill("numcachebig", eqs);
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(secred::read_spill_numeric(bin, ids, system, stats, error));
+  REQUIRE_EQ(system.size(), std::size_t(3));
+  REQUIRE_EQ(stats.terms, std::uint64_t(4));
+  REQUIRE_EQ(stats.fallbacks, std::uint64_t(1));  // one table entry, parsed once
+
+  unsigned big_terms = 0;
+  for (const Eq &eq : system) {
+    for (const auto &term : eq) {
+      const secred::Rat64 &coeff = term.second;
+      if (coeff.den != 0) {
+        REQUIRE_EQ(coeff.num, int64_t(1));
+        REQUIRE_EQ(coeff.den, int64_t(3));
+        continue;
+      }
+      ++big_terms;
+      REQUIRE(secred::rat_text(coeff) == big);
+      REQUIRE_EQ(secred::rat_mod_u64(coeff.num, coeff.den, 9223372036854775783ull),
+                 std::uint64_t(50));
+    }
+  }
+  REQUIRE_EQ(big_terms, 3u);
+}
+
+// Values must survive the cache exactly: an unreduced fraction stays unreduced, a zero
+// stays, and every equation sees the coefficients the text reader gives it.
+TEST(spill_binary_numeric_reuses_repeated_coefficients) {
+  std::vector<GlobalEquation> eqs(4);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "4/6");
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{0, 1}), "-7/9");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{1, 0}), "4/6");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{0, 0}), "0");
+  eqs[2].emplace_back(RawIntegral(std::vector<int>{0, 1}), "4/6");
+  eqs[3].emplace_back(RawIntegral(std::vector<int>{1, 0}), "0");
+  eqs[3].emplace_back(RawIntegral(std::vector<int>{0, 0}), "4/6");
+  const std::string txt = write_text_spill("numreuse", eqs);
+  const std::string bin = write_binary_spill("numreuse", eqs);
+  const auto ids = ids_of({{0, 0}, {1, 0}, {0, 1}, {1, 1}});
+
+  std::vector<Eq> theirs;
+  SpillReadStats tstats;
+  std::string error;
+  REQUIRE(secred::read_spill_numeric(txt, ids, theirs, tstats, error));
+  std::vector<Eq> ours;
+  SpillReadStats ostats;
+  REQUIRE(secred::read_spill_numeric(bin, ids, ours, ostats, error));
+
+  REQUIRE_EQ(ours.size(), theirs.size());
+  for (std::size_t i = 0; i < ours.size(); ++i) {
+    REQUIRE_EQ(ours[i].size(), theirs[i].size());
+    for (std::size_t j = 0; j < ours[i].size(); ++j) {
+      REQUIRE_EQ(ours[i][j].first, theirs[i][j].first);
+      REQUIRE_EQ(ours[i][j].second.num, theirs[i][j].second.num);
+      REQUIRE_EQ(ours[i][j].second.den, theirs[i][j].second.den);
+    }
+  }
+  // `4/6` is kept as written, the way the text reader keeps it.
+  REQUIRE_EQ(ours[0][0].second.num, int64_t(4));
+  REQUIRE_EQ(ours[0][0].second.den, int64_t(6));
+  REQUIRE_EQ(ostats.fallbacks, tstats.fallbacks);
+  REQUIRE_EQ(ostats.fallbacks, std::uint64_t(0));
+}
+
+// Below two uses per distinct coefficient the cache is not worth its memory: the
+// reader parses each occurrence, as it did before, and the values are unchanged.
+TEST(spill_binary_numeric_parses_occurrences_when_the_table_is_not_reused) {
+  std::vector<GlobalEquation> eqs(2);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "18446744073709551616");
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{0, 1}), "5");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{1, 0}), "18446744073709551616");
+  const std::string bin = write_binary_spill("numcacheoff", eqs);
+  const auto ids = ids_of({{1, 1}, {0, 1}, {1, 0}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(secred::read_spill_numeric(bin, ids, system, stats, error));
+  REQUIRE_EQ(stats.terms, std::uint64_t(3));
+  // Three terms over two distinct coefficients: no cache, two occurrences parsed.
+  REQUIRE_EQ(stats.fallbacks, std::uint64_t(2));
+  const secred::Rat64 &c = system[1][0].second;
+  REQUIRE_EQ(c.den, int64_t(0));
+  REQUIRE(secred::rat_text(c) == "18446744073709551616");
+}
+
+// A coefficient neither the strict grammar nor the big-rational fallback accepts is a
+// hard error through the cached path too, with the same message.
+TEST(spill_binary_numeric_reports_a_bad_repeated_coefficient) {
+  std::vector<GlobalEquation> eqs(2);
+  eqs[0].emplace_back(RawIntegral(std::vector<int>{1, 1}), "1/0");
+  eqs[1].emplace_back(RawIntegral(std::vector<int>{0, 1}), "1/0");
+  const std::string bin = write_binary_spill("numcachebad", eqs);
+  const auto ids = ids_of({{1, 1}, {0, 1}});
+  std::vector<Eq> system;
+  SpillReadStats stats;
+  std::string error;
+  REQUIRE(!secred::read_spill_numeric(bin, ids, system, stats, error));
+  REQUIRE(error == "cannot parse coefficient: 1/0");
+}
