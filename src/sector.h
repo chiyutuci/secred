@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -147,10 +148,13 @@ public:
   bool operator==(const RawIntegral &other) const {
     if (nprops_ != other.nprops_)
       return false;
-    for (unsigned i = 0; i < nprops_; ++i)
-      if (indices_[i] != other.indices_[i])
-        return false;
-    return true;
+    // One word-wise compare instead of a byte loop: this runs on every hash
+    // table probe, and on the hot path the arrays differ in the first few
+    // bytes.  The bytes past nprops_ are always zero (indices_ is
+    // value-initialised), so comparing exactly nprops_ of them keeps equality
+    // identical to the loop it replaces.
+    return nprops_ == 0 ||
+           std::memcmp(indices_.data(), other.indices_.data(), nprops_) == 0;
   }
 
   bool operator!=(const RawIntegral &other) const { return !(*this == other); }
@@ -223,11 +227,28 @@ private:
 
 namespace std {
 template <> struct hash<RawIntegral> {
+  // splitmix64: a bijective 64-bit mix, applied once per eight propagator
+  // indices.  The old loop mixed one index at a time with a four-operation
+  // round; hash tables probe this on every lookup, so on the 9-propagator
+  // examples the word-wise version costs two mixes instead of nine rounds.
+  static std::uint64_t mix(std::uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+  }
+
   std::size_t operator()(const RawIntegral &integral) const {
-    std::size_t hash = integral.size();
-    for (unsigned i = 0; i < integral.size(); ++i)
-      hash ^= integral[i] + 0x9e3779b9 + (hash << 6) + (hash >> 2);
-    return hash;
+    std::uint64_t hash = mix(integral.nprops_);
+    const auto *bytes =
+        reinterpret_cast<const unsigned char *>(integral.indices_.data());
+    for (unsigned i = 0; i < integral.nprops_; i += 8) {
+      std::uint64_t word = 0;
+      const unsigned n = std::min(8u, integral.nprops_ - i);
+      std::memcpy(&word, bytes + i, n);
+      hash = mix(hash ^ word);
+    }
+    return static_cast<std::size_t>(hash);
   }
 };
 }
@@ -242,6 +263,216 @@ template <> struct convert<RawIntegral> {
   }
 };
 }
+
+// A keyless open-addressing table mapping each element of a caller-owned
+// vector<RawIntegral> to its position in that vector.  It stores one uint32
+// slot per entry instead of the ~72 bytes a node-based unordered_map spends,
+// and its keys live in the caller's vector, which must outlive the table and
+// receive every key exactly once.  Iteration order is unspecified.
+//
+// bind()/build() remember the address of the key vector, so a Sector whose
+// _seeds moves would need a rebuild; Sector builds its seed list in a vector
+// that is never reallocated while the table is populated.
+class IntegralSlotTable {
+public:
+  static constexpr unsigned kNoSlot = std::numeric_limits<unsigned>::max();
+
+  // Bind an empty key vector for incremental insert_last() calls.
+  void bind(const std::vector<RawIntegral> &keys) {
+    keys_ = &keys;
+    slots_.clear();
+    mask_ = 0;
+    size_ = 0;
+  }
+
+  // Bind and index every key in an already complete vector.
+  void build(const std::vector<RawIntegral> &keys) {
+    keys_ = &keys;
+    slots_.assign(capacity_for(keys.size()), kEmpty);
+    mask_ = slots_.empty() ? 0 : slots_.size() - 1;
+    size_ = 0;
+    for (std::size_t i = 0; i < keys.size(); ++i)
+      insert_at(static_cast<unsigned>(i));
+  }
+
+  // Index the key most recently appended to the bound vector.
+  void insert_last() {
+    if (keys_ == nullptr || keys_->empty())
+      return;
+    insert_at(static_cast<unsigned>(keys_->size() - 1));
+  }
+
+  bool empty() const { return size_ == 0; }
+  std::size_t size() const { return size_; }
+  // Slot storage currently allocated, like vector::capacity().  release()
+  // drives it to zero; clear() keeps it.  Tests use this to tell the two
+  // apart, since empty() cannot.
+  std::size_t capacity() const { return slots_.size(); }
+
+  unsigned find(const RawIntegral &key) const {
+    if (slots_.empty() || keys_ == nullptr)
+      return kNoSlot;
+    for (std::size_t i = hash_of(key) & mask_;; i = (i + 1) & mask_) {
+      const unsigned slot = slots_[i];
+      if (slot == kEmpty)
+        return kNoSlot;
+      if ((*keys_)[slot] == key)
+        return slot;
+    }
+  }
+
+  bool contains(const RawIntegral &key) const { return find(key) != kNoSlot; }
+
+  unsigned at(const RawIntegral &key) const {
+    const unsigned slot = find(key);
+    if (slot == kNoSlot)
+      throw std::out_of_range("integral slot table: key not found");
+    return slot;
+  }
+
+  // Drop the entries but keep the slot storage, like unordered_map::clear.
+  // The table is left unbound so a stale key pointer is never dereferenced.
+  void clear() {
+    std::fill(slots_.begin(), slots_.end(), kEmpty);
+    keys_ = nullptr;
+    size_ = 0;
+  }
+
+  // Return the slot storage to the heap.
+  void release() {
+    std::vector<std::uint32_t>().swap(slots_);
+    keys_ = nullptr;
+    mask_ = 0;
+    size_ = 0;
+  }
+
+  void swap(IntegralSlotTable &other) {
+    slots_.swap(other.slots_);
+    std::swap(keys_, other.keys_);
+    std::swap(size_, other.size_);
+    std::swap(mask_, other.mask_);
+  }
+
+private:
+  static constexpr std::uint32_t kEmpty = std::numeric_limits<std::uint32_t>::max();
+
+  static std::size_t hash_of(const RawIntegral &key) {
+    return std::hash<RawIntegral>{}(key);
+  }
+
+  // Smallest power of two >= 2 * n, at least 8: the load factor stays at or
+  // below one half, so an unsuccessful probe always meets an empty slot.
+  static std::size_t capacity_for(std::size_t n) {
+    if (n == 0)
+      return 0;
+    std::size_t capacity = 8;
+    while (capacity < 2 * n)
+      capacity <<= 1;
+    return capacity;
+  }
+
+  // keys[position] must already be in the bound vector.  An equal key keeps
+  // the size and takes the new position, reproducing map operator[]'s
+  // last-write-wins value.
+  void insert_at(unsigned position) {
+    if ((size_ + 1) * 2 > slots_.size())
+      grow();
+    for (std::size_t i = hash_of((*keys_)[position]) & mask_;; i = (i + 1) & mask_) {
+      std::uint32_t &slot = slots_[i];
+      if (slot == kEmpty) {
+        slot = position;
+        ++size_;
+        return;
+      }
+      if ((*keys_)[slot] == (*keys_)[position]) {
+        slot = position;
+        return;
+      }
+    }
+  }
+
+  void grow() {
+    std::vector<std::uint32_t> old;
+    old.swap(slots_);
+    slots_.assign(capacity_for(size_ + 1), kEmpty);
+    mask_ = slots_.size() - 1;
+    size_ = 0;
+    for (const std::uint32_t position : old) {
+      if (position == kEmpty)
+        continue;
+      std::size_t i = hash_of((*keys_)[position]) & mask_;
+      while (slots_[i] != kEmpty)
+        i = (i + 1) & mask_;
+      slots_[i] = position;
+      ++size_;
+    }
+  }
+
+  std::vector<std::uint32_t> slots_;
+  const std::vector<RawIntegral> *keys_ = nullptr;
+  std::size_t size_ = 0;
+  std::size_t mask_ = 0;
+};
+
+// Position of every seed integral in Sector::_seeds, plus the few labels that
+// the old std::unordered_map<RawIntegral,unsigned> created by operator[] on a
+// miss.  Those extra labels are usually zero or one in practice, so a linear
+// scan over extras_ is cheaper than a second hash table.
+class SeedWeights {
+public:
+  void build(const std::vector<RawIntegral> &seeds) {
+    table_.build(seeds);
+    extras_.clear();
+  }
+
+  void clear() {
+    table_.release();
+    std::vector<std::pair<RawIntegral, unsigned>>().swap(extras_);
+  }
+
+  bool empty() const { return table_.empty() && extras_.empty(); }
+  std::size_t size() const { return table_.size() + extras_.size(); }
+
+  bool find(const RawIntegral &key, unsigned &position) const {
+    const unsigned slot = table_.find(key);
+    if (slot != IntegralSlotTable::kNoSlot) {
+      position = slot;
+      return true;
+    }
+    for (const auto &[extra, value] : extras_)
+      if (extra == key) {
+        position = value;
+        return true;
+      }
+    return false;
+  }
+
+  bool contains(const RawIntegral &key) const {
+    unsigned position = 0;
+    return find(key, position);
+  }
+
+  unsigned at(const RawIntegral &key) const {
+    unsigned position = 0;
+    if (!find(key, position))
+      throw std::out_of_range("seed weights: integral not found");
+    return position;
+  }
+
+  // unordered_map::operator[] parity: a miss inserts 0, which later find and
+  // contains calls must observe.
+  unsigned weight_or_insert(const RawIntegral &key) {
+    unsigned position = 0;
+    if (find(key, position))
+      return position;
+    extras_.emplace_back(key, 0u);
+    return 0u;
+  }
+
+private:
+  IntegralSlotTable table_;
+  std::vector<std::pair<RawIntegral, unsigned>> extras_;
+};
 
 // Default relaxation of Kira's seed-truncation level.
 inline constexpr unsigned kSeedLevelOffset = 1;
@@ -413,7 +644,7 @@ struct ReductionContext {
                                rawEquationsPath);
     spillIntegrals.clear();
     spillCoeffs.clear();
-    spillIntegralIndex.clear();
+    spillIntegralIndex.bind(spillIntegrals);
     spillCoeffIndex.clear();
     spillBuf.clear();
     spillBytes = kSpillHeaderBytes;
@@ -471,6 +702,10 @@ struct ReductionContext {
     spillBuf.clear();
     spillBuf.shrink_to_fit();
     integrals.swap(spillIntegrals);
+    // The slot positions now describe the caller's vector, not the (emptied)
+    // spill vector the table is bound to, so drop them before anything can
+    // look through a stale position.  releaseSpillTables frees the storage.
+    spillIntegralIndex.clear();
   }
 
   // Release the interning tables once the spill file is complete.  The global
@@ -478,7 +713,7 @@ struct ReductionContext {
   // the caller, never these tables.  Swapping with empty containers returns the
   // heap, which clear() alone would keep.
   void releaseSpillTables() {
-    std::unordered_map<RawIntegral, std::uint32_t>().swap(spillIntegralIndex);
+    spillIntegralIndex.release();
     std::unordered_map<std::string, std::uint32_t>().swap(spillCoeffIndex);
     std::vector<std::string>().swap(spillCoeffs);
   }
@@ -493,11 +728,13 @@ struct ReductionContext {
   }
 
   std::uint32_t spill_integral_index(const RawIntegral &integ) {
-    const auto it = spillIntegralIndex.try_emplace(
-        integ, static_cast<std::uint32_t>(spillIntegrals.size()));
-    if (it.second)
-      spillIntegrals.push_back(integ);
-    return it.first->second;
+    const unsigned position = spillIntegralIndex.find(integ);
+    if (position != IntegralSlotTable::kNoSlot)
+      return position;
+    const auto next = static_cast<unsigned>(spillIntegrals.size());
+    spillIntegrals.push_back(integ);
+    spillIntegralIndex.insert_last();
+    return next;
   }
 
   std::uint32_t spill_coeff_index(const std::string &coeff) {
@@ -523,7 +760,7 @@ struct ReductionContext {
     globalEquationsCount.fetch_add(n_equations, std::memory_order_relaxed);
   }
 
-  std::unordered_map<RawIntegral, std::uint32_t> spillIntegralIndex;
+  IntegralSlotTable spillIntegralIndex;
   std::unordered_map<std::string, std::uint32_t> spillCoeffIndex;
   std::string spillBuf;
   std::uint64_t spillBytes = 0;
@@ -885,7 +1122,7 @@ private:
 
   std::vector<RawIntegral> _submasters;
 
-  std::unordered_map<RawIntegral, unsigned> _weights;
+  SeedWeights _weights;
 
   std::set<unsigned> _trivialsectors;
 };

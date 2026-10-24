@@ -68,10 +68,7 @@ public:
     return s._seeds;
   }
 
-  static const std::unordered_map<RawIntegral, unsigned> &
-  weights(const Sector &s) {
-    return s._weights;
-  }
+  static const SeedWeights &weights(const Sector &s) { return s._weights; }
 
   static const std::map<std::pair<int, int>, std::vector<std::vector<int>>> &
   combinations(const Sector &s) {
@@ -367,6 +364,41 @@ TEST(seeds_clear_resets_state) {
   s.clear();
   REQUIRE(SectorTestHelper::seeds(s).empty());
   REQUIRE(SectorTestHelper::weights(s).empty());
+}
+
+// The subsector columns used to be collected in a std::map, so the ordering
+// pass saw them in ascending operator< order.  The slot table collects them in
+// first-seen order, and the sector code restores the map sequence with
+// std::sort before ordering; this pins that equivalence on duplicates too.
+TEST(subsector_column_order_reproduces_map_iteration) {
+  const std::vector<RawIntegral> candidates{
+      RI({2, -1}), RI({1, -2}), RI({2, -1}), RI({3, -3}),
+      RI({1, -1}), RI({3, -3}), RI({2, -2})};
+
+  std::map<RawIntegral, unsigned> old_way;
+  for (const RawIntegral &integral : candidates)
+    old_way.emplace(integral, static_cast<unsigned>(old_way.size()));
+  std::vector<RawIntegral> map_order;
+  for (const auto &entry : old_way)
+    map_order.push_back(entry.first);
+
+  std::vector<RawIntegral> columns;
+  IntegralSlotTable index;
+  index.bind(columns);
+  for (const RawIntegral &integral : candidates) {
+    if (!index.contains(integral)) {
+      columns.push_back(integral);
+      index.insert_last();
+    }
+  }
+  std::sort(columns.begin(), columns.end());
+  REQUIRE(columns.size() == map_order.size());
+  for (std::size_t i = 0; i < columns.size(); ++i)
+    REQUIRE(columns[i] == map_order[i]);
+
+  index.build(columns);
+  for (std::size_t i = 0; i < columns.size(); ++i)
+    REQUIRE(index.find(columns[i]) == i);
 }
 
 // Sector with all-inactive propagators (sector id == 0, all lines false):
@@ -757,11 +789,18 @@ TEST(release_spill_tables_drops_the_interning_tables) {
   eq.emplace_back(RI({1, 1}), "2");
   eq.emplace_back(RI({1, 0}), "-1");
   ctx.appendRawEquation(eq);
-  std::vector<RawIntegral> integrals;
-  ctx.finishSpill(integrals);
+  REQUIRE(!ctx.spillIntegralIndex.empty());
   REQUIRE(ctx.spillCoeffs.size() == 2u);
   REQUIRE(!ctx.spillCoeffIndex.empty());
-  REQUIRE(!ctx.spillIntegralIndex.empty());
+  std::vector<RawIntegral> integrals;
+  ctx.finishSpill(integrals);
+  // finishSpill hands the integral order to the caller; the slot positions
+  // would describe a vector the table is no longer bound to, so it drops them.
+  // clear() keeps the slot array, so releaseSpillTables must still free it.
+  REQUIRE(ctx.spillIntegralIndex.empty());
+  REQUIRE(ctx.spillIntegralIndex.capacity() > 0u);
+  REQUIRE(ctx.spillCoeffs.size() == 2u);
+  REQUIRE(!ctx.spillCoeffIndex.empty());
 
   const std::string bytes = slurp(path);
   ctx.releaseSpillTables();
@@ -770,6 +809,7 @@ TEST(release_spill_tables_drops_the_interning_tables) {
   REQUIRE(ctx.spillCoeffs.capacity() == 0u);
   REQUIRE(ctx.spillCoeffIndex.empty());
   REQUIRE(ctx.spillIntegralIndex.empty());
+  REQUIRE(ctx.spillIntegralIndex.capacity() == 0u);
   // The caller keeps the ordering and the spill file is untouched.
   REQUIRE(integrals.size() == 2u);
   REQUIRE(integrals[0] == RI({1, 1}));

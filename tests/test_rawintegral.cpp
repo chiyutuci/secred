@@ -310,3 +310,150 @@ TEST(usable_in_unordered_map) {
   REQUIRE(m.size() == 1);
   REQUIRE(m[RI({1, 2})] == 20);
 }
+
+// ---------------------------------------------------------------------------
+// IntegralSlotTable — keyless positions into a caller-owned key vector
+// ---------------------------------------------------------------------------
+
+TEST(integral_slot_table_finds_positions_in_the_bound_keys) {
+  const std::vector<RawIntegral> keys{RI({1, 0}), RI({0, 1}), RI({2, -1})};
+  IntegralSlotTable table;
+  table.build(keys);
+
+  REQUIRE(!table.empty());
+  REQUIRE(table.size() == 3u);
+  REQUIRE(table.contains(RI({1, 0})));
+  REQUIRE(table.find(RI({0, 1})) == 1u);
+  REQUIRE(table.at(RI({2, -1})) == 2u);
+  REQUIRE(!table.contains(RI({3, 3})));
+  REQUIRE(table.find(RI({3, 3})) == IntegralSlotTable::kNoSlot);
+  REQUIRE_THROWS_AS(table.at(RI({3, 3})), std::out_of_range);
+}
+
+TEST(integral_slot_table_grows_by_rehashing) {
+  std::vector<RawIntegral> keys;
+  for (int i = 0; i < 1000; ++i)
+    keys.push_back(RI({i, -i, i % 7}));
+  IntegralSlotTable table;
+  table.build(keys);
+  REQUIRE(table.size() == keys.size());
+  for (unsigned i = 0; i < keys.size(); ++i)
+    REQUIRE(table.find(keys[i]) == i);
+
+  // Rebuilding the same keys must not duplicate entries.
+  table.build(keys);
+  REQUIRE(table.size() == keys.size());
+  REQUIRE(table.find(keys[999]) == 999u);
+}
+
+TEST(integral_slot_table_indexes_keys_appended_after_bind) {
+  std::vector<RawIntegral> keys;
+  IntegralSlotTable table;
+  table.bind(keys);
+  REQUIRE(table.empty());
+
+  for (int i = 0; i < 120; ++i) {
+    keys.push_back(RI({i, -i}));
+    table.insert_last();
+  }
+  REQUIRE(table.size() == keys.size());
+  for (unsigned i = 0; i < keys.size(); ++i)
+    REQUIRE(table.find(keys[i]) == i);
+
+  table.clear();
+  REQUIRE(table.empty());
+  REQUIRE(table.size() == 0u);
+  // After clear the table is unbound; lookups must not dereference a stale key.
+  REQUIRE(table.find(RI({0, 0})) == IntegralSlotTable::kNoSlot);
+
+  table.build(keys);
+  REQUIRE(table.find(keys[119]) == 119u);
+}
+
+// A repeated key keeps one entry and maps to its last position, which is what
+// assigning through std::unordered_map::operator[] did.
+TEST(integral_slot_table_keeps_the_last_position_of_a_repeated_key) {
+  std::vector<RawIntegral> keys{RI({1, 1}), RI({2, 2}), RI({1, 1})};
+  IntegralSlotTable table;
+  table.build(keys);
+  REQUIRE(table.size() == 2u);
+  REQUIRE(table.find(RI({1, 1})) == 2u);
+  REQUIRE(table.find(RI({2, 2})) == 1u);
+}
+
+// clear() keeps the slot array for reuse; release() returns it to the heap.
+// empty() cannot tell them apart, so the reclamation test needs capacity().
+TEST(integral_slot_table_release_returns_the_slot_storage) {
+  std::vector<RawIntegral> keys;
+  for (int i = 0; i < 120; ++i)
+    keys.push_back(RI({i, -i}));
+  IntegralSlotTable table;
+  table.build(keys);
+  REQUIRE(table.capacity() > 0u);
+
+  table.clear();
+  REQUIRE(table.capacity() > 0u);
+  REQUIRE(table.empty());
+
+  table.build(keys);
+  table.release();
+  REQUIRE(table.capacity() == 0u);
+  REQUIRE(table.empty());
+  REQUIRE(table.find(keys[0]) == IntegralSlotTable::kNoSlot);
+}
+
+// ---------------------------------------------------------------------------
+// SeedWeights
+// ---------------------------------------------------------------------------
+
+TEST(seed_weights_weight_or_insert_matches_operator_index) {
+  std::vector<RawIntegral> seeds{RI({2, 0}), RI({0, 2})};
+  SeedWeights weights;
+  weights.build(seeds);
+  REQUIRE(weights.size() == 2u);
+  REQUIRE(weights.at(RI({0, 2})) == 1u);
+
+  // A miss inserts 0 and becomes visible to later lookups, exactly like
+  // unordered_map::operator[].
+  REQUIRE(weights.weight_or_insert(RI({1, 1})) == 0u);
+  REQUIRE(weights.size() == 3u);
+  REQUIRE(weights.contains(RI({1, 1})));
+  REQUIRE(weights.at(RI({1, 1})) == 0u);
+  REQUIRE(weights.weight_or_insert(RI({1, 1})) == 0u);
+  REQUIRE(weights.size() == 3u);
+
+  // Rebuilding drops the interpolated keys; clear empties everything.
+  weights.build(seeds);
+  REQUIRE(weights.size() == 2u);
+  REQUIRE(!weights.contains(RI({1, 1})));
+  weights.clear();
+  REQUIRE(weights.empty());
+  REQUIRE(weights.size() == 0u);
+}
+
+TEST(seed_weights_at_missing_key_throws) {
+  std::vector<RawIntegral> seeds{RI({3, 0})};
+  SeedWeights weights;
+  weights.build(seeds);
+  REQUIRE_THROWS_AS(weights.at(RI({0, 3})), std::out_of_range);
+}
+
+// ---------------------------------------------------------------------------
+// Hash consistency
+// ---------------------------------------------------------------------------
+
+TEST(rawintegral_hash_equal_for_all_sizes) {
+  std::hash<RawIntegral> h;
+  for (int n = 0; n <= (int)RawIntegral::MAX_PROPS; ++n) {
+    RawIntegral a(static_cast<unsigned>(n), 1);
+    RawIntegral b(static_cast<unsigned>(n), 1);
+    REQUIRE(a == b);
+    REQUIRE(h(a) == h(b));
+    for (int i = 0; i < n; ++i) {
+      a[i] = static_cast<int8_t>(i % 5 - 2);
+      b[i] = static_cast<int8_t>(i % 5 - 2);
+    }
+    REQUIRE(a == b);
+    REQUIRE(h(a) == h(b));
+  }
+}

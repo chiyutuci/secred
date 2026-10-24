@@ -373,8 +373,7 @@ void Sector::_generate_seeds(OrderingMode mode,
                             return preferred->contains(x);
                           });
 
-  for (unsigned i = 0; i < _seeds.size(); ++i)
-    _weights[_seeds[i]] = i;
+  _weights.build(_seeds);
 
   _combinations.clear();
 }
@@ -560,8 +559,12 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   std::vector<EquationFF> system;
   std::vector<std::pair<uint32, uint32>> eqrecord;
 
-  std::map<RawIntegral, unsigned int> subsector_map;
-  unsigned int sub_int_id = _seeds.size();
+  // The subsector columns are collected in first-seen order, deduped through a
+  // position table, then sorted into the ascending operator< order the old
+  // std::map iterated before _order_subintegrals permuted them.
+  std::vector<RawIntegral> subInts;
+  IntegralSlotTable subIndex;
+  subIndex.bind(subInts);
 
   NumericSparseSolverMod alg;
 
@@ -589,8 +592,9 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
             if (_bound.filter_drops(integral, cfg.subsector_filter_n) ||
                 _trivialsectors.contains(integral.sector()))
               continue;
-            if (subsector_map.find(integral) == subsector_map.end()) {
-              subsector_map[integral] = sub_int_id++;
+            if (!subIndex.contains(integral)) {
+              subInts.push_back(integral);
+              subIndex.insert_last();
             }
             nsubitems++;
           } else {
@@ -603,15 +607,12 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   }
   time_stamp(file, " finish searching subsectors: ");
 
-  std::vector<RawIntegral> subInts;
-  for (auto item : subsector_map) {
-    subInts.emplace_back(item.first);
-  }
+  // std::map iterated these unique keys in ascending operator< order, and
+  // sorting them reproduces that sequence exactly.  The input order matters:
+  // Balance ordering uses a stable sort with a non-total comparator.
+  std::sort(subInts.begin(), subInts.end());
   _order_subintegrals(subInts, cfg.ordering_mode, cfg.preferred);
-  subsector_map.clear();
-  for (unsigned i = 0; i < subInts.size(); ++i) {
-    subsector_map[subInts[i]] = i;
-  }
+  subIndex.build(subInts);
   unsigned nsubint = subInts.size();
 
   system.clear();
@@ -635,15 +636,21 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
             continue;
 
           unsigned weight = 0;
-          if (!_weights.contains(integral)) {
+          unsigned seed_position = 0;
+          if (!_weights.find(integral, seed_position)) {
             if (_bound.filter_drops(integral, cfg.subsector_filter_n) ||
                 _trivialsectors.contains(integral.sector()))
               continue;
-            weight = subsector_map[integral] + nvars;
+            // The search pass indexed every integral that can reach here; a
+            // miss would have been operator[] 0 in the old map.
+            const unsigned sub_position = subIndex.find(integral);
+            weight = (sub_position == IntegralSlotTable::kNoSlot ? 0u
+                                                                 : sub_position) +
+                     nvars;
             equation.insert(weight, coeff);
           } else {
-            weight = _weights[integral];
-            equation.insert(nvars - 1 - _weights[integral], coeff);
+            weight = seed_position;
+            equation.insert(nvars - 1 - seed_position, coeff);
           }
         }
         if (equation.empty())
@@ -676,7 +683,7 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
   std::vector<RawIntegral> vtargets(ctx.targets[_id].begin(),
                                     ctx.targets[_id].end());
   for (unsigned i = 0; i < ctx.targets[_id].size(); ++i) {
-    neededVars[i] = nvars - 1 - _weights[vtargets[i]];
+    neededVars[i] = nvars - 1 - _weights.weight_or_insert(vtargets[i]);
   }
 
   time_stamp(file, "\n begin copying data: ");
@@ -748,9 +755,9 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
     std::vector<unsigned> input_ids;
     input_ids.reserve(_inputTargets.size());
     for (const RawIntegral &t : _inputTargets) {
-      const auto w = _weights.find(t);
-      if (w != _weights.end())
-        input_ids.push_back(nsubint + w->second);
+      unsigned seed_position = 0;
+      if (_weights.find(t, seed_position))
+        input_ids.push_back(nsubint + seed_position);
     }
     for (unsigned id : secred::sector_masters(ffred_learn, input_ids))
       probe_scope.insert(ncols - 1 - id);
@@ -790,7 +797,6 @@ unsigned Sector::sector_reduction_ff_n(const std::vector<IBPProtoFF> &ibps,
       }
       file << "\n  " << nsubint - 1 - needed_indep[i] + nvars << ": "
            << subint << " #" << subint.sector();
-      subsector_map[subint] = -1;
     }
   }
   file << '\n';
@@ -1041,7 +1047,6 @@ void Sector::clear() {
   _seeds.clear();
   _seeds.shrink_to_fit();
   _weights.clear();
-  _weights.rehash(0);
   _submasters.clear();
   _submasters.shrink_to_fit();
   _masters.clear();
