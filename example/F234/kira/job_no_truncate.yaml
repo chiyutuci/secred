@@ -1,0 +1,34 @@
+# F234 (fam4) at symbolic d, Kira 3.1, no seed truncation: one box for every sector.
+# This is the reference input (…/build/src/kira/final/jobs.yaml) verbatim.
+#
+# The single box {r: 8, s: 4} is applied to every subsector of sector 255
+# (d is omitted, so the number of dots is unlimited).  There is no truncate_sp
+# and no per-sector reduce entry.  select_mandatory_list (not
+# select_mandatory_recursively, which is the Kira-2 mechanism and inflates
+# F234 past 2.8M equations).
+#
+# Measured (Kira 3.1, 64 threads, 2026-10-21): 565,749 equations, 500.9 s,
+# 13.76 GiB, 309 masters, 0 unreduced.
+jobs:
+ - reduce_sectors:
+    reduce:
+     - {topologies: [fam4], sectors: [255], r: 8, s: 4}
+
+
+    select_integrals:
+      select_mandatory_list:
+        - [fam4, target]
+
+
+    preferred_masters: preferred
+    integral_ordering: 5
+
+
+    run_initiate: true
+    run_firefly: true
+
+
+
+ - kira2math:
+    target:
+     - [fam4, target]

@@ -1,0 +1,46 @@
+family:
+  name: fam96
+  dimension: 1999/500
+  internals: [ l1, l2 ]
+  externals: [ p1, p2, p3 ]
+  invariants:
+    - [ s, 2 ]
+    - [ t, 2 ]
+  sps_rules:
+    - [ p1, p1, 0 ]
+    - [ p2, p2, 0 ]
+    - [ p3, p3, 0 ]
+    - [ p1, p2, s ]
+    - [ p1, p3, t ]
+    - [ p2, p3, 9/2-s-t ]
+  propagators:
+    - [ l1, 3/2 ]
+    - [ l1+p1/2+p2/2+p3/2, 0 ]
+    - [ l2, 3/2 ]
+    - [ l2+p2, 3/2 ]
+    - [ l2-p1, 3/2 ]
+    - [ l2-p1/2+p2/2+p3/2, 0 ]
+    - [ l1+l2-p1/2+p2/2+p3/2, 3/2 ]
+    - [ l1+p1, 0 ]
+    - [ l1+p2, 0 ]
+
+settings:
+  sthreads: 64                # worker threads for the sector-wise reduction (default: min(64, hardware thread count))
+  parallel_mode: fine         # schedule sectors individually (fine) or layer by layer (layer)
+  subsector_filter_n: 1       # subsector filter offset n: a subsector integral is dropped when
+                              # its boundary quantity (depth + rank) falls more than n below
+                              # the boundary (0 = drop every subsector integral)
+  gthreads: 64                # threads for the global phase's reconstruction; defaults to sthreads
+  cache_dir: cache_fam96      # directory for the run's output (reductions, masters, logs)
+
+
+targets:
+  - [1, 1, 1, 1, 1, 1, 1, 0, 0]
+  - [1, 1, 1, 1, 1, 1, 1, -1, 0]
+  - [1, 1, 1, 1, 1, 1, 1, 0, -1]
+  - [1, 1, 1, 1, 1, 1, 1, -2, 0]
+  - [1, 1, 1, 1, 1, 1, 1, -1, -1]
+  - [1, 1, 1, 1, 1, 1, 1, 0, -2]
+  - [1, 1, 1, 1, 2, 1, 1, 0, 0]
+  - [1, 1, 1, 1, 2, 1, 1, -1, 0]
+  - [1, 1, 1, 1, 2, 1, 1, 0, -1]

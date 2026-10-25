@@ -1,0 +1,35 @@
+# F1 (fam1) at d = 1999/500, Kira 3.1, no seed truncation: one box for every sector.
+#
+# Counterpart of job_truncate.yaml: family, target list and selection are identical,
+# only the 8192 per-sector boxes are replaced by the single top-sector box with the
+# number of dots left unlimited (d omitted) -- the same relation the F234 example has
+# between its two job files.
+#
+#   r = 13 = t_top + max dots over all targets      s = 3 = SMAX
+#
+# RUN ONCE (2026-10-21/22), NOT COMPLETED: generation finished with 1,817,943,482
+# equations (1,317,752,159 zero + 500,191,323 independent), 16.8x the truncated
+# job's 108,139,890, in ~5 h 44 min with Kira RSS ~312 GiB; the run was then
+# stopped while preparing content for the selector, once the machine had swapped
+# 251 GiB (system RAM used peaked at 335 GiB, i.e. the 500 GiB RAM line is never
+# reached on this box).  No masters were produced.  See bench/kira_F1_F234_runs.md
+# section 7 for the full record.  Re-run only with far more physical memory or
+# with the expectation of long swap thrashing, in a fresh directory.
+#
+# The dimension is not in this file: pass it on the command line as
+#   kira job_no_truncate.yaml -p64 -sd=1999/500
+# (the 2026-10-19 truncated run was done exactly that way).  Without -sd, Kira runs
+# at symbolic d.
+jobs:
+ - reduce_sectors:
+    reduce:
+     - {topologies: [fam1], sectors: [8191], r: 13, s: 3}
+    select_integrals:
+      select_mandatory_list:
+        - [fam1, target]
+    integral_ordering: 5
+    run_initiate: true
+    run_firefly: true
+ - kira2math:
+    target:
+     - [fam1, target]
