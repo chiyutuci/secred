@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # add compile options
 
 # project name
-project(secred VERSION 0.1.0)
+project(secred VERSION 1.0.0)
 
 # Optional build tuning, off by default so the released package stays portable.
 #
