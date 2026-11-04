@@ -24,7 +24,7 @@ A system counts as symbolic when `dimension` is not a number, or when it has an
 invariant besides the one named by `invar_one`; `invar_one` alone does not make a
 system symbolic, since the invariant is set to 1 before the reduction.
 
-**Preprint:** _link to be added_ (placeholder).
+**Preprint:** [arXiv:2611.03703](https://arxiv.org/abs/2611.03703).
 
 ---
 
@@ -206,10 +206,18 @@ described by FireFly's own log, `firefly.log` in the cache directory.
 
 ## Citation
 
-If you use SecRed in your work, please cite the preprint (reference to be added):
+If you use SecRed in your work, please cite the preprint:
 
 ```bibtex
-@article{...}
+@misc{niu2026secred,
+  title         = {{SecRed}: A program for sector-wise {IBP} reduction of
+                   {Feynman} integrals},
+  author        = {Niu, Ruichang and Zeng, Chao and Gong, Bin and Wang, Jianxiong},
+  year          = {2026},
+  eprint        = {2611.03703},
+  archivePrefix = {arXiv},
+  primaryClass  = {hep-ph}
+}
 ```
 
 ## Licence
