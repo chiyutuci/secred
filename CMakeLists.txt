@@ -62,6 +62,46 @@ if (NOT JEMALLOC_LIBRARY)
 endif ()
 message(STATUS "jemalloc: ${JEMALLOC_LIBRARY}")
 
+# FiniteFlow's bundled fmt (format.h, FMT_VERSION 30002) grows its formatting
+# buffer with std::allocator::allocate(n, hint).  The hinted overload was
+# deprecated in C++17 and removed in C++20, and SecRed requires C++20, so a
+# stock FiniteFlow does not compile against it: every translation unit that
+# includes <fflow/common.hh> stops in MemoryBuffer::grow with
+#   error: no matching function for call to
+#   'std::allocator<char>::allocate(std::size_t&, std::nullptr_t)'
+# The hint was only an optimisation request that the standard allocator ignores,
+# so dropping it is a semantic no-op.  Patch a build-local copy of the header
+# instead of asking users to edit their FiniteFlow install: the copy is placed
+# first on the include path and nothing outside the build directory is touched.
+# A FiniteFlow that already drops the hint is used untouched.
+find_path(FFLOW_INCLUDE_DIR NAMES fflow/format.h)
+if (NOT FFLOW_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "FiniteFlow headers not found (fflow/format.h), and SecRed includes "
+        "them in every build.\n"
+        "  Build and install FiniteFlow as described in README.md.\n"
+        "  Installed under a prefix CMake does not search?  Pass it in directly:\n"
+        "  cmake -S . -B build -DFFLOW_INCLUDE_DIR=/path/to/include")
+endif ()
+file(READ "${FFLOW_INCLUDE_DIR}/fflow/format.h" SECRED_FFLOW_FORMAT_H)
+set(SECRED_FFLOW_FORMAT_H_CXX20 "${SECRED_FFLOW_FORMAT_H}")
+string(REPLACE "this->allocate(new_capacity, FMT_NULL)"
+               "this->allocate(new_capacity)"
+               SECRED_FFLOW_FORMAT_H_CXX20 "${SECRED_FFLOW_FORMAT_H_CXX20}")
+string(REPLACE "this->allocate(new_capacity, nullptr)"
+               "this->allocate(new_capacity)"
+               SECRED_FFLOW_FORMAT_H_CXX20 "${SECRED_FFLOW_FORMAT_H_CXX20}")
+if (NOT SECRED_FFLOW_FORMAT_H_CXX20 STREQUAL SECRED_FFLOW_FORMAT_H)
+    set(SECRED_FFLOW_COMPAT_DIR "${CMAKE_BINARY_DIR}/fflow-cxx20-compat")
+    file(MAKE_DIRECTORY "${SECRED_FFLOW_COMPAT_DIR}/fflow")
+    file(WRITE "${SECRED_FFLOW_COMPAT_DIR}/fflow/format.h"
+         "${SECRED_FFLOW_FORMAT_H_CXX20}")
+    include_directories(BEFORE "${SECRED_FFLOW_COMPAT_DIR}")
+    message(STATUS "FiniteFlow: dropped the allocator hint in format.h for C++20 "
+                   "(build-local copy in ${SECRED_FFLOW_COMPAT_DIR})")
+endif ()
+include_directories(SYSTEM "${FFLOW_INCLUDE_DIR}")
+
 # set project directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
 set(SECRED_SRC_DIR src)

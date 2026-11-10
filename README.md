@@ -78,6 +78,14 @@ under a non-standard prefix must be passed in:
 cmake -S . -B build -DCMAKE_PREFIX_PATH=/opt/finiteflow
 ```
 
+FiniteFlow's bundled `fmt` predates C++20: it allocates its formatting buffer
+with `std::allocator::allocate(n, hint)`, an overload that C++20 removed, so a
+stock FiniteFlow header does not compile inside SecRed's C++20 build. The
+configure step detects that call and compiles against a build-local copy of
+`format.h` with the unused hint dropped; nothing outside the build directory is
+modified. If the headers are in a prefix CMake does not search, pass
+`-DFFLOW_INCLUDE_DIR=/path/to/include`.
+
 This produces the program `build/secred`.
 
 ## Run
